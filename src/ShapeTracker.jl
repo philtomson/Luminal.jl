@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
 # Defines the ShapeTracker, which manages tensor shapes through operations.
 
-import Base: max, min
+import Base: max, min # These will eventually need to be handled by Symbolics.jl's symbolic operations
 
 export ShapeTracker, permute!, reshape
 
@@ -16,9 +16,9 @@ struct ShapeTracker
         len = length(dims)
         new(dims, 
             collect(1:len), 
-            fill(false, len), 
-            fill((Expression([Num(0)]), Expression([Num(typemax(Int))])), len),
-            fill((Expression([Num(0)]), Expression([Num(0)])), len))
+            fill(false, len),
+            fill((Luminal.Symbolic.Expression([Luminal.Symbolic.Num(0)]), Luminal.Symbolic.Expression([Luminal.Symbolic.Num(typemax(Int))])), len),
+            fill((Luminal.Symbolic.Expression([Luminal.Symbolic.Num(0)]), Luminal.Symbolic.Expression([Luminal.Symbolic.Num(0)])), len))
     end
 end
 

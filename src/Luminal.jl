@@ -15,9 +15,14 @@ include("Graph.jl")
 include("HighLevelOps.jl")
 
 # Compiler
+# Symbolics.jl Integration
+include("SymbolicsIntegration.jl")
+
 include("Compiler.jl")
 
 # Execution Engine
 include("Execution.jl")
+
+export SymbolicsIntegration # Export the new submodule
 
 end # module Luminal
