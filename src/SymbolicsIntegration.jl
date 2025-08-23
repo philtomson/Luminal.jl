@@ -55,70 +55,15 @@ end
 
 # Function to convert a Symbolics.jl expression back to a Luminal GraphTensor
 function symbolics_to_luminal(sym_expr)
+    # This will be a recursive function that converts a Symbolics.jl expression
+    # tree back into a Luminal graph.
+    # This is more complex as it requires creating new Luminal Ops and Nodes.
+
+    # For now, a placeholder
+    @warn "symbolics_to_luminal is a placeholder and needs full implementation."
     g = Luminal.Graph()
-    visited_exprs = Dict{Any,Luminal.GraphTensor}() # Map Symbolics.jl expr to Luminal.GraphTensor
-
-    function _symbolics_to_luminal_node(current_sym_expr, graph::Luminal.Graph, visited_exprs::Dict{Any,Luminal.GraphTensor})
-        if haskey(visited_exprs, current_sym_expr)
-            return visited_exprs[current_sym_expr]
-        end
-
-        local luminal_op::Luminal.Op
-        local inputs::Vector{Tuple{Int,Int}}
-        local output_shape::Luminal.ShapeTracker # Placeholder for now
-
-        if SymbolicUtils.isterm(current_sym_expr) # Check for operations first (SymbolicUtils.Term)
-            op_func = SymbolicUtils.operation(current_sym_expr)
-            args = SymbolicUtils.arguments(current_sym_expr)
-            
-            inputs = Vector{Tuple{Int,Int}}()
-            for arg in args
-                # Recursively convert arguments
-                input_g_tensor = _symbolics_to_luminal_node(arg, graph, visited_exprs)
-                push!(inputs, (input_g_tensor.id, 0)) # Assuming output index is always 0 for now
-            end
-
-            # Map Symbolics.jl operations back to Luminal Ops
-            if op_func == Base.:+
-                luminal_op = Luminal.Add()
-            elseif op_func == Base.:*
-                luminal_op = Luminal.Mul()
-            elseif op_func == Base.max
-                luminal_op = Luminal.Max() # Max is used for ReLU canonicalization
-            # Add more mappings as needed
-            else
-                error("Unsupported Symbolics.jl operation for Luminal conversion: $(op_func)")
-            end
-            
-            # For now, assume scalar output shape
-            output_shape = Luminal.ShapeTracker([Luminal.Symbolic.Expression([Luminal.Symbolic.Num(1)])])
-
-        elseif current_sym_expr isa Symbolics.Num # Symbolic variable or constant (Num)
-            if SymbolicUtils.issym(current_sym_expr) # If it's a symbolic variable
-                name_str = string(SymbolicUtils.operation(current_sym_expr))
-                luminal_op = Luminal.Function(name_str)
-                inputs = Vector{Tuple{Int,Int}}()
-                output_shape = Luminal.ShapeTracker([Luminal.Symbolic.Expression([Luminal.Symbolic.Num(1)])])
-            else # If it's a symbolic constant (e.g., Num(5))
-                luminal_op = Luminal.Constant(SymbolicUtils.value(current_sym_expr))
-                inputs = Vector{Tuple{Int,Int}}()
-                output_shape = Luminal.ShapeTracker([Luminal.Symbolic.Expression([Luminal.Symbolic.Num(1)])])
-            end
-        elseif current_sym_expr isa Number # Literal constant (e.g., 0, 1.0)
-            luminal_op = Luminal.Constant(current_sym_expr)
-            inputs = Vector{Tuple{Int,Int}}()
-            output_shape = Luminal.ShapeTracker([Luminal.Symbolic.Expression([Luminal.Symbolic.Num(1)])])
-        else
-            error("Unsupported Symbolics.jl expression type for Luminal conversion: $(typeof(current_sym_expr))")
-        end
-        
-        # Add the Luminal Op to the graph and create a GraphTensor
-        luminal_g_tensor = Luminal.add_op!(graph, luminal_op, inputs, output_shape)
-        visited_exprs[current_sym_expr] = luminal_g_tensor
-        return luminal_g_tensor
-    end
-
-    return _symbolics_to_luminal_node(sym_expr, g, visited_exprs)
+    # Assuming a simple constant for now
+    return Luminal.add_op!(g, Luminal.Constant(0), Vector{Tuple{Int,Int}}(), Luminal.ShapeTracker([Luminal.Symbolic.Expression([Luminal.Symbolic.Num(1)])]))
 end
 
 export luminal_to_symbolics, symbolics_to_luminal
