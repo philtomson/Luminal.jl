@@ -1,39 +1,80 @@
 #!/usr/bin/env julia
 
-push!(LOAD_PATH, "../src")
+# Add the src directory to the Julia load path
+push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
 using Luminal
 using Test
-using Symbolics
+using SymbolicUtils
+using SymbolicUtils: Sym, iscall, operation, arguments, term
 
-@testset "Symbolics.jl Integration" begin
-    @testset "Basic Conversion" begin
-        # Create a simple Luminal graph: a + b
+@testset "SymbolicUtils Integration" begin
+    @testset "Basic graph → symbolic conversion (a + b)" begin
         g = Luminal.Graph()
-        a_luminal = Luminal.tensor(g, [1]) # Placeholder shape, will be InputTensor1
-        b_luminal = Luminal.tensor(g, [1]) # Placeholder shape, will be InputTensor2
-        c_luminal = a_luminal + b_luminal # Luminal.Add operation
+        a = Luminal.tensor(g, [1])
+        b = Luminal.tensor(g, [1])
+        c = a + b
 
-        # Convert Luminal graph to Symbolics.jl expression
-        sym_expr = Luminal.SymbolicsIntegration.luminal_to_symbolics(c_luminal)
+        # Convert via MetatheoryIntegration
+        sym_expr = Luminal.MetatheoryIntegration.luminal_to_symbolic(c)
 
-        # Define Symbolics.jl variables with the same naming convention as luminal_to_symbolics
-        @variables InputTensor1 InputTensor2
+        println("a + b symbolic: ", sym_expr)
+        println("Type: ", typeof(sym_expr))
 
-        # The converted symbolic expression should be InputTensor1 + InputTensor2
-        @test sym_expr isa Num # Or Term
-        @test isequal(sym_expr, InputTensor1 + InputTensor2)
+        # Should be a symbolic Add expression
+        @test sym_expr isa SymbolicUtils.BasicSymbolic
+        @test iscall(sym_expr)
+        @test operation(sym_expr) === (+)
 
-        # This part of the test will be implemented once symbolics_to_luminal is fully functional.
-        # For now, ensure that the previous test cases still pass.
+        # Arguments should be two symbolic variables
+        args = arguments(sym_expr)
+        sym_args = filter(a -> a isa SymbolicUtils.BasicSymbolic, args)
+        @test length(sym_args) == 2
+        @test nameof(sym_args[1]) == Symbol("InputTensor", a.id)
+        @test nameof(sym_args[2]) == Symbol("InputTensor", b.id)
     end
 
-    @testset "Symbolic max/min" begin
-        @variables x
-        println("Type of max(x, 0): ", typeof(max(x, 0))) # Debug print
-        @test isequal(max(x, 0), max(x, 0))
-        @test isequal(min(x, 0), min(x, 0))
-        @test isequal(max(x, 5), max(x, 5))
-        @test isequal(min(x, 5), min(x, 5))
+    @testset "Symbolic max preserves structure" begin
+        # Verify that term(max, ...) creates a proper symbolic term
+        @syms x::Real
+        max_expr = term(max, x, 0; type=Real)
+
+        println("max(x, 0): ", max_expr)
+        println("Type: ", typeof(max_expr))
+
+        @test iscall(max_expr)
+        @test operation(max_expr) === max
+        @test arguments(max_expr)[1] === x
+        @test arguments(max_expr)[2] == 0
+    end
+
+    @testset "Symbolic min preserves structure" begin
+        @syms x::Real
+        min_expr = term(min, x, 0; type=Real)
+
+        println("min(x, 0): ", min_expr)
+        println("Type: ", typeof(min_expr))
+
+        @test iscall(min_expr)
+        @test operation(min_expr) === min
+        @test arguments(min_expr)[1] === x
+        @test arguments(min_expr)[2] == 0
+    end
+
+    @testset "Mul conversion preserves structure (a * b)" begin
+        g = Luminal.Graph()
+        a = Luminal.tensor(g, [2])
+        b = Luminal.tensor(g, [2])
+        c = a * b
+
+        sym_expr = Luminal.MetatheoryIntegration.luminal_to_symbolic(c)
+
+        println("a * b symbolic: ", sym_expr)
+
+        @test sym_expr isa SymbolicUtils.BasicSymbolic
+        @test iscall(sym_expr)
+        @test operation(sym_expr) === (*)
     end
 end
+
+println("SymbolicUtils integration tests passed!")

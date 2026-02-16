@@ -1,23 +1,44 @@
 
+# Compiler.jl — Graph optimization using SymbolicUtils.jl rewrite rules
 
-# 3. Define the main compile function.
-using Symbolics # For @variables and simplify
-using Luminal.SymbolicsIntegration # For luminal_to_symbolics and symbolics_to_luminal
+using SymbolicUtils
+using SymbolicUtils: @rule, term, operation, arguments, Sym, BasicSymbolic, iscall
+using SymbolicUtils.Rewriters: Postwalk, Fixpoint, Chain, PassThrough
+using Luminal.MetatheoryIntegration # For luminal_to_symbolic and luminal_relu
 
+# Define the ReLU canonicalization rule: luminal_relu(x) => max(x, 0)
+const RELU_RULE = @rule luminal_relu(~x) => term(max, ~x, 0; type=Real)
+
+"""
+    optimize(expr)
+
+Apply optimization rules to a symbolic expression.
+Uses a manual fixpoint loop to avoid deep type nesting that causes
+stack overflow in Julia 1.12's type inferencer.
+"""
+function optimize(expr)
+    rewriter = Postwalk(PassThrough(Chain([RELU_RULE])))
+    prev = nothing
+    result = expr
+    while !isequal(prev, result)
+        prev = result
+        result = rewriter(result)
+    end
+    return result
+end
+
+"""
+    compile(graph::Luminal.Graph, output_g_tensor::Luminal.GraphTensor)
+
+Optimize a Luminal graph by converting it to a SymbolicUtils expression,
+applying rewrite rules, and returning the optimized symbolic expression.
+"""
 function compile(graph::Luminal.Graph, output_g_tensor::Luminal.GraphTensor)
-    # output_g_tensor is already the GraphTensor representing the output
+    # Convert the Luminal graph to a SymbolicUtils symbolic expression
+    sym_expr = Luminal.MetatheoryIntegration.luminal_to_symbolic(output_g_tensor)
 
-    # Convert the Luminal graph to a Symbolics.jl expression
-    sym_expr = Luminal.SymbolicsIntegration.luminal_to_symbolics(output_g_tensor)
-    println("Original Symbolics Term: ", sym_expr)
+    # Apply the optimization rules
+    optimized = optimize(sym_expr)
 
-    # Apply Symbolics.jl's simplification
-    optimized_sym_expr = Symbolics.simplify(sym_expr)
-    println("Optimized Symbolics Term: ", optimized_sym_expr)
-
-    # Convert the optimized Symbolics.jl expression back to a Luminal graph
-    optimized_g_tensor = Luminal.SymbolicsIntegration.symbolics_to_luminal(optimized_sym_expr)
-
-    # Return the optimized Luminal GraphTensor
-    return optimized_g_tensor
+    return optimized
 end

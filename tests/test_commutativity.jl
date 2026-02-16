@@ -1,45 +1,56 @@
+#!/usr/bin/env julia
+
 # Add the src directory to the Julia load path
-push!(LOAD_PATH, "../src")
+push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
 using Luminal
+using Test
+using SymbolicUtils
+using SymbolicUtils: Sym, iscall, operation, arguments
 
-println("Running Optimizer Test: (2 * a) * 3")
+@testset "Commutativity" begin
+    @testset "(2 * a) * 3 => 6a" begin
+        # 1. Build the computation graph: (2 * a) * 3
+        graph = Luminal.Graph()
 
-# 1. Initialize a Graph
-graph = Luminal.Graph()
+        a = Luminal.tensor(graph, [2, 2])
 
-# 2. Build the computation graph
+        # Constant 2
+        const_shape = Luminal.ShapeTracker([1])
+        const_2 = Luminal.add_op!(graph, Luminal.Constant(2), Tuple{Int,Int}[], const_shape)
 
-# Input tensor 'a'
-a = Luminal.tensor(graph, [2, 2])
+        # Constant 3
+        const_3 = Luminal.add_op!(graph, Luminal.Constant(3), Tuple{Int,Int}[], const_shape)
 
-# Constant 2
-push!(graph.nodes, Luminal.Node(Luminal.Constant(2), []))
-const_2 = Luminal.GraphTensor(2, [], graph)
+        # Build: (2 * a) * 3
+        mul_1 = const_2 * a
+        mul_2 = mul_1 * const_3
 
-# Constant 3
-push!(graph.nodes, Luminal.Node(Luminal.Constant(3), []))
-const_3 = Luminal.GraphTensor(3, [], graph)
+        # 2. Compile
+        optimized_expr = Luminal.compile(graph, mul_2)
 
-# Build the expression: (2 * a) * 3
-mul_node_1 = const_2 * a
-mul_node_2 = mul_node_1 * const_3
+        # 3. Debug
+        println("Original: (2 * a) * 3")
+        println("Optimized: ", optimized_expr)
+        println("Type: ", typeof(optimized_expr))
 
-# 3. Compile the graph
-optimized_term = Luminal.compile(graph, mul_node_2.id)
+        # 4. Verify: should be 6 * a (commutativity + constant folding)
+        @test iscall(optimized_expr)
+        @test operation(optimized_expr) === (*)
+        args = arguments(optimized_expr)
 
-# 4. Verify the result
-# The optimizer should perform the following steps:
-# 1. (2 * a) * 3
-# 2. (a * 2) * 3   (Commutativity)
-# 3. a * (2 * 3)   (Associativity)
-# 4. a * 6         (Constant Folding)
-# The term for 'a' is :Function
-expected_term = :(Mul(Function, 6))
+        # SymbolicUtils normalizes Mul with a coefficient and sorted symbolic args
+        println("Args: ", args)
 
-println("Final Optimized Term: ", optimized_term)
-println("Expected Term: ", expected_term)
+        # Find the symbolic variable and the constant in the arguments
+        sym_args = filter(a -> a isa SymbolicUtils.BasicSymbolic, args)
+        num_args = filter(a -> a isa Number, args)
 
-@assert optimized_term == expected_term "Optimizer Test Failed!"
+        @test length(sym_args) == 1
+        @test nameof(sym_args[1]) == Symbol("InputTensor", a.id)
+        @test length(num_args) == 1
+        @test num_args[1] == 6
+    end
+end
 
-println("\nOptimizer Test Passed!")
+println("Commutativity tests passed!")

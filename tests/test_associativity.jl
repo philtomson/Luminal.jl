@@ -1,42 +1,57 @@
+#!/usr/bin/env julia
+
 # Add the src directory to the Julia load path
-push!(LOAD_PATH, "../src")
+push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
 using Luminal
+using Test
+using SymbolicUtils
+using SymbolicUtils: Sym, iscall, operation, arguments
 
-println("Running Optimizer Test: (a + 2) + 3")
+@testset "Associativity" begin
+    @testset "(a + 2) + 3 => a + 5" begin
+        # 1. Build the computation graph: (a + 2) + 3
+        graph = Luminal.Graph()
 
-# 1. Initialize a Graph
-graph = Luminal.Graph()
+        a = Luminal.tensor(graph, [2, 2])
 
-# 2. Build the computation graph
+        # Constant 2
+        const_shape = Luminal.ShapeTracker([1])
+        const_2 = Luminal.add_op!(graph, Luminal.Constant(2), Tuple{Int,Int}[], const_shape)
 
-# Input tensor 'a'
-a = Luminal.tensor(graph, [2, 2])
+        # Constant 3
+        const_3 = Luminal.add_op!(graph, Luminal.Constant(3), Tuple{Int,Int}[], const_shape)
 
-# Constant 2
-push!(graph.nodes, Luminal.Node(Luminal.Constant(2), []))
-const_2 = Luminal.GraphTensor(2, [], graph)
+        # Build: (a + 2) + 3
+        add_1 = a + const_2
+        add_2 = add_1 + const_3
 
-# Constant 3
-push!(graph.nodes, Luminal.Node(Luminal.Constant(3), []))
-const_3 = Luminal.GraphTensor(3, [], graph)
+        # 2. Compile
+        optimized_expr = Luminal.compile(graph, add_2)
 
-# Build the expression: (a + 2) + 3
-add_node_1 = a + const_2
-add_node_2 = add_node_1 + const_3
+        # 3. Debug
+        println("Original: (a + 2) + 3")
+        println("Optimized: ", optimized_expr)
+        println("Type: ", typeof(optimized_expr))
 
-# 3. Compile the graph
-optimized_term = Luminal.compile(graph, add_node_2.id)
+        # 4. Verify: should be a + 5 (associativity + constant folding)
+        @test iscall(optimized_expr)
+        @test operation(optimized_expr) === (+)
+        args = arguments(optimized_expr)
 
-# 4. Verify the result
-# The associative rule should change the expression to a + (2 + 3),
-# and then constant folding should simplify it to a + 5.
-# The term for 'a' is :Function
-expected_term = :(Add(Function, 5))
+        # SymbolicUtils normalizes Add as a flat sum with sorted args
+        # The result should contain the symbolic variable and the folded constant 5
+        println("Args: ", args)
 
-println("Final Optimized Term: ", optimized_term)
-println("Expected Term: ", expected_term)
+        # Find the symbolic variable and the constant in the arguments
+        sym_args = filter(a -> a isa SymbolicUtils.BasicSymbolic, args)
+        num_args = filter(a -> a isa Number, args)
 
-@assert optimized_term == expected_term "Optimizer Test Failed!"
+        @test length(sym_args) == 1
+        @test nameof(sym_args[1]) == Symbol("InputTensor", a.id)
+        @test length(num_args) == 1
+        @test num_args[1] == 5
+    end
+end
 
-println("\nOptimizer Test Passed!")
+println("Associativity tests passed!")

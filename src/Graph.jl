@@ -49,11 +49,7 @@ end
 Define a new input tensor on the graph.
 """
 function tensor(graph::Graph, shape::Vector{Int})
-    # Convert the integer shape to a vector of symbolic Expressions
-    dims = [Luminal.Symbolic.Expression([Luminal.Symbolic.Num(d)]) for d in shape]
-    # Create a new ShapeTracker for this input tensor
-    st = ShapeTracker(dims)
-    
+    st = ShapeTracker(shape)
     op = Function("InputTensor")
     inputs = Vector{Tuple{Int, Int}}()
     return add_op!(graph, op, inputs, st)

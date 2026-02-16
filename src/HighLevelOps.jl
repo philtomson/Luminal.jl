@@ -85,12 +85,9 @@ end
 # ------------
 
 function reshape(a::GraphTensor, new_shape_vec::Vector{Int})
-    # Convert integer shape to symbolic expressions
-    new_dims = [Expression([Num(d)]) for d in new_shape_vec]
-    # Use the ShapeTracker's reshape method
-    output_shape = reshape(a.shape, new_dims)
+    output_shape = reshape(a.shape, new_shape_vec)
     inputs = [(a.id, 0)]
-    return add_op!(a.graph_ref, Reshape(new_dims), inputs, output_shape)
+    return add_op!(a.graph_ref, Reshape(new_shape_vec), inputs, output_shape)
 end
 
 function permute(a::GraphTensor, dims::Vector{Int})
@@ -107,10 +104,9 @@ end
 function matmul(a::GraphTensor, b::GraphTensor)
     @assert a.graph_ref === b.graph_ref "Tensors must be from the same graph"
     
-    # This is a simplified shape calculation. A full implementation would use the ShapeTracker.
-    # For now, we manually construct the output shape vector.
-    a_dims = [Symbolic.execute(d, Dict{Char, Int64}()) for d in a.shape.dims] # Evaluate expressions
-    b_dims = [Symbolic.execute(d, Dict{Char, Int64}()) for d in b.shape.dims] # Evaluate expressions
+    # Simplified shape calculation for concrete integer dimensions.
+    a_dims = a.shape.dims
+    b_dims = b.shape.dims
     @assert length(a_dims) >= 2 && length(b_dims) >= 2 "Matmul inputs must be at least 2D"
     @assert a_dims[2] == b_dims[1] "Inner dimensions must match"
     if length(a_dims) > 2
@@ -121,8 +117,7 @@ function matmul(a::GraphTensor, b::GraphTensor)
     if length(a_dims) > 2
         append!(output_shape_vec, a_dims[3:end])
     end
-    output_dims_expr = [Expression([Num(d)]) for d in output_shape_vec]
-    output_shape = ShapeTracker(output_dims_expr)
+    output_shape = ShapeTracker(output_shape_vec)
 
     inputs = [(a.id, 0), (b.id, 0)]
     return add_op!(a.graph_ref, MatMul(), inputs, output_shape)
