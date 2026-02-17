@@ -230,9 +230,9 @@ weakdeps = ["SparseArrays"]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
 
 [[deps.Combinatorics]]
-git-tree-sha1 = "c761b00e7755700f9cdf5b02039939d1359330e1"
+git-tree-sha1 = "08c8b6831dc00bfea825826be0bc8336fc369860"
 uuid = "861a8166-3701-5b0c-9a16-15d98fcdc6aa"
-version = "1.1.0"
+version = "1.0.2"
 
 [[deps.Compat]]
 deps = ["TOML", "UUIDs"]
@@ -577,7 +577,9 @@ version = "1.11.0"
 
 [[deps.Metatheory]]
 deps = ["AutoHashEquals", "DocStringExtensions", "Reexport", "TermInterface", "TimerOutputs"]
-path = "/tmp/Metatheory.jl"
+git-tree-sha1 = "b8ff82a4753bc85337c6c087fb0dd1c3b7318d2b"
+repo-rev = "fix-custom-operators"
+repo-url = "https://github.com/philtomson/Metatheory.jl"
 uuid = "e9d8d322-4543-424a-9be4-0cc815abe26c"
 version = "3.0.0"
 
@@ -891,7 +893,7 @@ weakdeps = ["PrettyTables"]
 
 [[deps.SymbolicUtils]]
 deps = ["AbstractTrees", "ArrayInterface", "Bijections", "ChainRulesCore", "Combinatorics", "ConstructionBase", "DataStructures", "DocStringExtensions", "DynamicPolynomials", "ExproniconLite", "LinearAlgebra", "MultivariatePolynomials", "NaNMath", "Setfield", "SparseArrays", "SpecialFunctions", "StaticArrays", "SymbolicIndexingInterface", "TaskLocalValues", "TermInterface", "TimerOutputs", "Unityper"]
-path = "/devel/phil/SymbolicUtils.jl"
+git-tree-sha1 = "8c103c491ccf3e2b4284635c24b5de768adc6be8"
 uuid = "d1185830-fcd6-423d-90d6-eec64667417b"
 version = "3.31.0"
 
