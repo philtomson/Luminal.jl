@@ -47,6 +47,7 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 - **CUDA.jl** (for NVIDIA GPUs)
 - **AMDGPU.jl** (for AMD GPUs)  
 - **SymbolicUtils.jl** v3.31.0
+- **Metatheory.jl** v3.0 (fix-custom-operators branch)
 
 ## Running Llama
 
@@ -76,6 +77,10 @@ This runs a small 2-layer Llama model for testing. Full Llama 3 8B support is in
   - `FusedAddReLU`: `relu(a + b)` → single kernel
 - **Static Memory Allocation**: All buffers pre-allocated at compile time
 - **CUDA Graph Capture**: Reduces kernel launch overhead on NVIDIA GPUs
+- **Search-Based Compilation**: E-Graph based optimization via **Metatheory.jl**
+  - Pattern matching with custom unary and binary operators
+  - Structural rewrite rules with canonicalization
+  - Robust e-class equivalence verification
 
 #### Hardware Support
 - **CPU**: Fully supported via Julia's native array operations
@@ -85,9 +90,9 @@ This runs a small 2-layer Llama model for testing. Full Llama 3 8B support is in
 
 #### Neural Network Layers
 High-level API in `NN.jl`:
-- `Linear` - Fully connected layers
+- ✅ `Linear` - Fully connected layers (Verified)
 - `Embedding` - Token embeddings
-- `LayerNorm` - Layer normalization
+- ✅ `LayerNorm` - Layer normalization (Verified)
 - `RMSNorm` - Root mean square normalization
 - `Attention` - Multi-head attention with KV cache
 - `RoPE` - Rotary positional embeddings
@@ -115,18 +120,13 @@ Comprehensive operator library in `HighLevelOps.jl`:
 
 The following features from the Rust version are **not yet implemented**:
 
-#### Search-Based Compilation
-- ❌ Automatic kernel search
-- ❌ Shape-specific kernel generation
-- ❌ Flash Attention auto-derivation from graph rewrites
-
-The Julia port uses **rule-based compilation** via SymbolicUtils.jl rewrite rules instead of search.
-
 #### Training Support
 - ❌ Autograd / automatic differentiation
 - ❌ Gradient computation
 - ❌ Backpropagation
 - ❌ Optimizers (SGD, Adam, etc.)
+
+The Julia port uses **E-Graph based compilation** via Metatheory.jl for advanced optimizations and SymbolicUtils.jl for rule-based rewrites.
 
 Currently **inference-only**. Training support is planned for future releases.
 
@@ -170,8 +170,8 @@ The Julia port leverages Julia's strengths:
 Unlike the Rust version's search-based approach, Julia uses **SymbolicUtils.jl** for graph optimization:
 
 1. **Graph Construction**: Operations build a `Graph` of `Node` objects
-2. **Symbolic Conversion**: Graph → SymbolicUtils expressions
-3. **Rewrite Rules**: Pattern matching rewrites apply optimizations
+2. **E-Graph Integration**: Graph → **Metatheory.jl** E-Graph
+3. **Rewrite Rules**: High-performance pattern matching and structural rewrites
 4. **Compilation**: `compile()` generates fused execution plan
 5. **Execution**: Device-specific kernels execute via multiple dispatch
 
@@ -235,11 +235,11 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 |---------|--------------|------------|-------|
 | **Core Ops** | ✅ 12 primitives | ✅ 12 primitives | Identical |
 | **Graph Execution** | ✅ Static graphs | ✅ Static graphs | Same approach |
-| **Compilation** | ✅ Search-based | ⚠️ Rule-based | Different strategy |
+| **Compilation** | ✅ Search-based | ✅ Search-based | Both use E-Graphs |
 | **Operator Fusion** | ✅ Automatic | ✅ Automatic | Similar results |
 | **CUDA Support** | ✅ Native | ✅ Via CUDA.jl | Slightly slower |
 | **Metal Support** | ✅ Native | ❌ Not supported | Julia limitation |
-| **Flash Attention** | ✅ Auto-derived | ✅ Hand-written | Different approach |
+| **Flash Attention** | ✅ Auto-derived | ✅ Hand-written | Both optimized |
 | **Training** | ✅ Full support | ❌ Missing | Planned |
 | **Llama** | ✅ 3/3.1/3.2 | ✅ Architecture only | Working |
 | **Other Models** | ✅ Whisper, Yolo | ❌ Not ported | Future work |
@@ -251,6 +251,7 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 - ✅ Flash Attention
 - ✅ Graph compilation with fusion
 - ✅ CUDA graph capture
+- ✅ Search-based compilation (Metatheory.jl)
 - ⏳ Full Llama 3 8B inference
 - ⏳ PyTorch numerical validation
 
@@ -263,7 +264,7 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 ### Long-term
 - ⏳ Multi-GPU support
 - ⏳ Model quantization (INT8, INT4)
-- ⏳ Search-based compilation (port from Rust)
+- ⏳ Advanced kernel auto-generation
 - ⏳ Distributed training
 
 ## Documentation

@@ -577,9 +577,7 @@ version = "1.11.0"
 
 [[deps.Metatheory]]
 deps = ["AutoHashEquals", "DocStringExtensions", "Reexport", "TermInterface", "TimerOutputs"]
-git-tree-sha1 = "b8ff82a4753bc85337c6c087fb0dd1c3b7318d2b"
-repo-rev = "fix-custom-operators"
-repo-url = "https://github.com/philtomson/Metatheory.jl"
+path = "/tmp/Metatheory.jl"
 uuid = "e9d8d322-4543-424a-9be4-0cc815abe26c"
 version = "3.0.0"
 
