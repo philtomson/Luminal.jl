@@ -3,7 +3,7 @@
 # A node in the computation graph
 struct Node
     op::Op
-    inputs::Vector{Tuple{Int, Int}} # (NodeID, OutputIndex)
+    inputs::Vector{Tuple{Int, Int, ShapeTracker}} # (NodeID, OutputIndex, InputShape)
 end
 
 # A tensor on the graph, which is a symbolic handle to a node's output.
@@ -16,6 +16,7 @@ end
 # The main computation graph structure
 mutable struct Graph
     nodes::Vector{Node}
+    shapes::Vector{ShapeTracker} # Output shapes for each node
     tensors::Dict{Tuple{Int, Int}, Any} # (NodeID, OutputIndex) -> Tensor data
     dyn_map::Dict{Char, Int}
     no_delete::Set{Int}
@@ -24,6 +25,7 @@ mutable struct Graph
     # Default constructor
     function Graph()
         new(Vector{Node}(), 
+            Vector{ShapeTracker}(),
             Dict{Tuple{Int, Int}, Any}(), 
             Dict{Char, Int}(), 
             Set{Int}(), 
@@ -32,13 +34,14 @@ mutable struct Graph
 end
 
 """
-    add_op!(graph::Graph, op::Op, inputs::Vector{Tuple{Int, Int}}, output_shape::ShapeTracker)
+    add_op!(graph::Graph, op::Op, inputs::Vector{Tuple{Int, Int, ShapeTracker}}, output_shape::ShapeTracker)
 
 Add a new operation node to the graph and return a GraphTensor representing it.
 """
-function add_op!(graph::Graph, op::Op, inputs::Vector{Tuple{Int, Int}}, output_shape::ShapeTracker)
+function add_op!(graph::Graph, op::Op, inputs::Vector{Tuple{Int, Int, ShapeTracker}}, output_shape::ShapeTracker)
     node = Node(op, inputs)
     push!(graph.nodes, node)
+    push!(graph.shapes, output_shape)
     node_id = length(graph.nodes)
     return GraphTensor(node_id, output_shape, graph)
 end
@@ -51,6 +54,27 @@ Define a new input tensor on the graph.
 function tensor(graph::Graph, shape::Vector{Int})
     st = ShapeTracker(shape)
     op = Function("InputTensor")
-    inputs = Vector{Tuple{Int, Int}}()
+    inputs = Vector{Tuple{Int, Int, ShapeTracker}}()
+    return add_op!(graph, op, inputs, st)
+end
+
+"""
+    tensor(graph::Graph, data::AbstractArray)
+
+Convenience method to create an input tensor with shape matching the provided data.
+"""
+function tensor(graph::Graph, data::AbstractArray)
+    return tensor(graph, Int[size(data)...])
+end
+
+"""
+    constant(graph::Graph, value::Number)
+
+Create a scalar constant on the graph.
+"""
+function constant(graph::Graph, value::Number)
+    st = ShapeTracker(Int[])
+    op = Constant(value)
+    inputs = Vector{Tuple{Int, Int, ShapeTracker}}()
     return add_op!(graph, op, inputs, st)
 end

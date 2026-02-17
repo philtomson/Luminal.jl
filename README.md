@@ -1,0 +1,287 @@
+# Luminal Julia Port
+
+[![Julia](https://img.shields.io/badge/Julia-1.12.5-9558B2?style=for-the-badge&logo=julia&logoColor=white)](https://julialang.org/)
+[![Status](https://img.shields.io/badge/Status-Active%20Development-blue?style=for-the-badge)](https://github.com/jafioti/luminal)
+
+A Julia port of [Luminal](https://github.com/jafioti/luminal), a deep learning library using **ahead-of-time compilation** for high performance.
+
+> [!NOTE]
+> This is a port of the Luminal Rust library to Julia. Some features from the original Rust version are not yet implemented. See [Missing Features](#missing-features) for details.
+
+## Quick Start
+
+```julia
+using Luminal
+
+# Setup graph and tensors
+g = Graph()
+a = tensor(g, (3, 1))
+b = tensor(g, (1, 4))
+
+# Do math...
+c = matmul(a, b)
+
+# Prepare inputs
+inputs = Dict(
+    a.id => Float32[1.0; 2.0; 3.0;;],
+    b.id => Float32[1.0 2.0 3.0 4.0]
+)
+
+# Execute
+device = get_device()
+result = execute(g, c.id, inputs, device)
+
+println("Result: ", result)
+```
+
+## Installation
+
+```bash
+cd Julia
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+### Requirements
+
+- **Julia 1.12.5+**
+- **CUDA.jl** (for NVIDIA GPUs)
+- **AMDGPU.jl** (for AMD GPUs)  
+- **SymbolicUtils.jl** v3.31.0
+
+## Running Llama
+
+```bash
+cd Julia
+julia --project=. tests/test_llama.jl
+```
+
+This runs a small 2-layer Llama model for testing. Full Llama 3 8B support is in progress.
+
+## Features
+
+### ✅ Implemented
+
+#### Core Architecture
+- **RISC-style Ops**: 12 primitive operations:
+  - Unary: `Log2, Exp2, Sin, Sqrt, Recip`
+  - Binary: `Add, Mul, Mod, LessThan`
+  - Other: `SumReduce, MaxReduce, Contiguous`
+- **Graph-based Execution**: All operations build a static computation graph
+- **Shape Tracking**: Symbolic dimension tracking with broadcasting support
+
+#### Compilation & Optimization
+- **Ahead-of-Time Compilation**: `compile(graph)` creates optimized execution plans
+- **Operator Fusion**: Automatic fusion of element-wise operation chains
+  - `FusedMulAdd`: `a * b + c` → single kernel
+  - `FusedAddReLU`: `relu(a + b)` → single kernel
+- **Static Memory Allocation**: All buffers pre-allocated at compile time
+- **CUDA Graph Capture**: Reduces kernel launch overhead on NVIDIA GPUs
+
+#### Hardware Support
+- **CPU**: Fully supported via Julia's native array operations
+- **NVIDIA CUDA**: Full support via CUDA.jl
+- **AMD ROCm**: Partial support via AMDGPU.jl
+- **Automatic Device Detection**: `get_device()` selects best available hardware
+
+#### Neural Network Layers
+High-level API in `NN.jl`:
+- `Linear` - Fully connected layers
+- `Embedding` - Token embeddings
+- `LayerNorm` - Layer normalization
+- `RMSNorm` - Root mean square normalization
+- `Attention` - Multi-head attention with KV cache
+- `RoPE` - Rotary positional embeddings
+
+#### Transformer Support
+- **Llama Architecture**: Fully implemented
+  - MLP with SiLU/Swish activation
+  - Multi-query attention
+  - RoPE embeddings
+  - RMSNorm
+- **Flash Attention**: Custom CUDA kernel for efficient attention
+  - Causal and non-causal variants
+  - Online softmax algorithm
+  - CPU fallback
+
+#### High-Level Operations
+Comprehensive operator library in `HighLevelOps.jl`:
+- Math: `+, -, *, /, ^, sqrt, exp, log, sin, cos`
+- Comparison: `<, >, <=, >=, ==, !=`
+- Tensor ops: `matmul, permute, reshape, expand, slice, pad`
+- Activations: `relu, sigmoid, swish, gelu, softmax`
+- Reductions: `sum, max, mean`
+
+### ⚠️ Missing Features
+
+The following features from the Rust version are **not yet implemented**:
+
+#### Search-Based Compilation
+- ❌ Automatic kernel search
+- ❌ Shape-specific kernel generation
+- ❌ Flash Attention auto-derivation from graph rewrites
+
+The Julia port uses **rule-based compilation** via SymbolicUtils.jl rewrite rules instead of search.
+
+#### Training Support
+- ❌ Autograd / automatic differentiation
+- ❌ Gradient computation
+- ❌ Backpropagation
+- ❌ Optimizers (SGD, Adam, etc.)
+
+Currently **inference-only**. Training support is planned for future releases.
+
+#### Distributed Computing
+- ❌ Data parallelism
+- ❌ Pipeline parallelism  
+- ❌ Tensor parallelism
+- ❌ Multi-GPU support
+
+Single-device execution only.
+
+#### Additional Models
+- ❌ Whisper (speech recognition)
+- ❌ Yolo v8 (object detection)
+- ❌ Phi 3
+
+Only Llama architecture is currently implemented.
+
+#### Advanced Optimizations
+- ❌ Tensor Core utilization on NVIDIA
+- ❌ Blackwell intrinsics (TMEM, TMA)
+- ❌ Quantization (INT8, FP16 support exists but not quantized inference)
+
+#### Tooling
+- ❌ Benchmarking suite
+- ❌ PyTorch validation tests
+- ❌ Model export/import
+
+## Architecture
+
+### Why Julia?
+
+The Julia port leverages Julia's strengths:
+- **Multiple Dispatch**: Natural fit for operator overloading and device-specific kernels
+- **Type System**: Strong typing helps catch errors at compile time
+- **CUDA/GPU Support**: First-class GPU support via CUDA.jl and AMDGPU.jl
+- **Scientific Computing**: Rich ecosystem for numerical computing
+
+### Compilation Strategy
+
+Unlike the Rust version's search-based approach, Julia uses **SymbolicUtils.jl** for graph optimization:
+
+1. **Graph Construction**: Operations build a `Graph` of `Node` objects
+2. **Symbolic Conversion**: Graph → SymbolicUtils expressions
+3. **Rewrite Rules**: Pattern matching rewrites apply optimizations
+4. **Compilation**: `compile()` generates fused execution plan
+5. **Execution**: Device-specific kernels execute via multiple dispatch
+
+### Directory Structure
+
+```
+Julia/
+├── src/
+│   ├── Luminal.jl              # Main module
+│   ├── Ops.jl                  # Primitive operations
+│   ├── Graph.jl                # Graph data structures
+│   ├── ShapeTracker.jl         # Dimension tracking
+│   ├── HighLevelOps.jl         # High-level operator library
+│   ├── SymbolicIntegration.jl  # SymbolicUtils integration
+│   ├── Compiler.jl             # Graph compilation & fusion
+│   ├── Execution.jl            # Interpreter & kernels
+│   ├── Device.jl               # Hardware abstraction
+│   └── NN.jl                   # Neural network layers
+├── tests/                      # Comprehensive test suite
+└── docs/
+    └── porting_plan.md         # Detailed porting status
+```
+
+## Testing
+
+Run the full test suite:
+
+```bash
+cd Julia
+for f in tests/test_*.jl; do
+    echo "=== $f ==="
+    julia --project=. "$f"
+done
+```
+
+Individual tests:
+```bash
+julia --project=. tests/test_compilation.jl    # Graph compilation
+julia --project=. tests/test_fusion.jl          # Operator fusion
+julia --project=. tests/test_attention.jl       # Flash attention
+julia --project=. tests/test_llama.jl           # Llama model
+```
+
+See [`tests/README.md`](tests/README.md) for detailed test documentation.
+
+## Performance
+
+Preliminary benchmarks on NVIDIA GTX 1070:
+
+| Model | Device | Throughput |
+|-------|--------|------------|
+| TinyLlama 2L/1024H | CUDA | 131ms per forward pass |
+| Llama Attention (compiled) | CUDA | ~10x faster than interpreter |
+
+> [!NOTE]
+> Performance is still being optimized. The Rust version achieves 15-25 tok/s on Llama 3 8B (M-series Macs).
+
+## Comparison to Rust Version
+
+| Feature | Rust Luminal | Julia Port | Notes |
+|---------|--------------|------------|-------|
+| **Core Ops** | ✅ 12 primitives | ✅ 12 primitives | Identical |
+| **Graph Execution** | ✅ Static graphs | ✅ Static graphs | Same approach |
+| **Compilation** | ✅ Search-based | ⚠️ Rule-based | Different strategy |
+| **Operator Fusion** | ✅ Automatic | ✅ Automatic | Similar results |
+| **CUDA Support** | ✅ Native | ✅ Via CUDA.jl | Slightly slower |
+| **Metal Support** | ✅ Native | ❌ Not supported | Julia limitation |
+| **Flash Attention** | ✅ Auto-derived | ✅ Hand-written | Different approach |
+| **Training** | ✅ Full support | ❌ Missing | Planned |
+| **Llama** | ✅ 3/3.1/3.2 | ✅ Architecture only | Working |
+| **Other Models** | ✅ Whisper, Yolo | ❌ Not ported | Future work |
+| **Distributed** | ✅ Planned | ❌ Not planned | Long-term |
+
+## Roadmap
+
+### Short-term (Q1 2026)
+- ✅ Flash Attention
+- ✅ Graph compilation with fusion
+- ✅ CUDA graph capture
+- ⏳ Full Llama 3 8B inference
+- ⏳ PyTorch numerical validation
+
+### Medium-term (Q2 2026)
+- ⏳ Training support (autograd)
+- ⏳ Gradient checkpointing
+- ⏳ Mixed precision (FP16/BF16)
+- ⏳ Whisper implementation
+
+### Long-term
+- ⏳ Multi-GPU support
+- ⏳ Model quantization (INT8, INT4)
+- ⏳ Search-based compilation (port from Rust)
+- ⏳ Distributed training
+
+## Documentation
+
+- [Porting Plan](docs/porting_plan.md) - Detailed implementation status and roadmap
+- [Test Suite](tests/README.md) - Test documentation and coverage
+- [Rust Luminal Docs](https://docs.luminalai.com) - Original library documentation
+
+## Contributing
+
+This is an active port of the Rust Luminal library. Contributions welcome!
+
+**Priority areas**:
+- Training/autograd implementation
+- PyTorch validation tests
+- Performance benchmarking
+- Additional model implementations
+
+## License
+
+Licensed under the Apache License, Version 2.0 http://www.apache.org/licenses/LICENSE-2.0 or the MIT license http://opensource.org/licenses/MIT, at your option.

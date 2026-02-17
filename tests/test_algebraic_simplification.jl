@@ -18,18 +18,19 @@ using SymbolicUtils: Sym, iscall
 
         # Constant 1 (as a graph node)
         const_1_shape = Luminal.ShapeTracker([1])
-        const_1 = Luminal.add_op!(graph, Luminal.Constant(1), Tuple{Int,Int}[], const_1_shape)
+        const_1 = Luminal.add_op!(graph, Luminal.Constant(1), Tuple{Int,Int,Luminal.ShapeTracker}[], const_1_shape)
 
         # Constant 0 (as a graph node)
         const_0_shape = Luminal.ShapeTracker([1])
-        const_0 = Luminal.add_op!(graph, Luminal.Constant(0), Tuple{Int,Int}[], const_0_shape)
+const_0 = Luminal.add_op!(graph, Luminal.Constant(0), Tuple{Int,Int,Luminal.ShapeTracker}[], const_0_shape)
 
         # Build the expression: (a * 1) + 0
         mul_node = a * const_1
         add_node = mul_node + const_0
 
         # 2. Compile (optimize) the graph
-        optimized_expr = Luminal.compile(graph, add_node)
+        sym_expr = Luminal.luminal_to_symbolic(add_node)
+        optimized_expr = Luminal.optimize(sym_expr)
 
         # 3. Debug prints
         println("Original expression: (a * 1) + 0")

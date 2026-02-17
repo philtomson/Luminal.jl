@@ -15,8 +15,8 @@ using SymbolicUtils: Sym, iscall, operation, arguments, term
         b = Luminal.tensor(g, [1])
         c = a + b
 
-        # Convert via MetatheoryIntegration
-        sym_expr = Luminal.MetatheoryIntegration.luminal_to_symbolic(c)
+        # Convert via SymbolicIntegration
+        sym_expr = Luminal.SymbolicIntegration.luminal_to_symbolic(c)
 
         println("a + b symbolic: ", sym_expr)
         println("Type: ", typeof(sym_expr))
@@ -67,7 +67,7 @@ using SymbolicUtils: Sym, iscall, operation, arguments, term
         b = Luminal.tensor(g, [2])
         c = a * b
 
-        sym_expr = Luminal.MetatheoryIntegration.luminal_to_symbolic(c)
+        sym_expr = Luminal.SymbolicIntegration.luminal_to_symbolic(c)
 
         println("a * b symbolic: ", sym_expr)
 

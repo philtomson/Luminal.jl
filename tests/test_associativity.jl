@@ -17,17 +17,18 @@ using SymbolicUtils: Sym, iscall, operation, arguments
 
         # Constant 2
         const_shape = Luminal.ShapeTracker([1])
-        const_2 = Luminal.add_op!(graph, Luminal.Constant(2), Tuple{Int,Int}[], const_shape)
+const_2 = Luminal.add_op!(graph, Luminal.Constant(2), Tuple{Int,Int,Luminal.ShapeTracker}[], const_shape)
 
         # Constant 3
-        const_3 = Luminal.add_op!(graph, Luminal.Constant(3), Tuple{Int,Int}[], const_shape)
+const_3 = Luminal.add_op!(graph, Luminal.Constant(3), Tuple{Int,Int,Luminal.ShapeTracker}[], const_shape)
 
         # Build: (a + 2) + 3
         add_1 = a + const_2
         add_2 = add_1 + const_3
 
         # 2. Compile
-        optimized_expr = Luminal.compile(graph, add_2)
+        sym_expr = Luminal.luminal_to_symbolic(add_2)
+        optimized_expr = Luminal.optimize(sym_expr)
 
         # 3. Debug
         println("Original: (a + 2) + 3")

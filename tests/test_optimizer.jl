@@ -18,7 +18,7 @@ using SymbolicUtils: Sym, operation, arguments, iscall
         const_0 = Luminal.add_op!(g, Luminal.Constant(0), Tuple{Int,Int}[], const_shape)
 
         # 2. Compile (optimize) the graph using SymbolicUtils.jl rewrite rules
-        optimized_expr = Luminal.compile(g, output_node)
+        optimized_expr = Luminal.optimize_symbolic(g, output_node)
 
         # 3. Debug prints
         println("Optimized Expression: ", optimized_expr)
