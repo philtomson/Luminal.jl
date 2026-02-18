@@ -6,7 +6,7 @@ using Pkg
 Pkg.rm("Metatheory")
 
 # Add the fixed version
-Pkg.develop(path="/tmp/Metatheory.jl")
+Pkg.develop(path="/home/phil/build/Metatheory.jl")
 Pkg.build("Metatheory")
 
 # Now test with fresh session

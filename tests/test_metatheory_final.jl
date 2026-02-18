@@ -2,7 +2,7 @@
 # FINAL TEST: Verify fixes work with proper extraction
 
 using Pkg
-Pkg.develop(path="/tmp/Metatheory.jl")
+Pkg.develop(path="/home/phil/build/Metatheory.jl")
 
 using Metatheory
 using Metatheory.EGraphs

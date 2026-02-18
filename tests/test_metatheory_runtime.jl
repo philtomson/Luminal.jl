@@ -2,7 +2,7 @@
 # Runtime debug: Instrument the e-matching to see where it fails
 
 using Pkg
-Pkg.develop(path="/tmp/Metatheory.jl")
+Pkg.develop(path="/home/phil/build/Metatheory.jl")
 
 using Metatheory
 using Metatheory.EGraphs

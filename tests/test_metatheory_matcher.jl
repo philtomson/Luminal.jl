@@ -2,7 +2,7 @@
 # Ultimate trace: print generated matching code
 
 using Pkg
-Pkg.develop(path="/tmp/Metatheory.jl")
+Pkg.develop(path="/home/phil/build/Metatheory.jl")
 
 using Metatheory
 using Metatheory.Patterns

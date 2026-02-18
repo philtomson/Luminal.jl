@@ -47,7 +47,7 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 - **CUDA.jl** (for NVIDIA GPUs)
 - **AMDGPU.jl** (for AMD GPUs)  
 - **SymbolicUtils.jl** v3.31.0
-- **Metatheory.jl** v3.0 (fix-custom-operators branch)
+- **Metatheory.jl** v3.0 (from the `ale/3.0` branch of `JuliaSymbolics/Metatheory.jl`)
 
 ## Running Llama
 
