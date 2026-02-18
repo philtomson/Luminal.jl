@@ -24,7 +24,7 @@ export matmul, relu, sigmoid, swish, silu, gelu, softmax, layer_norm, mean_norm,
 # Hardware Abstraction
 include("Device.jl")
 using .Device
-export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice, AMDDevice
+export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice, AMDDevice, VulkanDevice
 
 # Execution Engine
 include("Execution.jl")

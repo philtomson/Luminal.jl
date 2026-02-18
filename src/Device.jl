@@ -2,14 +2,25 @@ module Device
 
 using CUDA
 using AMDGPU
+using Vulkan
 
-export AbstractDevice, CPUDevice, CUDADevice, AMDDevice, get_device, to_device, from_device, execute_with_capture
+export AbstractDevice, CPUDevice, CUDADevice, AMDDevice, VulkanDevice, get_device, to_device, from_device, execute_with_capture
 
 abstract type AbstractDevice end
 
 struct CPUDevice <: AbstractDevice end
 struct CUDADevice <: AbstractDevice end
 struct AMDDevice <: AbstractDevice end
+struct VulkanDevice <: AbstractDevice 
+    name::String
+end
+
+# Default constructor for empty name
+VulkanDevice() = VulkanDevice("Unknown GPU")
+
+function Base.show(io::IO, dev::VulkanDevice)
+    print(io, "VulkanDevice(\"", dev.name, "\")")
+end
 
 """
     get_device()
@@ -19,12 +30,47 @@ Priority: CUDA > AMDGPU > CPU.
 """
 function get_device()
     if CUDA.functional()
-        return CUDADevice()
-    elseif AMDGPU.functional()
-        return AMDDevice()
-    else
-        return CPUDevice()
+        try
+            # Light health check
+            CUDA.CuArray([1.0f0])
+            return CUDADevice()
+        catch e
+            @warn "CUDA is functional but health check failed: $e. Falling back to next device."
+        end
     end
+    
+    if AMDGPU.functional()
+        try
+            # Light health check: allocate a tiny array to verify stream/memory management
+            AMDGPU.ROCArray([1.0f0])
+            return AMDDevice()
+        catch e
+            @warn "AMDGPU is functional but health check failed: $e. Falling back to next device."
+        end
+    end
+
+    # Try Vulkan if others fail or are unavailable
+    try
+        v_inst = Vulkan.Instance([], [])
+        v_pdevs = Vulkan.enumerate_physical_devices(v_inst)
+        # Handle Result type from Vulkan.jl
+        actual_pdevs = v_pdevs isa Vector ? v_pdevs : Vulkan.unwrap(v_pdevs)
+        
+        if !isempty(actual_pdevs)
+            for pdev in actual_pdevs
+                props = Vulkan.get_physical_device_properties(pdev)
+                # Use numerical values if constants are giving trouble, or try to access them via Vulkan
+                is_gpu = Int(props.device_type) == 1 || Int(props.device_type) == 2
+                if is_gpu
+                    return VulkanDevice(props.device_name)
+                end
+            end
+        end
+    catch e
+        @debug "Vulkan detection failed: $e"
+    end
+    
+    return CPUDevice()
 end
 
 """
@@ -32,15 +78,22 @@ end
 
 Move data to the specified device. Handles Arrays and Dictionaries.
 """
-to_device(data, ::CPUDevice) = data
+# Fallback for generic objects (like Numbers, or already correctly placed arrays)
+to_device(data, ::AbstractDevice) = data
+
+# Dictionary mapping
+to_device(data::Dict, device::AbstractDevice) = Dict{Any, Any}(k => to_device(v, device) for (k, v) in data)
+
+# Physical data placement
 to_device(data::AbstractArray, ::CUDADevice) = CuArray(data)
 to_device(data::AbstractArray, ::AMDDevice) = ROCArray(data)
-to_device(data::Dict, device::AbstractDevice) = Dict{Any, Any}(k => to_device(v, device) for (k, v) in data)
-to_device(data::Dict, ::CPUDevice) = Dict{Any, Any}(k => v for (k, v) in data)
+# Explicitly handle CPUDevice and VulkanDevice to avoid ambiguity with generic fallback
+to_device(data::AbstractArray, ::CPUDevice) = data
+to_device(data::AbstractArray, ::VulkanDevice) = data
+
+# Number placement (mostly for scalars in graphs)
 to_device(data::Number, ::CUDADevice) = CuArray(fill(Float32(data)))
 to_device(data::Number, ::AMDDevice) = ROCArray(fill(Float32(data)))
-to_device(data::Number, ::CPUDevice) = data
-to_device(data::Number, ::AbstractDevice) = data
 
 """
     from_device(data)

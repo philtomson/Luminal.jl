@@ -1,6 +1,9 @@
 using Test
 using Luminal
 using CUDA
+using AMDGPU
+
+dev = get_device()
 
 @testset "GPU Graph Execution" begin
     g = Luminal.Graph()
@@ -21,35 +24,35 @@ using CUDA
     @test cpu_res ≈ Float32[11.0, 18.0, 27.0]
     
     # Verify GPU execution
-    if CUDA.functional()
-        println("Running on GPU (CUDA)...")
+    if dev isa CPUDevice
+        @warn "No GPU device available (or health check failed), skipping GPU execution test."
+    else
+        println("Running on GPU ($dev)...")
         gpu_res = Luminal.execute(g, out.id, Dict(
             a.id => Float32[1.0, 2.0, 3.0],
             b.id => Float32[4.0, 5.0, 6.0],
             c.id => Float32[7.0, 8.0, 9.0]
-        ), CUDADevice())
+        ), dev)
         @test gpu_res ≈ [11.0, 18.0, 27.0]
-    else
-        @warn "CUDA not available, skipping GPU execution test."
     end
 end
 
 @testset "GPU Reductions" begin
-    if CUDA.functional()
+    if ! (dev isa CPUDevice)
         g = Luminal.Graph()
         a = Luminal.tensor(g, rand(Float32, 4, 4))
         out = Luminal.sum(a, 1) # sum along first dimension
         
         data = rand(Float32, 4, 4)
-        expected = sum(data, dims=1)
+        expected = dropdims(sum(data, dims=1), dims=1)
         
-        res = Luminal.execute(g, out.id, Dict(a.id => data), CUDADevice())
+        res = Luminal.execute(g, out.id, Dict(a.id => data), dev)
         @test res ≈ expected
     end
 end
 
 @testset "GPU Fused Ops" begin
-    if CUDA.functional()
+    if ! (dev isa CPUDevice)
         g = Luminal.Graph()
         a = Luminal.tensor(g, rand(Float32, 10))
         b = Luminal.tensor(g, rand(Float32, 10))
@@ -57,7 +60,7 @@ end
         
         # Test FusedMulAdd
         fma_op = Luminal.FusedMulAdd()
-        fma_node = Luminal.add_op!(g, fma_op, [(a.id, 0), (b.id, 0), (c.id, 0)], Luminal.ShapeTracker([10]))
+        fma_node = Luminal.add_op!(g, fma_op, [(a.id, 0, a.shape), (b.id, 0, b.shape), (c.id, 0, c.shape)], Luminal.ShapeTracker([10]))
         
         data_a = rand(Float32, 10)
         data_b = rand(Float32, 10)
@@ -68,7 +71,7 @@ end
             a.id => data_a,
             b.id => data_b,
             c.id => data_c
-        ), CUDADevice())
+        ), dev)
         @test res ≈ expected
     end
 end

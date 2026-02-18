@@ -2,13 +2,15 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "44591858dfb43765962d0b399e9feb1f590cc5c0"
+project_hash = "77a8617946aa57b9ef805dbbe6704ef390fac890"
 
 [[deps.AMDGPU]]
-deps = ["AbstractFFTs", "AcceleratedKernels", "Adapt", "Atomix", "BFloat16s", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLD_jll", "LLVM", "LLVM_jll", "Libdl", "LinearAlgebra", "Pkg", "Preferences", "PrettyTables", "Printf", "ROCmDeviceLibs_jll", "Random", "Random123", "RandomNumbers", "SparseArrays", "SpecialFunctions", "StaticArraysCore", "Statistics", "UnsafeAtomics"]
-git-tree-sha1 = "a9ee6409fdb4d1156df1fdbf703cd4d023111ae4"
+deps = ["AbstractFFTs", "AcceleratedKernels", "Adapt", "Atomix", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLD_jll", "LLVM", "LLVM_jll", "Libdl", "LinearAlgebra", "Pkg", "Preferences", "PrettyTables", "Printf", "ROCmDeviceLibs_jll", "Random", "Random123", "RandomNumbers", "SparseArrays", "SpecialFunctions", "StaticArraysCore", "Statistics", "UnsafeAtomics"]
+git-tree-sha1 = "62d3a88a982385dce502d95815d2052977e528b9"
+repo-rev = "sds/update_wrappers"
+repo-url = "https://github.com/simeonschaub/AMDGPU.jl"
 uuid = "21141c5a-9bdb-4563-92ae-f87d6854732e"
-version = "2.2.1"
+version = "2.1.4"
 
     [deps.AMDGPU.extensions]
     AMDGPUChainRulesCoreExt = "ChainRulesCore"
@@ -171,6 +173,11 @@ version = "1.6.3"
 git-tree-sha1 = "a2d308fcd4c2fb90e943cf9cd2fbfa9c32b69733"
 uuid = "e2ed5e7c-b2de-5872-ae92-c73ca462fb04"
 version = "0.2.2"
+
+[[deps.BitMasks]]
+git-tree-sha1 = "4751ad2b3b58362f1584ff07ddb9d13aed53ef7a"
+uuid = "a3e06817-fd65-4797-8291-16f435bc2529"
+version = "0.1.9"
 
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
@@ -442,6 +449,11 @@ git-tree-sha1 = "af433a10f3942e882d3c671aacb203e006a5808f"
 uuid = "9c1d0b0a-7046-5b2e-a33f-ea22f176ac7e"
 version = "0.2.1+0"
 
+[[deps.JuliaSyntax]]
+git-tree-sha1 = "0d4b3dab95018bcf3925204475693d9f09dc45b8"
+uuid = "70703baa-626e-46a2-a12c-08ffd08c73b4"
+version = "1.0.2"
+
 [[deps.JuliaSyntaxHighlighting]]
 deps = ["StyledStrings"]
 uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
@@ -564,6 +576,11 @@ version = "0.3.29"
 [[deps.Logging]]
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
+
+[[deps.MLStyle]]
+git-tree-sha1 = "bc38dff0548128765760c79eb7388a4b37fae2c8"
+uuid = "d8e11817-5142-5d16-987a-aa16d5891078"
+version = "0.4.17"
 
 [[deps.MacroTools]]
 git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
@@ -763,6 +780,12 @@ git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
 uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.3.1"
 
+[[deps.ResultTypes]]
+deps = ["JuliaSyntax"]
+git-tree-sha1 = "d5343c5511ad148434a5d0f9f055d1ce0b6104ba"
+uuid = "08a2b407-ddc3-586a-afd6-c784ad1fffe2"
+version = "4.0.2"
+
 [[deps.RuntimeGeneratedFunctions]]
 deps = ["ExprTools", "SHA", "Serialization"]
 git-tree-sha1 = "7257165d5477fd1025f7cb656019dcb6b0512c38"
@@ -857,6 +880,12 @@ deps = ["PrecompileTools"]
 git-tree-sha1 = "a3c1536470bf8c5e02096ad4853606d7c8f62721"
 uuid = "892a3eda-7b42-436c-8928-eab12a02cf0e"
 version = "0.4.2"
+
+[[deps.StructEquality]]
+deps = ["Compat"]
+git-tree-sha1 = "192a9f1de3cfef80ab1a4ba7b150bb0e11ceedcf"
+uuid = "6ec83bb0-ed9f-11e9-3b4c-2b04cb4e219c"
+version = "2.1.0"
 
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
@@ -989,6 +1018,38 @@ weakdeps = ["LLVM"]
 
     [deps.UnsafeAtomics.extensions]
     UnsafeAtomicsLLVM = ["LLVM"]
+
+[[deps.Vulkan]]
+deps = ["Accessors", "BitMasks", "DocStringExtensions", "Libdl", "Logging", "MLStyle", "PrecompileTools", "Preferences", "Reexport", "ResultTypes", "StructEquality", "VulkanCore"]
+git-tree-sha1 = "7b375c493667522d0031d21ad7c635f79e5fe62e"
+uuid = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
+version = "0.6.29"
+
+    [deps.Vulkan.extensions]
+    VulkanColorTypesExt = "ColorTypes"
+    VulkanFixedPointNumbersColorTypesExt = ["ColorTypes", "FixedPointNumbers"]
+    VulkanFixedPointNumbersExt = "FixedPointNumbers"
+    VulkanFixedPointNumbersStaticArraysCoreExt = ["FixedPointNumbers", "StaticArraysCore"]
+    VulkanStaticArraysCoreExt = "StaticArraysCore"
+    VulkanXCBExt = "XCB"
+
+    [deps.Vulkan.weakdeps]
+    ColorTypes = "3da002f7-5984-5a60-b8a6-cbb66c0b333f"
+    FixedPointNumbers = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
+    StaticArraysCore = "1e83bf80-4336-4d27-bf5d-d5a4f845583c"
+    XCB = "16167f82-ea26-5cba-b1de-ed6fd5e30a10"
+
+[[deps.VulkanCore]]
+deps = ["Libdl", "Vulkan_Headers_jll"]
+git-tree-sha1 = "12c41714a3b71816d4b46b57a24f807b944f0a31"
+uuid = "16167f82-ea26-5cba-b1de-ed6fd5e30a11"
+version = "1.3.1"
+
+[[deps.Vulkan_Headers_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
+git-tree-sha1 = "a2bfa46393bce7f450ee949273f2ba310d889693"
+uuid = "8d446b21-f3ad-5576-a034-752265b9b6f9"
+version = "1.4.321+0"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]
