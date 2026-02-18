@@ -4,7 +4,7 @@
 using Pkg
 
 # Use the modified Metatheory.jl
-# Pkg.develop(path="/tmp/Metatheory.jl")
+# Pkg.develop(path="/home/phil/build/Metatheory.jl")
 # Pkg.instantiate()
 
 using Metatheory

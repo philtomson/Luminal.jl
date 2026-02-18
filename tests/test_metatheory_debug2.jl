@@ -2,7 +2,7 @@
 # Debug: Why do custom functions still fail after the fix?
 
 using Pkg
-Pkg.develop(path="/tmp/Metatheory.jl")
+Pkg.develop(path="/home/phil/build/Metatheory.jl")
 
 using Metatheory
 using Metatheory.EGraphs

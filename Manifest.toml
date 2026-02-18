@@ -230,9 +230,9 @@ weakdeps = ["SparseArrays"]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
 
 [[deps.Combinatorics]]
-git-tree-sha1 = "08c8b6831dc00bfea825826be0bc8336fc369860"
+git-tree-sha1 = "c761b00e7755700f9cdf5b02039939d1359330e1"
 uuid = "861a8166-3701-5b0c-9a16-15d98fcdc6aa"
-version = "1.0.2"
+version = "1.1.0"
 
 [[deps.Compat]]
 deps = ["TOML", "UUIDs"]
@@ -342,9 +342,9 @@ version = "1.11.0"
 
 [[deps.GPUArrays]]
 deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "SparseArrays", "Statistics"]
-git-tree-sha1 = "cf610e3149d6bd9d3dfb63b218869394c3ee819f"
+git-tree-sha1 = "6487601563e4a1d1dab796e88b4548bf5544209e"
 uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-version = "11.4.0"
+version = "11.4.1"
 
     [deps.GPUArrays.extensions]
     JLD2Ext = "JLD2"
@@ -577,9 +577,9 @@ version = "1.11.0"
 
 [[deps.Metatheory]]
 deps = ["AutoHashEquals", "DocStringExtensions", "Reexport", "TermInterface", "TimerOutputs"]
-git-tree-sha1 = "b8ff82a4753bc85337c6c087fb0dd1c3b7318d2b"
-repo-rev = "fix-custom-operators"
-repo-url = "https://github.com/philtomson/Metatheory.jl"
+git-tree-sha1 = "1479a9c0e3ea3e3c7044db33ac9826114777e834"
+repo-rev = "ale/3.0"
+repo-url = "https://github.com/JuliaSymbolics/Metatheory.jl"
 uuid = "e9d8d322-4543-424a-9be4-0cc815abe26c"
 version = "3.0.0"
 
