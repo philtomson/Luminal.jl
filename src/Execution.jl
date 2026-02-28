@@ -97,6 +97,9 @@ function realize_view(data, st::ShapeTracker)
     end
 
     if length(data) == 1
+        if data isa Number
+            data = [data] # Wrap scalar in an array to allow reshape
+        end
         return Base.reshape(data, fill(1, length(st.indexes))...)
     end
 
@@ -130,7 +133,11 @@ function realize_view(data, st::ShapeTracker)
     end
     
     # 3. Apply Indexing (Permutation and Rank selection)
-    res = Base.permutedims(full_arr, st.indexes)
+    if st.indexes == 1:length(st.indexes)
+        res = full_arr
+    else
+        res = PermutedDimsArray(full_arr, Tuple(st.indexes))
+    end
     
     # 4. Apply Mask (Slicing)
     r_dims = realized_dims(st)
@@ -471,7 +478,89 @@ function flash_attn_cpu(q, k, v, scale, causal)
     return out
 end
 
-execute_op!(out, op::FusedElementwiseOp, inputs...) = broadcast!(op.f, out, inputs...)
+function unfold_1d_cpu!(out_2d, a_2d, O, K, S, D)
+    BC = size(out_2d, 1)
+    for bc in 1:BC
+        for o in 1:O
+            for k in 1:K
+                a_idx = (o - 1) * S + (k - 1) * D + 1
+                out_2d[bc, o, k] = a_2d[bc, a_idx]
+            end
+        end
+    end
+    return
+end
+
+function unfold_1d_cuda_kernel!(out_2d, a_2d, O, K, S, D)
+    bc = blockIdx().x
+    o = blockIdx().y
+    k = threadIdx().x
+    
+    if k <= K && o <= O && bc <= size(a_2d, 1)
+        a_idx = (o - 1) * S + (k - 1) * D + 1
+        out_2d[bc, o, k] = a_2d[bc, a_idx]
+    end
+    return
+end
+
+function execute_op!(out, op::Unfold, a)
+    fill!(out, 0)
+    spatial = length(op.kernel_shape)
+    if spatial == 1
+        K = op.kernel_shape[1]
+        S = op.stride_shape[1]
+        D = op.dilation_shape[1]
+        
+        O = size(out)[end-1]
+        BC = prod(size(out)[1:end-2])
+        L = size(a)[end]
+        
+        out_2d = Base.reshape(out, BC, O, K)
+        a_2d = Base.reshape(a, BC, L)
+        
+        if a isa CuArray
+            threads = min(K, 1024)
+            blocks = (BC, O)
+            @cuda threads=threads blocks=blocks unfold_1d_cuda_kernel!(out_2d, a_2d, O, K, S, D)
+        else
+            unfold_1d_cpu!(out_2d, a_2d, O, K, S, D)
+        end
+    else
+        error("Unfold > 1D not implemented")
+    end
+    return out
+end
+
+function execute_op(op::Unfold, a)
+    spatial = length(op.kernel_shape)
+    rank = ndims(a)
+    batch_len = rank - spatial - 1
+    out_spatial = Int[]
+    for i in 1:spatial
+        s_i = size(a, batch_len + 1 + i)
+        k_i = op.kernel_shape[i]
+        d_i = op.dilation_shape[i]
+        st_i = op.stride_shape[i]
+        o_i = (s_i - d_i * (k_i - 1) - 1) ÷ st_i + 1
+        push!(out_spatial, o_i)
+    end
+    out_shape = [size(a)[1:batch_len+1]..., out_spatial..., op.kernel_shape...]
+    out = similar(a, out_shape...)
+    return execute_op!(out, op, a)
+end
+
+function execute_op!(out, op::FusedElementwiseOp, inputs...)
+    try
+        broadcast!(op.f, out, inputs...)
+    catch e
+        println("FAILED TO COMPILE OR EXECUTE KERNEL FOR: ", op.name)
+        println("Output Type: ", typeof(out), " Size: ", size(out))
+        for (i, inp) in enumerate(inputs)
+            println("Input $i Type: ", typeof(inp), " Size: ", size(inp))
+        end
+        rethrow(e)
+    end
+end
 
 function execute_op!(out, op::FlashAttentionOp, q, k, v)
     if q isa CuArray
@@ -488,6 +577,23 @@ function execute_op!(out, op::FlashAttentionOp, q, k, v)
     return out
 end
 
+function _gather_kernel!(out, x, indices)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= length(out)
+        S = length(indices)
+        row = (i - 1) % S + 1
+        col = (i - 1) ÷ S + 1
+        
+        idx_val = Int(indices[row]) + 1
+        if idx_val >= 1 && idx_val <= size(x, 1)
+            @inbounds out[i] = x[idx_val, col]
+        else
+            @inbounds out[i] = 0.0f0
+        end
+    end
+    return nothing
+end
+
 function execute_op!(out, op::Function, inputs...)
     if op.name == "InputTensor"
         return nothing
@@ -495,14 +601,14 @@ function execute_op!(out, op::Function, inputs...)
         error("ARange requires context")
     elseif op.name == "Gather"
         # inputs[1][indices, :] -> out
-        indices = Int.(inputs[2]) .+ 1
-        # In-place gather?
-        # out .= inputs[1][indices, :]
-        # This allocates the temporary slice?
-        # Yes.
-        # Efficient gather! kernels exists in CUDA.jl/NNlib?
-        # For now:
-        copyto!(out, inputs[1][indices, :])
+        if typeof(out) <: CUDA.CuArray
+            threads = 256
+            blocks = ceil(Int, length(out) / threads)
+            CUDA.@cuda(threads=threads, blocks=blocks, _gather_kernel!(out, inputs[1], inputs[2]))
+        else
+            indices = Int.(inputs[2]) .+ 1
+            copyto!(out, inputs[1][indices, :])
+        end
     elseif op.name == "CumSum"
         cumsum!(out, inputs[1], dims=ndims(inputs[1]))
     else
@@ -511,8 +617,15 @@ function execute_op!(out, op::Function, inputs...)
     return out
 end
 
-function execute(graph::Graph, output_id::Int, initial_inputs::Dict, device::AbstractDevice=get_device())
+function execute(graph::Graph, output_ids::Vector{Int}, initial_inputs::Dict, device::AbstractDevice=get_device())
     results = to_device(initial_inputs, device)
+    
+    # Include pre-loaded weights from the graph
+    for ((node_id, output_idx), data) in graph.tensors
+        if !haskey(results, node_id) && output_idx == 1
+            results[node_id] = data
+        end
+    end
 
     for (node_id, node) in enumerate(graph.nodes)
         haskey(results, node_id) && continue
@@ -543,7 +656,17 @@ function execute(graph::Graph, output_id::Int, initial_inputs::Dict, device::Abs
         results[node_id] = current_result
     end
 
-    return from_device(results[output_id])
+    # Return a dict of results
+    final_results = Dict{Int, Any}()
+    for id in output_ids
+        final_results[id] = from_device(results[id])
+    end
+    return final_results
+end
+
+function execute(graph::Graph, output_id::Int, initial_inputs::Dict, device::AbstractDevice=get_device())
+    res_dict = execute(graph, [output_id], initial_inputs, device)
+    return res_dict[output_id]
 end
 
 function eval_dim(d)

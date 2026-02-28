@@ -12,14 +12,19 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, Function, Slice, Pad, FlashAttentionOp
+export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, Function, Slice, Pad, FlashAttentionOp, Unfold
+
 
 include("Graph.jl")
 export Graph, GraphTensor, add_op!, tensor, constant
 
+# Autograd
+include("Autograd.jl")
+export gradients, backward, mark_trainable!
+
 # Graph Construction API
 include("HighLevelOps.jl")
-export matmul, relu, sigmoid, swish, silu, gelu, softmax, layer_norm, mean_norm, std_norm, arange, gather, max_reduce, flash_attention, triu
+export matmul, relu, sigmoid, swish, silu, gelu, softmax, layer_norm, mean_norm, std_norm, arange, gather, max_reduce, flash_attention, triu, unfold, log2, exp2, sin, cos, sqrt, abs
 
 # Hardware Abstraction
 include("Device.jl")
@@ -29,6 +34,10 @@ export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice
 # Execution Engine
 include("Execution.jl")
 export execute
+
+# Weight Loading
+include("Weights.jl")
+export WeightRegistry, register_weight!, load_weights!, load_weights_hf!
 
 include("NN.jl")
 export NN
@@ -47,5 +56,10 @@ include("MetatheoryBridge.jl")
 include("MetatheoryCost.jl")
 include("MetatheoryRules.jl")
 include("MetatheoryOptimizer.jl")
+
+# Decoding & Inference
+include("Decoding.jl")
+using .Decoding
+export greedy_decode
 
 end # module Luminal
