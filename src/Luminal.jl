@@ -57,6 +57,11 @@ include("MetatheoryCost.jl")
 include("MetatheoryRules.jl")
 include("MetatheoryOptimizer.jl")
 
+# Tokenizers
+include("LlamaTokenizer.jl")
+using .LlamaTokenization
+export LlamaTokenizer, encode, decode
+
 # Decoding & Inference
 include("Decoding.jl")
 using .Decoding

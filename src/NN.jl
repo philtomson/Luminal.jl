@@ -2,7 +2,7 @@ module NN
 
 using ..Luminal
 
-export Linear, Conv1D, Embedding, LayerNorm, RMSNorm, Mlp, SelfAttention, TransformerBlock, Llama
+export Linear, Conv1D, Embedding, LayerNorm, RMSNorm, Mlp, SelfAttention, TransformerBlock, Llama, Phi3, repeat_kv
 
 # Layer Designs
 # --------------
@@ -172,6 +172,62 @@ function (ln::LayerNorm)(x::Luminal.GraphTensor)
     return out
 end
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Weight Registration Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Helper: create a named Linear layer with optional registration
+function _linear(in_f, out_f, cx, reg, prefix; bias=true)
+    l = Linear(in_f, out_f, cx; bias=bias)
+    if reg !== nothing
+        register_weight!(reg, "$(prefix).weight", l.weight)
+        bias && register_weight!(reg, "$(prefix).bias", l.bias)
+    end
+    return l
+end
+
+# Helper: create a named RMSNorm with optional registration
+function _rmsnorm(dim, cx, reg, prefix; epsilon=1f-5)
+    ln = RMSNorm(dim, cx; epsilon=epsilon)
+    if reg !== nothing
+        register_weight!(reg, "$(prefix).weight", ln.weight)
+    end
+    return ln
+end
+
+# Helper: create a named Embedding with optional registration
+function _embedding(vocab_size, dim, cx, reg, prefix)
+    weight = Luminal.tensor(cx, [vocab_size, dim])
+    if reg !== nothing
+        register_weight!(reg, "$(prefix).weight", weight)
+    end
+    return Embedding(weight)
+end
+
+# Helper: create a named LayerNorm with optional registration
+function _layernorm(dim, cx, reg, prefix; epsilon=1f-5)
+    ln = LayerNorm(dim, cx; epsilon=epsilon)
+    if reg !== nothing
+        register_weight!(reg, "$(prefix).weight", ln.weight)
+        ln.bias !== nothing && register_weight!(reg, "$(prefix).bias", ln.bias)
+    end
+    return ln
+end
+
+# Helper: create a Conv1D with optional registration
+function _conv1d(ch_in, ch_out, kernel, cx, reg, prefix; stride=1, padding=0, bias=true)
+    c = Conv1D(ch_in, ch_out, kernel, cx; stride=stride, padding=padding, bias=bias)
+    if reg !== nothing
+        register_weight!(reg, "$(prefix).weight", c.weight)
+        bias && register_weight!(reg, "$(prefix).bias", c.bias)
+    end
+    return c
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Models
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Llama MLP
 struct Mlp
     gate_proj::Linear
@@ -179,11 +235,11 @@ struct Mlp
     up_proj::Linear
 end
 
-function Mlp(hidden::Int, intermediate::Int, graph::Luminal.Graph)
+function Mlp(hidden::Int, intermediate::Int, graph::Luminal.Graph, reg=nothing, prefix::String="mlp")
     return Mlp(
-        Linear(hidden, intermediate, graph; bias=false),
-        Linear(intermediate, hidden, graph; bias=false),
-        Linear(hidden, intermediate, graph; bias=false)
+        _linear(hidden, intermediate, graph, reg, "$(prefix).gate_proj"; bias=false),
+        _linear(intermediate, hidden, graph, reg, "$(prefix).down_proj"; bias=false),
+        _linear(hidden, intermediate, graph, reg, "$(prefix).up_proj"; bias=false)
     )
 end
 
@@ -194,7 +250,7 @@ function (m::Mlp)(x::Luminal.GraphTensor)
 end
 
 # RoPE (Rotary Positional Embeddings)
-function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq::Int)
+function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq::Int; base=10000.0f0)
     # input: batch, n_heads, seq, head_dim
     dims = Luminal.realized_dims(input.shape)
     batch, n_heads, seq, head_dim = dims[1], dims[2], dims[3], dims[4]
@@ -204,7 +260,7 @@ function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq::Int)
     # Get freqs
     half_dim = div(head_dim, 2)
     freqs = Luminal.arange(graph, half_dim) * 2.0f0 / Float32(head_dim)
-    inv_freqs = Luminal.reciprocal(Luminal.exp2(freqs * log2(500000.0f0)))
+    inv_freqs = Luminal.reciprocal(Luminal.exp2(freqs * log2(Float32(base))))
     
     pos = Luminal.arange(graph, seq) + Float32(prev_seq)
     
@@ -246,6 +302,20 @@ function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq::Int)
     return Luminal.reshape(res, [batch, n_heads, seq, head_dim])
 end
 
+function repeat_kv(keys::Luminal.GraphTensor, groups::Int)
+    if groups == 1
+        return keys
+    end
+    # keys: (B, KV_H, S, D)
+    dims = Luminal.realized_dims(keys.shape)
+    batch, kv_heads, seq, head_dim = dims[1], dims[2], dims[3], dims[4]
+    
+    # expand to (B, KV_H, groups, S, D)
+    expanded = Luminal.expand(keys, 3, groups)
+    # reshape to (B, KV_H * groups, S, D)
+    return Luminal.reshape(expanded, [batch, kv_heads * groups, seq, head_dim])
+end
+
 # SelfAttention
 struct SelfAttention
     q_proj::Linear
@@ -257,20 +327,20 @@ struct SelfAttention
     head_dim::Int
 end
 
-function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Luminal.Graph)
+function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Luminal.Graph, reg=nothing, prefix::String="self_attn")
     head_dim = div(hidden, n_heads)
     return SelfAttention(
-        Linear(hidden, hidden, graph; bias=false),
-        Linear(hidden, n_kv_heads * head_dim, graph; bias=false),
-        Linear(hidden, n_kv_heads * head_dim, graph; bias=false),
-        Linear(hidden, hidden, graph; bias=false),
+        _linear(hidden, hidden, graph, reg, "$(prefix).q_proj"; bias=false),
+        _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).k_proj"; bias=false),
+        _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).v_proj"; bias=false),
+        _linear(hidden, hidden, graph, reg, "$(prefix).o_proj"; bias=false),
         n_heads,
         n_kv_heads,
         head_dim
     )
 end
 
-function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int)
+function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0)
     # x: (batch, seq, hidden)
     batch, seq, hidden = Luminal.realized_dims(x.shape)
     
@@ -284,17 +354,15 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int)
     values = Luminal.permute(values, [1, 3, 2, 4]) # (B, KV_H, S, D)
     
     # RoPE
-    queries = apply_rotary_embeddings(queries, prev_seq)
-    keys = apply_rotary_embeddings(keys, prev_seq)
+    queries = apply_rotary_embeddings(queries, prev_seq; base=rope_base)
+    keys = apply_rotary_embeddings(keys, prev_seq; base=rope_base)
     
     # Attention: (Q @ K.T) / sqrt(D)
-    # For GQA, we need to expand K and V if KV_H < H
+    # GQA: Repeat KV heads to match Q heads
     if sa.n_kv_heads < sa.n_heads
         groups = div(sa.n_heads, sa.n_kv_heads)
-        # keys: (B, KV_H, S, D) -> (B, KV_H, groups, S, D)
-        keys = Luminal.expand(Luminal.expand(keys, 3, groups), 5, sa.head_dim) # This is not quite right in Julia expand
-        # Actually in Luminal Rust they do expand_dim(2, groups)
-        # For simplicity, let's assume H == KV_H for now or implement proper GQA later.
+        keys = repeat_kv(keys, groups)
+        values = repeat_kv(values, groups)
     end
     
     # (B, H, S, D) @ (B, H, D, S) -> (B, H, S, S)
@@ -326,18 +394,18 @@ struct TransformerBlock
     feed_forward_norm::LayerNorm
 end
 
-function TransformerBlock(hidden::Int, n_heads::Int, n_kv_heads::Int, intermediate::Int, graph::Luminal.Graph)
+function TransformerBlock(hidden::Int, n_heads::Int, n_kv_heads::Int, intermediate::Int, graph::Luminal.Graph, reg=nothing, prefix::String="block")
     return TransformerBlock(
-        SelfAttention(hidden, n_heads, n_kv_heads, graph),
-        RMSNorm(hidden, graph),
-        Mlp(hidden, intermediate, graph),
-        RMSNorm(hidden, graph)
+        SelfAttention(hidden, n_heads, n_kv_heads, graph, reg, "$(prefix).self_attn"),
+        _rmsnorm(hidden, graph, reg, "$(prefix).input_layernorm"),
+        Mlp(hidden, intermediate, graph, reg, "$(prefix).mlp"),
+        _rmsnorm(hidden, graph, reg, "$(prefix).post_attention_layernorm")
     )
 end
 
-function (tb::TransformerBlock)(x::Luminal.GraphTensor, prev_seq::Int)
+function (tb::TransformerBlock)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0)
     normed_x = tb.attention_norm(x)
-    attn_out = tb.attention(normed_x, prev_seq)
+    attn_out = tb.attention(normed_x, prev_seq; rope_base=rope_base)
     x = x + attn_out
     
     normed_x = tb.feed_forward_norm(x)
@@ -353,26 +421,86 @@ struct Llama
     head::Linear
 end
 
-function Llama(graph::Luminal.Graph; 
+function Llama(graph::Luminal.Graph, reg=nothing; 
                vocab_size=128256, 
                hidden=4096, 
                n_layers=32, 
                n_heads=32, 
                n_kv_heads=8, 
                intermediate=14336)
-    layers = [TransformerBlock(hidden, n_heads, n_kv_heads, intermediate, graph) for _ in 1:n_layers]
+    
+    pfx = "model"
+    layers = [TransformerBlock(hidden, n_heads, n_kv_heads, intermediate, graph, reg, "$(pfx).layers.$(i-1)") for i in 1:n_layers]
+    
+    emb_weight = Luminal.tensor(graph, [vocab_size, hidden])
+    if reg !== nothing
+        register_weight!(reg, "$(pfx).embed_tokens.weight", emb_weight)
+    end
+    
     return Llama(
-        Embedding(vocab_size, hidden, graph),
+        Embedding(emb_weight),
         layers,
-        RMSNorm(hidden, graph),
-        Linear(hidden, vocab_size, graph; bias=false)
+        _rmsnorm(hidden, graph, reg, "$(pfx).norm"),
+        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
     )
 end
 
 function (l::Llama)(input::Luminal.GraphTensor, prev_seq::Int)
     x = l.embedding(input)
     for layer in l.layers
-        x = layer(x, prev_seq)
+        x = layer(x, prev_seq; rope_base=500000.0f0)
+    end
+    x = l.norm(x)
+    return l.head(x)
+end
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Top-level Phi-3 Model
+# ──────────────────────────────────────────────────────────────────────────────
+
+struct Phi3
+    embedding::Embedding
+    layers::Vector{TransformerBlock}
+    norm::LayerNorm
+    head::Linear
+end
+
+"""
+    Phi3(; vocab_size=32064, hidden=3072, n_layers=32, n_heads=32, n_kv_heads=8, intermediate=8192)
+
+Phi-3-mini-4k-instruct model architecture.
+"""
+function Phi3(graph::Luminal.Graph, reg=nothing; 
+               vocab_size=32064, 
+               hidden=3072, 
+               n_layers=32, 
+               n_heads=32, 
+               n_kv_heads=8, 
+               intermediate=8192)
+    
+    pfx = "model"
+    # Phi-3 uses similar layer naming to Llama but sometimes with slight variations.
+    # We'll use Llama-style as default for now which matches most HF Phi-3 mini checkpoints.
+    layers = [TransformerBlock(hidden, n_heads, n_kv_heads, intermediate, graph, reg, "$(pfx).layers.$(i-1)") for i in 1:n_layers]
+    
+    emb_weight = Luminal.tensor(graph, [vocab_size, hidden])
+    if reg !== nothing
+        register_weight!(reg, "$(pfx).embed_tokens.weight", emb_weight)
+    end
+
+    return Phi3(
+        Embedding(emb_weight),
+        layers,
+        _rmsnorm(hidden, graph, reg, "$(pfx).norm"),
+        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
+    )
+end
+
+function (l::Phi3)(input::Luminal.GraphTensor, prev_seq::Int)
+    x = l.embedding(input)
+    for layer in l.layers
+        # Phi-3 mini uses RoPE base 10000.0
+        x = layer(x, prev_seq; rope_base=10000.0f0)
     end
     x = l.norm(x)
     return l.head(x)

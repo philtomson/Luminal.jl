@@ -231,40 +231,7 @@ function sinusoids(channels::Int, length::Int, cx::Luminal.Graph)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers for optional weight registration
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Helper: create a named Linear layer with optional registration
-function _linear(in_f, out_f, cx, reg, prefix; bias=true)
-    l = Linear(in_f, out_f, cx; bias=bias)
-    if reg !== nothing
-        register_weight!(reg, "$(prefix).weight", l.weight)
-        bias && register_weight!(reg, "$(prefix).bias", l.bias)
-    end
-    return l
-end
-
-# Helper: create a named LayerNorm with optional registration
-function _layernorm(dim, cx, reg, prefix; epsilon=1f-5)
-    ln = LayerNorm(dim, cx; epsilon=epsilon)
-    if reg !== nothing
-        register_weight!(reg, "$(prefix).weight", ln.weight)
-        register_weight!(reg, "$(prefix).bias", ln.bias)
-    end
-    return ln
-end
-
-# Helper: create a Conv1D with optional registration
-function _conv1d(ch_in, ch_out, kernel, cx, reg, prefix; stride=1, padding=0, bias=true)
-    c = Conv1D(ch_in, ch_out, kernel, cx; stride=stride, padding=padding, bias=bias)
-    if reg !== nothing
-        register_weight!(reg, "$(prefix).weight", c.weight)
-        bias && register_weight!(reg, "$(prefix).bias", c.bias)
-    end
-    return c
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
+# Whisper Architecture definitions
 # Whisper Self-Attention
 # ─────────────────────────────────────────────────────────────────────────────
 
