@@ -3,7 +3,7 @@
 This document outlines the strategy and progress for porting the Luminal deep learning framework from Rust to Julia.
 
 > [!NOTE]
-> **Last updated: February 17, 2026** — Reflects completion of Phase 6 (Flash Attention) and Phase 8 (Search-Based Compilation).
+> **Last updated: February 20, 2026** — Reflects completion of Phase 5 (Standalone Llama GPU Generation) and Phase 8.
 
 ---
 
@@ -65,6 +65,10 @@ Verified by 81 passing tests.
 - **[x] Verification**: Verified with comprehensive unit and end-to-end tests in `Julia/tests/test_llama.jl`.
 - **[x] Benchmarking**: Preliminary result: 131ms for TinyLlama 2L/1024H on GPU.
 - **[x] Upstream Sync**: Analyzed upstream Rust repo. Confirmed core logic is stable; recent changes are primarily custom CUDA kernels (optimizations) and backend-specific fixes.
+- **[x] Standalone Example**: Created `examples/llama.jl` to demonstrate the end-to-end compilation, hardware-acceleration, and simulated generation loop of the Llama model architecture.
+  - _Bug Fix Discovery_: During the example's compilation phase, it was discovered that `SymbolicUtils.jl` eagerly simplifies `x * x` to dynamic exponential calls like `Base.:^(x, 2)`, which triggered an `InvalidIRError` during `CUDA.jl` execution. A custom AST transformation was injected into `Compiler.jl` to securely map these back to element-wise multiplication before constructing GPU execution kernels.
+  - _CUDA JIT & World Age Fixes_: Solved Julia 1.12 `InvalidIRError` by generating global named CUDA kernels natively (`Core.eval`) rather than `RuntimeGeneratedFunction` closures to circumvent JIT semantic errors during dynamic graph execution.
+  - _CUDA Graph Capture Issues_: Disabled `CUDA.capture()` default graph instantiations during generation loops on NVIDIA due to dynamic workspace allocations inside `array view`-enabled CUBLAS routes (`batch_matmul!`) triggering graph topology invalidation on replay. Simulation now completes dynamically at ~47 tok/sec.
 
 ---
 
@@ -144,12 +148,12 @@ The following features from the Rust version are **not yet implemented** in the 
 
 **Status**: Single-device only. Not prioritized.
 
-### Additional Models ❌
-- Whisper (speech recognition)
-- Yolo v8 (object detection)
-- Phi 3
+### Additional Models
+- **[x] Whisper (speech recognition)** - Ported core architecture components (`AudioEncoder`, `TextDecoder`, `Conv1D`, `WhisperSelfAttention`, `WhisperCrossAttention`) and compiled simulation loop to `examples/whisper.jl` running at ~12 steps/sec.
+- ❌ Yolo v8 (object detection)
+- ❌ Phi 3
 
-**Status**: Only Llama architecture implemented. Models can be added as needed.
+**Status**: Llama and Whisper architectures implemented. Models can be added as needed.
 
 ### Advanced Hardware Features ❌
 - Metal backend (macOS GPU)

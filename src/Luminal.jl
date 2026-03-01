@@ -62,4 +62,9 @@ include("Decoding.jl")
 using .Decoding
 export greedy_decode
 
+# Training & Optimizers
+include("Optimizer.jl")
+using .Optimizer
+export SGD, Adam, AbstractOptimizer, step!
+
 end # module Luminal

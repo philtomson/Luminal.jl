@@ -21,6 +21,7 @@ mutable struct Graph
     dyn_map::Dict{Char, Int}
     no_delete::Set{Int}
     to_retrieve::Set{Int}
+    trainable::Set{Int}
 
     # Default constructor
     function Graph()
@@ -29,6 +30,7 @@ mutable struct Graph
             Dict{Tuple{Int, Int}, Any}(), 
             Dict{Char, Int}(), 
             Set{Int}(), 
+            Set{Int}(),
             Set{Int}())
     end
 end

@@ -112,28 +112,10 @@ If supported (e.g. CUDA), it captures the execution into a graph stored in `cach
 and replays it on subsequent calls.
 """
 function execute_with_capture(::CUDADevice, f, cache::Dict)
-    # Check if executable graph exists in cache
-    if haskey(cache, :cuda_exec)
-        exec = cache[:cuda_exec]
-        # Launch existing graph
-        CUDA.launch(exec)
-    else
-        # 1. Warm up JIT! 
-        # Capturing during JIT compilation often fails/invalidates.
-        # Run once to ensure all kernels are compiled.
-        f()
-        
-        # 2. Capture and instantiate new graph
-        graph = CUDA.capture() do
-            f()
-        end
-        
-        exec = CUDA.instantiate(graph)
-        cache[:cuda_exec] = exec
-        
-        # 3. Launch the graph
-        CUDA.launch(exec)
-    end
+    # Temporary diagnostic step: bypass CUDA graph capture completely.
+    # We suspect CUBLAS batched_mul loops or similar operations implicitly allocate
+    # transient workspaces which get freed and invalidate the captured graph.
+    f()
 end
 
 execute_with_capture(::AbstractDevice, f, cache) = f()

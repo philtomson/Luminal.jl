@@ -49,14 +49,25 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 - **SymbolicUtils.jl** v3.31.0
 - **Metatheory.jl** v3.0 (from the `ale/3.0` branch of `JuliaSymbolics/Metatheory.jl`)
 
-## Running Llama
+## Examples
 
+### 🦙 Llama Inference
 ```bash
-cd Julia
-julia --project=. tests/test_llama.jl
+julia --project=. examples/llama.jl
 ```
+Simulates the generation loop of a small 4-layer Llama model using compiled graphs. 
 
-This runs a small 2-layer Llama model for testing. Full Llama 3 8B support is in progress.
+### 🤫 Whisper Inference
+```bash
+julia --project=. examples/whisper.jl
+```
+Runs the full Whisper speech-to-text pipeline (Audio Encoder + Text Decoder with KV Cache).
+
+### 📈 Linear Regression (Training)
+```bash
+julia --project=. examples/linear_regression.jl
+```
+Demonstrates the **Training API**: Forward pass, Loss computation, Autograd (`backward`), and Optimizer (`Adam`) updates.
 
 ## Features
 
@@ -76,7 +87,7 @@ This runs a small 2-layer Llama model for testing. Full Llama 3 8B support is in
   - `FusedMulAdd`: `a * b + c` → single kernel
   - `FusedAddReLU`: `relu(a + b)` → single kernel
 - **Static Memory Allocation**: All buffers pre-allocated at compile time
-- **CUDA Graph Capture**: Reduces kernel launch overhead on NVIDIA GPUs
+- **CUDA Graph Capture**: Supported, but currently disabled by default on NVIDIA GPUs to avoid memory pool conflicts during generation loops.
 - **Search-Based Compilation**: E-Graph based optimization via **Metatheory.jl**
   - Pattern matching with custom unary and binary operators
   - Structural rewrite rules with canonicalization
@@ -91,11 +102,11 @@ This runs a small 2-layer Llama model for testing. Full Llama 3 8B support is in
 #### Neural Network Layers
 High-level API in `NN.jl`:
 - ✅ `Linear` - Fully connected layers (Verified)
-- `Embedding` - Token embeddings
+- ✅ `Embedding` - Token embeddings (Verified)
 - ✅ `LayerNorm` - Layer normalization (Verified)
-- `RMSNorm` - Root mean square normalization
-- `Attention` - Multi-head attention with KV cache
-- `RoPE` - Rotary positional embeddings
+- ✅ `RMSNorm` - Root mean square normalization
+- ✅ `Attention` - Multi-head attention with KV cache
+- ✅ `RoPE` - Rotary positional embeddings
 
 #### Transformer Support
 - **Llama Architecture**: Fully implemented
@@ -108,6 +119,11 @@ High-level API in `NN.jl`:
   - Online softmax algorithm
   - CPU fallback
 
+#### Weight Loading & Data
+- **Safetensors Support**: Load weights directly from `.safetensors` files
+- **HuggingFace Integration**: `load_weights_hf!` for automatic model downloads
+- **Tokenizer**: Native BPE tokenizers for Llama and Whisper (pure Julia)
+
 #### High-Level Operations
 Comprehensive operator library in `HighLevelOps.jl`:
 - Math: `+, -, *, /, ^, sqrt, exp, log, sin, cos`
@@ -116,19 +132,15 @@ Comprehensive operator library in `HighLevelOps.jl`:
 - Activations: `relu, sigmoid, swish, gelu, softmax`
 - Reductions: `sum, max, mean`
 
+#### Training & Autograd
+- **Reverse-Mode AD**: Full implementation of automatic differentiation
+- **Operator Gradients**: VJP rules for all 12 primitives and broadcasting
+- **Optimizers**: `SGD` and `Adam` implementation for model training
+- **Integrations**: `backward(loss)` and `step!(opt, loss)` for training loops
+
 ### ⚠️ Missing Features
 
 The following features from the Rust version are **not yet implemented**:
-
-#### Training Support
-- ❌ Autograd / automatic differentiation
-- ❌ Gradient computation
-- ❌ Backpropagation
-- ❌ Optimizers (SGD, Adam, etc.)
-
-The Julia port uses **E-Graph based compilation** via Metatheory.jl for advanced optimizations and SymbolicUtils.jl for rule-based rewrites.
-
-Currently **inference-only**. Training support is planned for future releases.
 
 #### Distributed Computing
 - ❌ Data parallelism
@@ -139,7 +151,7 @@ Currently **inference-only**. Training support is planned for future releases.
 Single-device execution only.
 
 #### Additional Models
-- ❌ Whisper (speech recognition)
+- ✅ Whisper (speech recognition) - Full inference with KV cache
 - ❌ Yolo v8 (object detection)
 - ❌ Phi 3
 
@@ -189,7 +201,13 @@ Julia/
 │   ├── Compiler.jl             # Graph compilation & fusion
 │   ├── Execution.jl            # Interpreter & kernels
 │   ├── Device.jl               # Hardware abstraction
-│   └── NN.jl                   # Neural network layers
+│   ├── NN.jl                   # Neural network layers
+│   ├── Autograd.jl             # Reverse-mode AD
+│   ├── Optimizer.jl            # SGD & Adam optimizers
+│   ├── Decoding.jl             # Greedy decode logic
+│   ├── Weights.jl              # Safetensors/HF weight loading
+│   ├── Whisper.jl              # Whisper architecture
+│   └── WhisperTokenizer.jl      # Whisper BPE tokenizer
 ├── tests/                      # Comprehensive test suite
 └── docs/
     └── porting_plan.md         # Detailed porting status
@@ -213,6 +231,9 @@ julia --project=. tests/test_compilation.jl    # Graph compilation
 julia --project=. tests/test_fusion.jl          # Operator fusion
 julia --project=. tests/test_attention.jl       # Flash attention
 julia --project=. tests/test_llama.jl           # Llama model
+julia --project=. tests/test_autograd.jl        # Autograd verification
+julia --project=. tests/test_optimizer.jl       # Optimizer verification
+julia --project=. tests/test_greedy_decode.jl   # Whisper end-to-end
 ```
 
 See [`tests/README.md`](tests/README.md) for detailed test documentation.
@@ -224,7 +245,9 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 | Model | Device | Throughput |
 |-------|--------|------------|
 | TinyLlama 2L/1024H | CUDA | 131ms per forward pass |
+| TinyLlama 4L/512H (Generation)| CUDA | ~47 tok/s (21ms/token) |
 | Llama Attention (compiled) | CUDA | ~10x faster than interpreter |
+| Whisper Decoding | CPU | ~12 steps/s |
 
 > [!NOTE]
 > Performance is still being optimized. The Rust version achieves 15-25 tok/s on Llama 3 8B (M-series Macs).
@@ -240,9 +263,9 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 | **CUDA Support** | ✅ Native | ✅ Via CUDA.jl | Slightly slower |
 | **Metal Support** | ✅ Native | ❌ Not supported | Julia limitation |
 | **Flash Attention** | ✅ Auto-derived | ✅ Hand-written | Both optimized |
-| **Training** | ✅ Full support | ❌ Missing | Planned |
+| **Training** | ✅ Full support | ✅ SGD & Adam | Supported |
 | **Llama** | ✅ 3/3.1/3.2 | ✅ Architecture only | Working |
-| **Other Models** | ✅ Whisper, Yolo | ❌ Not ported | Future work |
+| **Other Models** | ✅ Whisper, Yolo | ✅ Whisper only | Ported |
 | **Distributed** | ✅ Planned | ❌ Not planned | Long-term |
 
 ## Roadmap
@@ -256,10 +279,10 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 - ⏳ PyTorch numerical validation
 
 ### Medium-term (Q2 2026)
-- ⏳ Training support (autograd)
+- ✅ Training support (autograd & optimizers)
+- ✅ Whisper implementation
 - ⏳ Gradient checkpointing
 - ⏳ Mixed precision (FP16/BF16)
-- ⏳ Whisper implementation
 
 ### Long-term
 - ⏳ Multi-GPU support

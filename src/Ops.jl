@@ -76,6 +76,12 @@ struct Pad <: Op
     padding::Vector{Tuple{Int, Int}}
 end
 
+struct Unfold <: Op
+    kernel_shape::Vector{Int}
+    stride_shape::Vector{Int}
+    dilation_shape::Vector{Int}
+end
+
 # Special Ops
 struct MatMul <: Op end
 struct Constant <: Op

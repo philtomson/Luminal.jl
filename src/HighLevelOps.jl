@@ -1,4 +1,4 @@
-import Base: +, -, *, /, %, <, >, <=, >=, ==, !=, log2, exp2, sin, cos, exp, sqrt, max, min, abs
+import Base: +, -, *, /, %, <, >, <=, >=, ==, !=, log2, exp2, sin, cos, exp, sqrt, max, min, abs, sum, maximum
 
 # Binary Arithmetics with Scalar support
 # -------------------------------------
@@ -385,4 +385,36 @@ function flash_attention(q::GraphTensor, k::GraphTensor, v::GraphTensor; scale=n
     output_shape = q.shape # Output has same shape as Q
     
     return add_op!(q.graph_ref, FlashAttentionOp(Float32(scale), causal), inputs, output_shape)
+end
+
+function unfold(a::GraphTensor, kernel_shape::Vector{Int}, stride_shape::Vector{Int}, dilation_shape::Vector{Int})
+    spatial = length(kernel_shape)
+    rank = length(realized_dims(a.shape))
+    @assert rank > spatial "Input rank $rank must be greater than spatial dims $spatial"
+    
+    batch_len = rank - spatial - 1
+    a_dims = realized_dims(a.shape)
+    
+    out_spatial = Int[]
+    for i in 1:spatial
+        # evaluate the dynamic/static dimension size
+        s_i = typeof(a_dims[batch_len + 1 + i]) == Int ? a_dims[batch_len + 1 + i] : 1 # or throw for symbolic for now
+        if typeof(a_dims[batch_len + 1 + i]) != Int
+             error("Unfold currently requires concrete spatial dimensions, got $(a_dims[batch_len + 1 + i])")
+        end
+        
+        k_i = kernel_shape[i]
+        d_i = dilation_shape[i]
+        st_i = stride_shape[i]
+        
+        o_i = (s_i - d_i * (k_i - 1) - 1) ÷ st_i + 1
+        push!(out_spatial, o_i)
+    end
+    
+    # New shape: [batch..., channels, out_spatial..., kernel_shape...]
+    output_shape_vec = [a_dims[1:batch_len+1]..., out_spatial..., kernel_shape...]
+    output_shape = ShapeTracker(output_shape_vec)
+    
+    inputs = [(a.id, 0, a.shape)]
+    return add_op!(a.graph_ref, Unfold(kernel_shape, stride_shape, dilation_shape), inputs, output_shape)
 end

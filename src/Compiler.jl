@@ -9,6 +9,38 @@ using Luminal.SymbolicIntegration # For luminal_to_symbolic and luminal_relu
 # Import execution functions for compiled thunk
 using Luminal: execute_op, execute_op!, realize_view, to_device, realized_dims, eval_dim, execute_with_capture
 using CUDA
+using KernelAbstractions
+using RuntimeGeneratedFunctions
+RuntimeGeneratedFunctions.init(@__MODULE__)
+
+function fix_gpu_ast!(expr::Expr)
+    if expr.head == :call
+        if expr.args[1] == :exp2
+            expr.args[1] = :(Base.exp2)
+        elseif expr.args[1] == :log2
+            expr.args[1] = :(Base.log2)
+        elseif expr.args[1] == :sin
+            expr.args[1] = :(Base.sin)
+        elseif expr.args[1] == :cos
+            expr.args[1] = :(Base.cos)
+        elseif expr.args[1] == :sqrt
+            expr.args[1] = :(Base.sqrt)
+        elseif expr.args[1] == :max
+            expr.args[1] = :(Base.max)
+        elseif expr.args[1] == :min
+            expr.args[1] = :(Base.min)
+        end
+        for i in 2:length(expr.args)
+            if expr.args[i] isa Expr
+                fix_gpu_ast!(expr.args[i])
+            end
+        end
+    end
+    return expr
+end
+function fix_gpu_ast!(val)
+    return val 
+end
 
 # --- Optimization Rules ---
 const RELU_RULE = @rule luminal_relu(~x) => term(max, ~x, 0.0f0; type=Real)
@@ -23,10 +55,8 @@ const RECIP_CLEANUP = @rule luminal_recip(~x) => term(/, 1.0f0, ~x; type=Real)
 const LOOP_FUSION_RULE = @rule luminal_loop_in(luminal_loop_out(~x, ~loop, ~range, ~st), ~loop, ~range, ~st) => ~x
 
 const GENERAL_RULES = [
-    LOG_EXP_RULE, EXP_LOG_RULE, SQRT_SQRT_RULE, MAX_ID_RULE, MIN_ID_RULE,
-    LOOP_FUSION_RULE,
-    FUSED_MUL_ADD_RULE, FUSED_ADD_RELU_RULE,
-    RELU_RULE, RECIP_CLEANUP
+    RELU_RULE, LOG_EXP_RULE, EXP_LOG_RULE, SQRT_SQRT_RULE, 
+    MAX_ID_RULE, MIN_ID_RULE, FUSED_MUL_ADD_RULE, FUSED_ADD_RELU_RULE, RECIP_CLEANUP, LOOP_FUSION_RULE
 ]
 
 function optimize(expr)
@@ -90,6 +120,8 @@ function op_to_sym(op, inputs)
         return inputs[1] + inputs[2]
     elseif op isa Luminal.Mul
         return inputs[1] * inputs[2]
+    elseif op isa Luminal.Mod
+        return term(mod, inputs[1], inputs[2]; type=Real)
     elseif op isa Luminal.Log2
         return term(log2, inputs[1]; type=Real)
     elseif op isa Luminal.Exp2
@@ -111,7 +143,7 @@ function op_to_sym(op, inputs)
     elseif op isa Luminal.FusedAddReLU
         return term(max, inputs[1] + inputs[2], 0.0f0; type=Real)
     elseif op isa Luminal.LessThan
-        return term(scalar_less, inputs[1], inputs[2]; type=Real)
+        return term(ifelse, term(<, inputs[1], inputs[2]), 1.0f0, 0.0f0; type=Real)
     elseif op isa Luminal.Constant
         return Float32(op.value)
     else
@@ -156,28 +188,33 @@ function compile(graph::Luminal.Graph)
     end
 
     # 1. Identify Fusible Intermediates
+    compile_device = Luminal.get_device() 
     fusible_intermediates = Set{Int}()
-    for (node_id, node) in enumerate(graph.nodes)
-        if is_elementwise(node.op) && consumer_count[node_id] == 1
-             # Find consumer
-             is_consumed_by_ew = false
-             for other_node in graph.nodes
-                 for (in_id, _, _) in other_node.inputs
-                     if in_id == node_id && is_elementwise(other_node.op)
-                         is_consumed_by_ew = true
-                         break
+    
+    # Disable dynamic fusion generation on CUDA backend since Julia 1.12 World Age
+    # actively blocks runtime JIT caching of dynamically created AST kernels inside modules.
+    if !(compile_device isa Luminal.CUDADevice)
+        for (node_id, node) in enumerate(graph.nodes)
+            if is_elementwise(node.op) && consumer_count[node_id] == 1
+                 # Find consumer
+                 is_consumed_by_ew = false
+                 for other_node in graph.nodes
+                     for (in_id, _, _) in other_node.inputs
+                         if in_id == node_id && is_elementwise(other_node.op)
+                             is_consumed_by_ew = true
+                             break
+                         end
                      end
+                     is_consumed_by_ew && break
                  end
-                 is_consumed_by_ew && break
-             end
-             if is_consumed_by_ew
-                 push!(fusible_intermediates, node_id)
-             end
+                 if is_consumed_by_ew
+                     push!(fusible_intermediates, node_id)
+                 end
+            end
         end
     end
 
     # 2. Allocate Results
-    compile_device = Luminal.get_device() 
     results = Vector{Any}(undef, length(graph.nodes))
     
     for (node_id, node) in enumerate(graph.nodes)
@@ -228,19 +265,82 @@ function compile(graph::Luminal.Graph)
                 end
                 sym_expr = op_to_sym(op, input_syms)
 
-                # Create the Julia function manually using toexpr
-                sym_args = [s for (_, _, s) in group_inputs]
-                if isempty(sym_args)
-                    f = (args...) -> Float32(Core.eval(Luminal, toexpr(sym_expr)))
-                else
-                    arg_names = [s.name for s in sym_args]
-                    f_expr = :($(Expr(:tuple, arg_names...)) -> $(toexpr(sym_expr)))
-                    println("Fusing node $node_id: $f_expr")
-                    flush(stdout)
-                    f = Core.eval(Luminal, f_expr)
+                # Instead of mapping to Julia AST, we build a Reverse Polish Notation (RPN) instruction list
+                # Opcodes: -1=Input, -2=Constant, >=0=Operator (from list below)
+                # Operators: 0=Add, 1=Mul, 2=Mod, 3=Log2, 4=Exp2, 5=Sin, 6=Cos, 7=Sqrt, 8=Recip, 9=ReLU, 10=Max, 11=Less
+                
+                # Assign simple opcodes for Luminal primitives
+                function op_to_code(op)
+                    if op isa Luminal.Add return 0
+                    elseif op isa Luminal.Mul return 1
+                    elseif op isa Luminal.Mod return 2
+                    elseif op isa Luminal.Log2 return 3
+                    elseif op isa Luminal.Exp2 return 4
+                    elseif op isa Luminal.Sin return 5
+                    elseif op isa Luminal.Cos return 6
+                    elseif op isa Luminal.Sqrt return 7
+                    elseif op isa Luminal.Recip return 8
+                    elseif op isa Luminal.ReLU return 9
+                    elseif op isa Luminal.Max return 10
+                    elseif op isa Luminal.LessThan return 11
+                    else return -3 # Unknown Error
+                    end
                 end
                 
-                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", f)
+                # Walk the tree and build the RPN
+                # Nodes are represented as nested tuples: (op, children...) or (input_idx,) or (constant_val,)
+                rpn_nodes = Int32[]
+                rpn_consts = Float32[]
+                
+                function build_rpn!(expr_sym)
+                    if expr_sym isa Sym
+                        # Find the input index
+                        idx = findfirst(x -> x[3] === expr_sym, group_inputs)
+                        push!(rpn_nodes, -1)
+                        push!(rpn_nodes, Int32(idx))
+                    elseif Base.isexpr(expr_sym, :call)
+                        # We encoded ops back to Julia expressions, need to parse them backward
+                        # Alternatively, we just use the original op tree directly!
+                        error("Cannot parse raw Julia AST back to RPN, must build from Luminal graph")
+                    elseif typeof(expr_sym) <: Real
+                        push!(rpn_nodes, -2)
+                        push!(rpn_consts, Float32(expr_sym))
+                        push!(rpn_nodes, Int32(length(rpn_consts)))
+                    else
+                         error("Unknown expression node in fusion: ", expr_sym)
+                    end
+                end
+
+                # To avoid the AST string mapping hell, we will write a tiny recursive walker over the *actual* Luminal graph instead of the Symbolics.jl tree to generate the RPN natively.
+                # However, this breaks `optimize()` simplifications which operate on Symbolics.jl Math AST, so we will use an alternative fallback.
+                
+                # Since world-age crashes are exclusive to Julia functions generated inside the dynamic `run_graph`, we can completely side-step the `InvalidIRError` by keeping `execute_op!` but running it purely natively on the CPU `Array` loop by using `allowscalar()` for scalar-heavy ops if on CUDA, OR we can stick to using standard Broadcast and `invokelatest` but *revert the fusion passes* on CUDADevices if we detect them.
+                
+                # But Wait! Base `broadcast!` with standard primitive Julia functions works perfectly fine. The `InvalidIRError` occurs *only* when `broadcast!` receives an *anonymous closure* generated by `RuntimeGeneratedFunctions` or `@eval`.
+                
+                # To bypass all this string interpolation and RPN nonsense, let's just generate the closures with standard `eval` like before, BUT execute the graph *via global named functions* evaluated at compile time!
+                
+                sym_args = [s for (_, _, s) in group_inputs]
+                arg_names = [s.name for s in sym_args]
+                
+                node_expr = fix_gpu_ast!(toexpr(sym_expr))
+                
+                kernel_name = Symbol("global_fused_$node_id")
+                
+                args_defs = [Expr(:(::), Symbol(name), :(Real)) for name in arg_names]
+                
+                kernel_ast = quote
+                    function $kernel_name($(args_defs...))
+                        return Float32($node_expr)
+                    end
+                end
+                
+                println("Fusing node $node_id via global base kernel:")
+                flush(stdout)
+                
+                Core.eval(Luminal, kernel_ast)
+                
+                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", getfield(Luminal, kernel_name))
                 target_rank = length(realized_dims(graph.shapes[node_id]))
                 function align_rank(val, rank)
                     if ndims(val) >= rank return val end
@@ -250,7 +350,11 @@ function compile(graph::Luminal.Graph)
                 input_steps = [align_rank(realize_view(results[id], st), target_rank) for (id, st, _) in group_inputs]
                 target_buf = results[node_id]
                 
-                push!(steps, (results, device) -> execute_op!(target_buf, fused_op, input_steps...))
+                push!(steps, (results, device) -> begin
+                    # Standard broadcast using a purely global, rigidly typed generic Julia function
+                    # The `execute_op!` function already does `broadcast!(op.f, out, inputs...)`
+                    Base.invokelatest(execute_op!, target_buf, fused_op, input_steps...)
+                end)
                 processed[node_id] = true
             end
         end

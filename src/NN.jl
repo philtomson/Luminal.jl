@@ -2,7 +2,7 @@ module NN
 
 using ..Luminal
 
-export Linear, Embedding, LayerNorm, RMSNorm, Mlp, SelfAttention, TransformerBlock, Llama
+export Linear, Conv1D, Embedding, LayerNorm, RMSNorm, Mlp, SelfAttention, TransformerBlock, Llama
 
 # Layer Designs
 # --------------
@@ -32,6 +32,75 @@ function (l::Linear)(x::Luminal.GraphTensor)
         out = out + b_expanded
     end
     return out
+end
+
+# Conv1D Layer
+struct Conv1D
+    weight::Luminal.GraphTensor
+    bias::Union{Luminal.GraphTensor, Nothing}
+    kernel::Int
+    stride::Int
+    padding::Int
+    dilation::Int
+    ch_in::Int
+    ch_out::Int
+end
+
+function Conv1D(ch_in::Int, ch_out::Int, kernel::Int, graph::Luminal.Graph; stride=1, padding=0, dilation=1, bias=true)
+    weight = Luminal.tensor(graph, [ch_out, ch_in * kernel])
+    b = bias ? Luminal.tensor(graph, [ch_out]) : nothing
+    return Conv1D(weight, b, kernel, stride, padding, dilation, ch_in, ch_out)
+end
+
+function (c::Conv1D)(x::Luminal.GraphTensor)
+    # x: (batch..., channels, length)
+    rank = length(Luminal.realized_dims(x.shape))
+    padded = x
+    if c.padding > 0
+        padded = Luminal.pad_along(x, rank, c.padding, c.padding)
+    end
+    
+    # unfold shape: [batch..., channels, out_length, kernel]
+    unfolded = Luminal.unfold(padded, [c.kernel], [c.stride], [c.dilation])
+    
+    # permute unfolded to [batch..., out_length, channels, kernel]
+    axes = collect(1:(rank+1))
+    chan_idx = rank - 1
+    out_len_idx = rank
+    axes[chan_idx] = out_len_idx
+    axes[out_len_idx] = chan_idx
+    unfolded_permuted = Luminal.permute(unfolded, axes)
+    
+    # reshape to [batch..., out_length, channels * kernel]
+    dims = Luminal.realized_dims(unfolded_permuted.shape)
+    new_shape = [dims[1:end-2]..., dims[end-1] * dims[end]]
+    reshaped_for_matmul = Luminal.reshape(unfolded_permuted, new_shape)
+    
+    # matmul with weight^T ([ch_in * kernel, ch_out]) => [batch..., out_length, ch_out]
+    out = Luminal.matmul(reshaped_for_matmul, Luminal.permute(c.weight, [2, 1]))
+    
+    # permute back to [batch..., ch_out, out_length]
+    out_axes = collect(1:rank)
+    out_chan_idx = rank - 1
+    out_len_idx = rank
+    out_axes[out_chan_idx] = out_len_idx
+    out_axes[out_len_idx] = out_chan_idx
+    out_final = Luminal.permute(out, out_axes)
+    
+    if c.bias !== nothing
+        # bias is (ch_out,)
+        b_expanded = c.bias
+        out_dims = Luminal.realized_dims(out_final.shape)
+        # expand over batch dimensions
+        for i in 1:(rank-2)
+            b_expanded = Luminal.expand(b_expanded, i, out_dims[i])
+        end
+        # expand over out_length
+        b_expanded = Luminal.expand(b_expanded, rank, out_dims[rank])
+        out_final = out_final + b_expanded
+    end
+    
+    return out_final
 end
 
 # Embedding Layer: y = weight[indexes]
@@ -308,5 +377,19 @@ function (l::Llama)(input::Luminal.GraphTensor, prev_seq::Int)
     x = l.norm(x)
     return l.head(x)
 end
+
+include("Whisper.jl")
+export WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,
+       DecoderTransformerBlock, TextDecoder,
+       # Audio preprocessing
+       mel_filters, get_mel_filters, log_mel_spectrogram, stft_power,
+       pad_or_trim, load_audio_file,
+       SAMPLE_RATE, N_FFT, HOP_LENGTH, N_SAMPLES, N_FRAMES,
+       # KV Caching
+       KVCacheState, IncrementalDecodeGraph, build_decode_step!, decode_step!,
+       whisper_self_attn_cached, whisper_cross_attn_cached
+
+include("WhisperTokenizer.jl")
+export WhisperTokenizer, encode, decode, sot_sequence, LANGUAGES
 
 end # module NN
