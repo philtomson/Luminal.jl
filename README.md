@@ -63,6 +63,12 @@ julia --project=. examples/whisper.jl
 ```
 Runs the full Whisper speech-to-text pipeline (Audio Encoder + Text Decoder with KV Cache).
 
+### 📐 Phi-3 Inference
+```bash
+julia --project=. examples/phi3.jl
+```
+Simulates the Phi-3-mini-4k architecture with GQA and compiled loops.
+
 ### 📈 Linear Regression (Training)
 ```bash
 julia --project=. examples/linear_regression.jl
@@ -109,11 +115,11 @@ High-level API in `NN.jl`:
 - ✅ `RoPE` - Rotary positional embeddings
 
 #### Transformer Support
-- **Llama Architecture**: Fully implemented
+- **Llama & Phi-3 Architecture**: Fully implemented
   - MLP with SiLU/Swish activation
-  - Multi-query attention
-  - RoPE embeddings
-  - RMSNorm
+  - **Grouped-Query Attention (GQA)**: Memory-efficient attention for Phi-3
+  - **Rotary Positional Embeddings (RoPE)**: Configurable base frequency for diverse models
+  - RMSNorm & layer normalization
 - **Flash Attention**: Custom CUDA kernel for efficient attention
   - Causal and non-causal variants
   - Online softmax algorithm
@@ -121,8 +127,9 @@ High-level API in `NN.jl`:
 
 #### Weight Loading & Data
 - **Safetensors Support**: Load weights directly from `.safetensors` files
+- **Weight Registry**: Automated mapping of HuggingFace keys to model parameters
 - **HuggingFace Integration**: `load_weights_hf!` for automatic model downloads
-- **Tokenizer**: Native BPE tokenizers for Llama and Whisper (pure Julia)
+- **Tokenizer**: Native SentencePiece BPE tokenizer for Llama/Phi-3 and Byte-level BPE for Whisper
 
 #### High-Level Operations
 Comprehensive operator library in `HighLevelOps.jl`:
@@ -152,10 +159,10 @@ Single-device execution only.
 
 #### Additional Models
 - ✅ Whisper (speech recognition) - Full inference with KV cache
+- ✅ Phi-3 (mini-4k-instruct) - Full architecture support
 - ❌ Yolo v8 (object detection)
-- ❌ Phi 3
 
-Only Llama architecture is currently implemented.
+Llama and Phi-3 architectures are currently implemented.
 
 #### Advanced Optimizations
 - ❌ Tensor Core utilization on NVIDIA
@@ -207,7 +214,8 @@ Julia/
 │   ├── Decoding.jl             # Greedy decode logic
 │   ├── Weights.jl              # Safetensors/HF weight loading
 │   ├── Whisper.jl              # Whisper architecture
-│   └── WhisperTokenizer.jl      # Whisper BPE tokenizer
+│   ├── WhisperTokenizer.jl     # Whisper BPE tokenizer
+│   └── LlamaTokenizer.jl       # Llama/Phi-3 SentencePiece tokenizer
 ├── tests/                      # Comprehensive test suite
 └── docs/
     └── porting_plan.md         # Detailed porting status
@@ -265,6 +273,7 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 | **Flash Attention** | ✅ Auto-derived | ✅ Hand-written | Both optimized |
 | **Training** | ✅ Full support | ✅ SGD & Adam | Supported |
 | **Llama** | ✅ 3/3.1/3.2 | ✅ Architecture only | Working |
+| **Phi-3** | ✅ mini | ✅ Architecture only | Working |
 | **Other Models** | ✅ Whisper, Yolo | ✅ Whisper only | Ported |
 | **Distributed** | ✅ Planned | ❌ Not planned | Long-term |
 
@@ -275,6 +284,7 @@ Preliminary benchmarks on NVIDIA GTX 1070:
 - ✅ Graph compilation with fusion
 - ✅ CUDA graph capture
 - ✅ Search-based compilation (Metatheory.jl)
+- ✅ Phi-3 Support
 - ⏳ Full Llama 3 8B inference
 - ⏳ PyTorch numerical validation
 
