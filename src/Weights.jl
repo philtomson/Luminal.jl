@@ -13,7 +13,7 @@
 
 using SafeTensors
 
-export WeightRegistry, register_weight!, load_weights!, load_weights_hf!
+export WeightRegistry, register_weight!, load_weights!, load_weights_hf!, load_weights_to_dict
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WeightRegistry
@@ -131,22 +131,93 @@ end
 """
     load_weights!(graph, reg, tensors; device=get_device())
 
-Populate `graph` tensors from a pre-loaded dictionary of arrays (e.g. from `SafeTensors.load_safetensors`).
+Populate `graph` tensors from a pre-loaded dictionary of arrays/tensors.
+If the tensors are already on the correct device, they are shared.
 """
 function load_weights!(graph::Luminal.Graph,
                        reg::WeightRegistry,
-                       tensors::Dict{String, <:AbstractArray};
+                       tensors::Dict{String, Any};
                        device::Luminal.AbstractDevice=Luminal.get_device())
     loaded = 0
-    for (key, node_id) in reg.mapping
+    for (i, (key, node_id)) in enumerate(reg.mapping)
         if haskey(tensors, key)
-            raw = tensors[key]
-            data = convert(Array{Float32}, raw)
-            graph.tensors[(node_id, 1)] = Luminal.to_device(Dict(node_id => data), device)[node_id]
+            data = tensors[key]
+            target_data = Luminal.to_device(data, device)
+            graph.tensors[(node_id, 1)] = target_data
             loaded += 1
         end
     end
     return graph
+end
+
+# Backward compatibility or simpler Dict type
+function load_weights!(graph::Luminal.Graph, reg::WeightRegistry, tensors::Dict{String, <:AbstractArray}; device=get_device())
+    return load_weights!(graph, reg, Dict{String, Any}(k => v for (k,v) in tensors); device=device)
+end
+
+"""
+    load_weights_to_dict(path; device=get_device()) -> Dict{String, Any}
+
+Load all weights from a safetensors file (or directory) into a dictionary of
+device-resident arrays. This is useful for sharing weights across multiple
+graphs (e.g., prefill vs. decode).
+"""
+function load_weights_to_dict(path::String;
+                             device::Luminal.AbstractDevice=Luminal.get_device())
+    files = _collect_safetensors_files(path)
+    isempty(files) && error("No safetensors files found at: $path")
+
+    tensors = Dict{String, Any}()
+    for file in files
+        open(file, "r") do fio
+            header, header_length = SafeTensors.load_header(fio)
+            # We don't know which keys we need, so we load everything in the file(s)
+            # that we recognize as weights.
+            for (sym, entry) in header
+                key = String(sym)
+                key == "__metadata__" && continue
+                haskey(tensors, key) && continue # Skip if already loaded from previous shard
+
+                !haskey(entry, :dtype) && continue # Skip if not a tensor entry
+                dtype   = String(entry[:dtype])
+                shape   = tuple(Int.(entry[:shape])...)
+                offsets = entry[:data_offsets]
+                start   = Int(offsets[1]) + header_length
+                stop    = Int(offsets[2]) + header_length
+
+                seek(fio, start)
+                raw_bytes = read(fio, stop - start)
+
+                if dtype == "F32"
+                    data = reinterpret(Float32, raw_bytes)
+                elseif dtype == "BF16"
+                    u16 = reinterpret(UInt16, raw_bytes)
+                    data = map(u -> reinterpret(Float32, UInt32(u) << 16), u16)
+                elseif dtype == "F16"
+                    data = reinterpret(Float16, raw_bytes)
+                else
+                    # Skip unknown dtypes (like metadata)
+                    continue
+                end
+
+                # Reshape and permute to match Julia's column-major format
+                permuted = Base.reshape(collect(data), reverse(shape)...)
+                if length(shape) > 1
+                    permuted = Array(permutedims(permuted, length(shape):-1:1))
+                end
+                
+                # Convert to Float16 if on GPU to save memory
+                if device isa Luminal.CUDADevice || device isa Luminal.AMDDevice
+                    permuted = convert(Array{Float16}, permuted)
+                else
+                    permuted = convert(Array{Float32}, permuted)
+                end
+
+                tensors[key] = Luminal.to_device(permuted, device)
+            end
+        end
+    end
+    return tensors
 end
 
 """

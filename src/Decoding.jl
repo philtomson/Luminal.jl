@@ -8,6 +8,7 @@ module Decoding
 using ..Luminal
 using ..Luminal.NN
 using ..Luminal.LlamaTokenization
+using CUDA
 
 export greedy_decode, llama_generate
 
@@ -65,7 +66,11 @@ function llama_generate(model,
     pfx_out   = pfx_model(pfx_input, 0)
 
     @info "Loading weights for prefill graph..."
-    load_weights!(pfx_graph, pfx_reg, model_dir; device=target_device)
+    # We load ALL weights into a dictionary on the target device once, 
+    # and reuse them across all graphs to save VRAM.
+    weights_dict = load_weights_to_dict(model_dir; device=target_device)
+    
+    load_weights!(pfx_graph, pfx_reg, weights_dict; device=target_device)
     pfx_exec = compile(pfx_graph; device=target_device)
 
     pfx_inputs = Dict{Int,Any}(pfx_input.id => Float32.(Base.reshape(prompt_ids, 1, plen)))
@@ -81,45 +86,65 @@ function llama_generate(model,
     end
 
     generated = [first_token]
+    
+    # Free prefill memory
+    pfx_exec = nothing
+    pfx_graph = nothing
+    prefill_logits = nothing
+    GC.gc()
+    if target_device isa Luminal.CUDADevice
+        CUDA.reclaim()
+    end
 
     # 4. KV-cached decode loop
-    #    Build one decode graph per step position (reuse if already compiled)
+    if target_device isa Luminal.CUDADevice
+        @info "VRAM before decode loop" available_mb=(CUDA.available_memory()/1024/1024)
+    end
+
     first_attn = model.layers[1].attention
     cache = LlamaKVCacheState(
         length(model.layers), first_attn.n_kv_heads, first_attn.head_dim;
         max_seq=max_seq)
-
-    compiled_graphs = Dict{Int, Any}()   # step_pos => (exec_fn, idg)
 
     # Step 0 = position immediately after the prefill sequence
     # (step_pos semantics: position in the *cache* of the current token)
     start_pos = plen  # first decode token lands at position plen in the cache
 
     for step in 0:(max_new_tokens - 2)
-        pos = start_pos + step
-
-        if !haskey(compiled_graphs, pos)
-            dg = Graph()
-            dreg = WeightRegistry()
-            dm = _rebuild_model_like(model, dg, dreg)
-            idg = build_llama_decode_step!(dm, dg, pos;
-                                           max_seq=max_seq,
-                                           rope_base=rope_base)
-            
-            @info "Loading weights for decode step..."
-            load_weights!(dg, dreg, model_dir; device=target_device)
-            exec_fn = compile(dg; device=target_device)
-            compiled_graphs[pos] = (exec_fn, idg)
+        # Clear VRAM and trigger GC before the next graph is compiled
+        GC.gc()
+        if target_device isa Luminal.CUDADevice
+            CUDA.reclaim()
         end
 
-        exec_fn, idg = compiled_graphs[pos]
-        current_token = generated[end]
+        pos = start_pos + step
+        dg = Graph()
+        dreg = WeightRegistry()
+        dm = _rebuild_model_like(model, dg, dreg)
+        idg = build_llama_decode_step!(dm, dg, pos;
+                                       max_seq=max_seq,
+                                       rope_base=rope_base)
+        
+        load_weights!(dg, dreg, weights_dict; device=target_device)
+        exec_fn = compile(dg; device=target_device)
 
+        current_token = generated[end]
         logits = llama_decode_step!(exec_fn, idg, cache, current_token; device=target_device)
         next_token = argmax(view(Array{Float32}(logits), 1, 1, :)) - 1  # 0-indexed
 
         push!(generated, next_token)
         next_token == eos_id && break
+        
+        # Explicitly clear this step's memory
+        exec_fn = nothing
+        dg = nothing
+        dreg = nothing
+        dm = nothing
+        dg = nothing
+        GC.gc()
+        if target_device isa Luminal.CUDADevice
+            CUDA.reclaim()
+        end
     end
 
     # 5. Decode token IDs to text (skip prompt tokens)

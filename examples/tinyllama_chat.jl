@@ -39,7 +39,8 @@ function main()
     # TinyLlama: hidden=2048, 22 layers, 32 heads, 4 KV heads, intermediate=5632
     # Use CPUDevice since 4.4GB of weights + intermediates exceeds 8GB GPU VRAM
     # in the current Luminal memory system.
-    device = Luminal.CPUDevice()
+    # Use the best available device (CUDA if present)
+    device = get_device()
 
     # Create dummy model architecture to register node IDs
     println("\n[2/3] Constructing TinyLlama architecture …")
@@ -63,7 +64,7 @@ function main()
     t0 = time()
     response = llama_generate(model, tok, prompt, model_dir;
                                max_new_tokens=max_tokens,
-                               max_seq=2048,
+                               max_seq=256,
                                device=device,
                                rope_base=10000f0)  # TinyLlama uses Llama-2 RoPE base
     t1 = time()

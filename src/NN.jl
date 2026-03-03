@@ -526,7 +526,7 @@ Host-side storage for past K/V tensors for one decode session.
 mutable struct LlamaKVCacheState
     step_pos::Int
     max_seq::Int
-    self_cache::Vector{Tuple{Array{Float32,4}, Array{Float32,4}}}
+    self_cache::Vector{Tuple{Array{Float16,4}, Array{Float16,4}}}
 end
 
 """
@@ -534,8 +534,8 @@ end
 """
 function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
                             batch::Int=1, max_seq::Int=2048)
-    self = [(zeros(Float32, batch, n_kv_heads, max_seq, head_dim),
-             zeros(Float32, batch, n_kv_heads, max_seq, head_dim))
+    self = [(zeros(Float16, batch, n_kv_heads, max_seq, head_dim),
+             zeros(Float16, batch, n_kv_heads, max_seq, head_dim))
             for _ in 1:n_layers]
     return LlamaKVCacheState(0, max_seq, self)
 end
@@ -725,8 +725,8 @@ function llama_decode_step!(exec_fn,
     # Update cache
     for (i, (nk_id, nv_id)) in enumerate(zip(idg.new_self_k_ids, idg.new_self_v_ids))
         cache.self_cache[i] = (
-            Array{Float32,4}(results[nk_id]),
-            Array{Float32,4}(results[nv_id]))
+            Array{Float16,4}(results[nk_id]),
+            Array{Float16,4}(results[nv_id]))
     end
 
     cache.step_pos += 1

@@ -54,7 +54,7 @@ function batch_matmul(A, B)
 end
 
 function batch_matmul!(C, A, B)
-    # In-place batch matmul: C = A * B
+    println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
     if ndims(A) == 2 && ndims(B) == 2
         mul!(C, A, B)
         return C
@@ -315,26 +315,18 @@ function execute_op!(out, op::SumReduce, a)
     # Insert 1 at op.dim (if it was dropped)
     # This depends on how `out` was allocated.
     # If `out` is truly reduced rank (N-1), we need a view.
-    if ndims(out) < ndims(a)
-        insert!(r_shape, op.dim, 1)
-        r_view = Base.reshape(out, r_shape...)
-        sum!(r_view, a)
-    else
-        sum!(out, a)
-    end
+    # Use Float32 for reduction to avoid FP16 MethodErrors on older GPUs
+    res = reduce(+, Float32.(a), dims=op.dim)
+    copyto!(out, res)
     return out
 end
 
 function execute_op!(out, op::MaxReduce, a)
     # Similar logic for maximum!
     r_shape = [size(out)...]
-    if ndims(out) < ndims(a)
-        insert!(r_shape, op.dim, 1)
-        r_view = Base.reshape(out, r_shape...)
-        maximum!(r_view, a)
-    else
-        maximum!(out, a)
-    end
+    # Use Float32 for reduction to avoid FP16 MethodErrors on older GPUs
+    res = reduce(max, Float32.(a), dims=op.dim)
+    copyto!(out, res)
     return out
 end
 

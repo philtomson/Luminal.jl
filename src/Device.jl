@@ -85,6 +85,8 @@ to_device(data, ::AbstractDevice) = data
 to_device(data::Dict, device::AbstractDevice) = Dict{Any, Any}(k => to_device(v, device) for (k, v) in data)
 
 # Physical data placement
+to_device(data::CuArray, ::CUDADevice) = data
+to_device(data::ROCArray, ::AMDDevice) = data
 to_device(data::AbstractArray, ::CUDADevice) = CuArray(data)
 to_device(data::AbstractArray, ::AMDDevice) = ROCArray(data)
 # Explicitly handle CPUDevice and VulkanDevice to avoid ambiguity with generic fallback

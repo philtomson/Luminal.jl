@@ -220,12 +220,19 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     for (node_id, node) in enumerate(graph.nodes)
         node_shape = graph.shapes[node_id]
         dims_int = map(eval_dim, realized_dims(node_shape))
-        dtype = Float32 
+        dtype = (compile_device isa Luminal.CUDADevice || compile_device isa Luminal.AMDDevice) ? Float16 : Float32
+        
+        # Reuse existing tensor if already loaded (e.g. weights)
+        if haskey(graph.tensors, (node_id, 1))
+            results[node_id] = graph.tensors[(node_id, 1)]
+            continue
+        end
         if compile_device isa Luminal.CUDADevice
             results[node_id] = CUDA.fill(dtype(0), dims_int...) 
         else
             results[node_id] = zeros(dtype, dims_int...)
         end
+
         if node.op isa Luminal.Constant
              copyto!(results[node_id], to_device(node.op.value, compile_device))
         elseif node.op isa Luminal.Function && node.op.name == "ARange"
@@ -234,7 +241,6 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
-    # 3. Create Execution Steps with Fusion
     steps = Base.Function[]
     processed = fill(false, length(graph.nodes))
 
@@ -247,7 +253,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             continue
         end
 
-        if !is_elementwise(op)
+        if !is_elementwise(op) || (compile_device isa Luminal.CUDADevice && !(node_id in fusible_intermediates))
             input_specs = node.inputs
             step_args = [realize_view(results[id], st) for (id, _, st) in input_specs]
             target_buf = results[node_id]
