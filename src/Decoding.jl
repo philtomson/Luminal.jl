@@ -7,8 +7,162 @@ module Decoding
 
 using ..Luminal
 using ..Luminal.NN
+using ..Luminal.LlamaTokenization
 
-export greedy_decode
+export greedy_decode, llama_generate
+
+"""
+    llama_generate(model, tokenizer, prompt, model_dir;
+                   max_new_tokens=200, max_seq=2048, rope_base=500000f0,
+                   device=nothing) -> String
+
+End-to-end greedy text generation for Llama-style (decoder-only) models.
+
+# Steps
+1. Encode `prompt` with `tokenizer` (adds BOS).
+2. Prefill: run the full prompt forward (`model(ids, 0)`) to warm up, then
+   grab logits for the last token position.
+3. Decode: iteratively call `llama_decode_step!` with a KV cache until EOS
+   or `max_new_tokens` is reached.
+4. Decode the output token IDs back to a string.
+
+# Arguments
+- `model`         : A `Luminal.NN.Llama` (or `Phi3`) instance
+- `tokenizer`     : A `LlamaTokenizer` loaded from the model directory
+- `prompt`        : Input string
+- `model_dir`     : Path to the directory containing `.safetensors` weights
+- `max_new_tokens`: Maximum tokens to generate (default 200)
+- `max_seq`       : KV cache capacity (default 2048)
+- `rope_base`     : RoPE base frequency (500000 for Llama-3, 10000 for Llama-2/Phi-3)
+- `device`        : Device to run on; defaults to `get_device()`
+"""
+function llama_generate(model,
+                         tokenizer::LlamaTokenizer,
+                         prompt::String,
+                         model_dir::String;
+                         max_new_tokens::Int=200,
+                         max_seq::Int=2048,
+                         rope_base::Float32=500000f0,
+                         device=nothing)
+
+    target_device = (device === nothing ? get_device() : device)
+
+    # Note: We now use the streaming load_weights! to load directly into the graph
+    # to avoid OutOfMemory errors on large checkpoints.
+
+    # 2. Encode prompt
+    prompt_ids = LlamaTokenization.encode(tokenizer, prompt; bos=true)
+    @info "Prompt: $(length(prompt_ids)) tokens"
+
+    # 3. Prefill — full prompt in one shot
+    #    Build & compile a prefill graph of the right sequence length
+    plen = length(prompt_ids)
+    pfx_graph = Graph()
+    pfx_reg   = WeightRegistry()
+    # Rebuild model structure for the prefill length graph
+    pfx_model = _rebuild_model_like(model, pfx_graph, pfx_reg)
+    pfx_input = Luminal.tensor(pfx_graph, [1, plen])
+    pfx_out   = pfx_model(pfx_input, 0)
+
+    @info "Loading weights for prefill graph..."
+    load_weights!(pfx_graph, pfx_reg, model_dir; device=target_device)
+    pfx_exec = compile(pfx_graph; device=target_device)
+
+    pfx_inputs = Dict{Int,Any}(pfx_input.id => Float32.(Base.reshape(prompt_ids, 1, plen)))
+    pfx_results = pfx_exec(pfx_inputs, target_device)
+    prefill_logits = Array{Float32}(pfx_results[pfx_out.id])  # (1, plen, vocab)
+
+    # Greedy-pick the first generated token from the last position of prefill
+    first_token = argmax(view(prefill_logits, 1, plen, :)) - 1  # 0-indexed
+
+    eos_id = tokenizer.eos_id
+    if first_token == eos_id
+        return LlamaTokenization.decode(tokenizer, Int[])
+    end
+
+    generated = [first_token]
+
+    # 4. KV-cached decode loop
+    #    Build one decode graph per step position (reuse if already compiled)
+    first_attn = model.layers[1].attention
+    cache = LlamaKVCacheState(
+        length(model.layers), first_attn.n_kv_heads, first_attn.head_dim;
+        max_seq=max_seq)
+
+    compiled_graphs = Dict{Int, Any}()   # step_pos => (exec_fn, idg)
+
+    # Step 0 = position immediately after the prefill sequence
+    # (step_pos semantics: position in the *cache* of the current token)
+    start_pos = plen  # first decode token lands at position plen in the cache
+
+    for step in 0:(max_new_tokens - 2)
+        pos = start_pos + step
+
+        if !haskey(compiled_graphs, pos)
+            dg = Graph()
+            dreg = WeightRegistry()
+            dm = _rebuild_model_like(model, dg, dreg)
+            idg = build_llama_decode_step!(dm, dg, pos;
+                                           max_seq=max_seq,
+                                           rope_base=rope_base)
+            
+            @info "Loading weights for decode step..."
+            load_weights!(dg, dreg, model_dir; device=target_device)
+            exec_fn = compile(dg; device=target_device)
+            compiled_graphs[pos] = (exec_fn, idg)
+        end
+
+        exec_fn, idg = compiled_graphs[pos]
+        current_token = generated[end]
+
+        logits = llama_decode_step!(exec_fn, idg, cache, current_token; device=target_device)
+        next_token = argmax(view(Array{Float32}(logits), 1, 1, :)) - 1  # 0-indexed
+
+        push!(generated, next_token)
+        next_token == eos_id && break
+    end
+
+    # 5. Decode token IDs to text (skip prompt tokens)
+    return LlamaTokenization.decode(tokenizer, generated)
+end
+
+"""
+    _rebuild_model_like(model, graph, reg)
+
+Clone the model architecture into a new `graph` with a fresh `reg`,
+using the same hyperparameters as the original. Supports `Llama` and `Phi3`.
+"""
+function _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry)
+    attn   = model.layers[1].attention
+    n_h    = attn.n_heads
+    n_kv   = attn.n_kv_heads
+    hd     = attn.head_dim
+    hidden = n_h * hd
+    inter  = Luminal.realized_dims(model.layers[1].feed_forward.gate_proj.weight.shape)[1]
+    vsize  = Luminal.realized_dims(model.head.weight.shape)[1]
+    return Llama(graph, reg;
+                 vocab_size=vsize, hidden=hidden,
+                 n_layers=length(model.layers),
+                 n_heads=n_h, n_kv_heads=n_kv,
+                 intermediate=inter)
+end
+
+function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegistry)
+    attn   = model.layers[1].attention
+    n_h    = attn.n_heads
+    n_kv   = attn.n_kv_heads
+    hd     = attn.head_dim
+    hidden = n_h * hd
+    inter  = Luminal.realized_dims(model.layers[1].feed_forward.gate_proj.weight.shape)[1]
+    vsize  = Luminal.realized_dims(model.head.weight.shape)[1]
+    return Phi3(graph, reg;
+                vocab_size=vsize, hidden=hidden,
+                n_layers=length(model.layers),
+                n_heads=n_h, n_kv_heads=n_kv,
+                intermediate=inter)
+end
+
+export llama_generate
 
 """
     greedy_decode(td, tokenizer, enc_output_array, model_weights_dir; 

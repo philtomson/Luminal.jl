@@ -62,20 +62,56 @@ function load_weights!(graph::Luminal.Graph,
                        path::String;
                        device::Luminal.AbstractDevice=Luminal.get_device())
 
-    # Collect all safetensors files.
     files = _collect_safetensors_files(path)
     isempty(files) && error("No safetensors files found at: $path")
 
+    # Build a reverse map: key -> node_id for fast lookup
+    key_to_node = reg.mapping   # String -> Int
+
     loaded = 0
     for file in files
-        tensors = SafeTensors.load_safetensors(file)   # Dict{String, Array}
-        for (key, node_id) in reg.mapping
-            if haskey(tensors, key)
-                raw = tensors[key]
-                # Convert to Float32; SafeTensors.jl already permutes dims for Julia
-                data = convert(Array{Float32}, raw)
-                # Move to the target device (CuArray, etc.)
-                graph.tensors[(node_id, 1)] = Luminal.to_device(Dict(node_id => data), device)[node_id]
+        open(file, "r") do fio
+            header, header_length = SafeTensors.load_header(fio)
+            # Only iterate over keys we actually need
+            for (key, node_id) in key_to_node
+                sym = Symbol(key)
+                !haskey(header, sym) && continue
+
+                entry   = header[sym]
+                dtype   = String(entry[:dtype])
+                shape   = tuple(Int.(entry[:shape])...)
+                start   = Int(entry[:data_offsets][1]) + header_length
+                stop    = Int(entry[:data_offsets][2]) + header_length
+
+                # Read raw bytes directly to bypass SafeTensors.jl's BF16 error
+                seek(fio, start)
+                raw_bytes = read(fio, stop - start)
+
+                # Convert based on dtype
+                if dtype == "F32"
+                    data = reinterpret(Float32, raw_bytes)
+                elseif dtype == "BF16"
+                    # Reinterpret as UInt16, cast to UInt32, shift left 16, reinterpret as Float32
+                    u16 = reinterpret(UInt16, raw_bytes)
+                    data = map(u -> reinterpret(Float32, UInt32(u) << 16), u16)
+                elseif dtype == "F16"
+                    data = Float32.(reinterpret(Float16, raw_bytes))
+                else
+                    error("Unsupported dtype $dtype for tensor $key")
+                end
+
+                # Reshape and permute to match Julia's column-major format
+                data = Base.reshape(collect(data), reverse(shape)...)
+                if length(shape) > 1
+                    data = Array(permutedims(data, length(shape):-1:1))
+                end
+
+                graph.tensors[(node_id, 1)] =
+                    Luminal.to_device(Dict(node_id => data), device)[node_id]
+
+                # Let GC collect the raw array
+                raw_bytes = nothing
+                data = nothing
                 loaded += 1
             end
         end

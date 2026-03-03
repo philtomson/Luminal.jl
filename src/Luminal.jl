@@ -65,7 +65,7 @@ export LlamaTokenizer, encode, decode
 # Decoding & Inference
 include("Decoding.jl")
 using .Decoding
-export greedy_decode
+export greedy_decode, llama_generate
 
 # Training & Optimizers
 include("Optimizer.jl")

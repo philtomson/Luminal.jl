@@ -506,6 +506,235 @@ function (l::Phi3)(input::Luminal.GraphTensor, prev_seq::Int)
     return l.head(x)
 end
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Llama KV-Cache Infrastructure
+#
+# Mirrors the Whisper KV-cache pattern but for decoder-only Llama/Phi-3 models.
+# Usage:
+#   cache = LlamaKVCacheState(model, max_seq=2048)
+#   idg   = build_llama_decode_step!(model, graph, step_pos)
+#   logits = llama_decode_step!(exec_fn, idg, cache, token_id)
+# ──────────────────────────────────────────────────────────────────────────────
+
+"""
+    LlamaKVCacheState
+
+Host-side storage for past K/V tensors for one decode session.
+- `self_cache[i]` = `(K, V)` arrays for layer i, shape (batch, n_kv_heads, max_seq, head_dim)
+- `step_pos`: current 0-indexed decode position
+"""
+mutable struct LlamaKVCacheState
+    step_pos::Int
+    max_seq::Int
+    self_cache::Vector{Tuple{Array{Float32,4}, Array{Float32,4}}}
+end
+
+"""
+    LlamaKVCacheState(n_layers, n_kv_heads, head_dim; batch=1, max_seq=2048)
+"""
+function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
+                            batch::Int=1, max_seq::Int=2048)
+    self = [(zeros(Float32, batch, n_kv_heads, max_seq, head_dim),
+             zeros(Float32, batch, n_kv_heads, max_seq, head_dim))
+            for _ in 1:n_layers]
+    return LlamaKVCacheState(0, max_seq, self)
+end
+
+
+"""
+    llama_self_attn_cached(sa, x, step_pos, past_k, past_v; rope_base=500000f0)
+
+Single-token cached self-attention for Llama decoder-only models.
+- `x` : (batch, 1, hidden)
+- `step_pos` : current 0-indexed decode position
+- `past_k`, `past_v` : (batch, n_kv_heads, max_seq, head_dim)
+Returns `(output, new_k, new_v)`.
+"""
+function llama_self_attn_cached(sa::SelfAttention,
+                                 x::Luminal.GraphTensor,
+                                 step_pos::Int,
+                                 past_k::Luminal.GraphTensor,
+                                 past_v::Luminal.GraphTensor;
+                                 rope_base::Float32=500000f0)
+    batch, _, hidden = Luminal.realized_dims(x.shape)
+
+    # Project current token: (batch, 1, hidden) → (batch, H/KV_H, 1, head_dim)
+    q_raw = Luminal.reshape(sa.q_proj(x), [batch, 1, sa.n_heads, sa.head_dim])
+    q     = Luminal.permute(q_raw, [1, 3, 2, 4])   # (B, H, 1, D)
+
+    k_raw = Luminal.reshape(sa.k_proj(x), [batch, 1, sa.n_kv_heads, sa.head_dim])
+    k_new = Luminal.contiguous(Luminal.permute(k_raw, [1, 3, 2, 4]))  # (B, KV_H, 1, D)
+
+    v_raw = Luminal.reshape(sa.v_proj(x), [batch, 1, sa.n_kv_heads, sa.head_dim])
+    v_new = Luminal.permute(v_raw, [1, 3, 2, 4])   # (B, KV_H, 1, D)
+
+    # Apply RoPE to q and k_new at position step_pos
+    q     = apply_rotary_embeddings(q,     step_pos; base=rope_base)
+    k_new = apply_rotary_embeddings(k_new, step_pos; base=rope_base)
+
+    # Scatter new k/v into the cache (same helper as Whisper KV scatter)
+    max_seq = Luminal.realized_dims(past_k.shape)[3]
+    suffix_len = max_seq - step_pos - 1
+
+    function _kv_scatter_llama(past, slot)
+        if step_pos == 0
+            return Luminal.concat_along(slot,
+                       Luminal.slice_along(past, 3, 1, max_seq), 3)
+        elseif suffix_len == 0
+            return Luminal.concat_along(
+                       Luminal.slice_along(past, 3, 0, step_pos), slot, 3)
+        else
+            return Luminal.concat_along(
+                       Luminal.concat_along(
+                           Luminal.slice_along(past, 3, 0, step_pos), slot, 3),
+                       Luminal.slice_along(past, 3, step_pos + 1, max_seq), 3)
+        end
+    end
+
+    new_k = _kv_scatter_llama(past_k, k_new)
+    new_v = _kv_scatter_llama(past_v, v_new)
+
+    # Attend over [0 : step_pos + 1]
+    k_ctx   = Luminal.slice_along(new_k, 3, 0, step_pos + 1)   # (B, KV_H, ctx, D)
+    v_ctx   = Luminal.slice_along(new_v, 3, 0, step_pos + 1)   # (B, KV_H, ctx, D)
+
+    # GQA: repeat KV heads to match Q heads
+    if sa.n_kv_heads < sa.n_heads
+        groups = div(sa.n_heads, sa.n_kv_heads)
+        k_ctx = repeat_kv(k_ctx, groups)
+        v_ctx = repeat_kv(v_ctx, groups)
+    end
+
+    k_ctx_t = Luminal.contiguous(Luminal.permute(k_ctx, [1, 2, 4, 3]))   # (B, H, D, ctx)
+    weights  = Luminal.matmul(q, k_ctx_t) * (1.0f0 / sqrt(Float32(sa.head_dim)))
+    probs    = Luminal.softmax(weights, 4)
+    out      = Luminal.matmul(probs, v_ctx)   # (B, H, 1, D)
+    out      = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [batch, 1, hidden])
+
+    return sa.o_proj(out), new_k, new_v
+end
+
+
+"""
+    LlamaDecodeGraph
+
+Node IDs for driving one step of the incremental Llama decode graph.
+"""
+struct LlamaDecodeGraph
+    token_input_id::Int
+    self_k_ids::Vector{Int}
+    self_v_ids::Vector{Int}
+    logits_id::Int
+    new_self_k_ids::Vector{Int}
+    new_self_v_ids::Vector{Int}
+    step_pos::Int
+end
+
+
+"""
+    build_llama_decode_step!(model, graph, step_pos; max_seq, batch, rope_base)
+
+Build the single-step incremental decode graph for a Llama-style model.
+`model` must be a `Llama` or `Phi3` instance whose weight tensors are already
+registered (or randomly initialized) in `graph`.
+
+Returns a `LlamaDecodeGraph`.
+"""
+function build_llama_decode_step!(model,
+                                   graph::Luminal.Graph,
+                                   step_pos::Int;
+                                   max_seq::Int=2048,
+                                   batch::Int=1,
+                                   rope_base::Float32=500000f0)
+    n_layers  = length(model.layers)
+    first_attn = model.layers[1].attention
+    n_kv_heads = first_attn.n_kv_heads
+    head_dim   = first_attn.head_dim
+
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    token_in = Luminal.tensor(graph, [batch, 1])
+
+    self_k_tensors = [Luminal.tensor(graph, [batch, n_kv_heads, max_seq, head_dim])
+                      for _ in 1:n_layers]
+    self_v_tensors = [Luminal.tensor(graph, [batch, n_kv_heads, max_seq, head_dim])
+                      for _ in 1:n_layers]
+
+    # ── Embedding ─────────────────────────────────────────────────────────────
+    x = model.embedding(token_in)  # (batch, 1, hidden)
+
+    # ── Decoder layers ────────────────────────────────────────────────────────
+    new_k_tensors = Luminal.GraphTensor[]
+    new_v_tensors = Luminal.GraphTensor[]
+
+    for (i, layer) in enumerate(model.layers)
+        normed = layer.attention_norm(x)
+        attn_out, nk, nv = llama_self_attn_cached(
+            layer.attention, normed, step_pos,
+            self_k_tensors[i], self_v_tensors[i];
+            rope_base=rope_base)
+        x = x + attn_out
+        push!(new_k_tensors, nk)
+        push!(new_v_tensors, nv)
+
+        normed_ff = layer.feed_forward_norm(x)
+        x = x + layer.feed_forward(normed_ff)
+    end
+
+    # ── Head ─────────────────────────────────────────────────────────────────
+    out    = model.norm(x)   # (batch, 1, hidden)
+    logits = model.head(out) # (batch, 1, vocab)
+
+    return LlamaDecodeGraph(
+        token_in.id,
+        [t.id for t in self_k_tensors],
+        [t.id for t in self_v_tensors],
+        logits.id,
+        [t.id for t in new_k_tensors],
+        [t.id for t in new_v_tensors],
+        step_pos)
+end
+
+
+"""
+    llama_decode_step!(exec_fn, idg, cache, token_id; device=get_device())
+
+Execute one cached decode step.
+- `exec_fn`: compiled execution function
+- `idg`: LlamaDecodeGraph for this step_pos
+- `cache`: LlamaKVCacheState (mutated in place)
+- `token_id`: scalar Int (0-indexed vocab index)
+
+Returns `logits::Array{Float32,3}` of shape (batch, 1, vocab_size).
+"""
+function llama_decode_step!(exec_fn,
+                             idg::LlamaDecodeGraph,
+                             cache::LlamaKVCacheState,
+                             token_id::Int;
+                             device=Luminal.get_device())
+    inputs = Dict{Int, Any}()
+    inputs[idg.token_input_id] = Float32[token_id;;]  # (1,1)
+
+    for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
+        inputs[k_id] = Luminal.to_device(Dict(k_id => cache.self_cache[i][1]), device)[k_id]
+        inputs[v_id] = Luminal.to_device(Dict(v_id => cache.self_cache[i][2]), device)[v_id]
+    end
+
+    results = exec_fn(inputs, device)
+    logits  = results[idg.logits_id]
+
+    # Update cache
+    for (i, (nk_id, nv_id)) in enumerate(zip(idg.new_self_k_ids, idg.new_self_v_ids))
+        cache.self_cache[i] = (
+            Array{Float32,4}(results[nk_id]),
+            Array{Float32,4}(results[nv_id]))
+    end
+
+    cache.step_pos += 1
+    return logits
+end
+
+export LlamaKVCacheState, LlamaDecodeGraph, build_llama_decode_step!, llama_decode_step!, llama_self_attn_cached
+
 include("Whisper.jl")
 export WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,
        DecoderTransformerBlock, TextDecoder,

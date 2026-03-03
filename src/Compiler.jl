@@ -178,7 +178,7 @@ end
 
 # --- Main Compile Function ---
 
-function compile(graph::Luminal.Graph)
+function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device())
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -188,7 +188,7 @@ function compile(graph::Luminal.Graph)
     end
 
     # 1. Identify Fusible Intermediates
-    compile_device = Luminal.get_device() 
+    compile_device = device 
     fusible_intermediates = Set{Int}()
     
     # Disable dynamic fusion generation on CUDA backend since Julia 1.12 World Age
