@@ -1,5 +1,14 @@
 # Position-Agnostic Graphs in Luminal.jl
 
+## Status: Partially Implemented
+
+The infrastructure for position-agnostic (dynamic shape) graphs is partially implemented as part of the `dev_PAG` branch work. 
+
+### Progress:
+- [x] **Decoding Path**: The `build_llama_decode_step!` function in `src/Decoding.jl` now creates a position-agnostic graph where the current position `pos` is a symbolic variable.
+- [x] **Symbolic Integration**: Basic symbolic dimension propagation is active in `ShapeTracker.jl`.
+- [ ] **Next Steps**: Full memory pooling and pre-allocation (Phase 3) to eliminate all execution-time allocations.
+
 Currently, [Luminal.jl](file:///devel/phil/Luminal.jl/src/Luminal.jl) suffers from severe VRAM spikes during text generation because it compiles a completely new execution graph (allocating ~1-2GB of new intermediate `CuArray` buffers) for every single token position. This happens because sequence lengths and positions (`pos`) are hardcoded as integers during the `compile()` phase.
 
 To achieve the memory efficiency and speed of the Rust version of Luminal, [Luminal.jl](file:///devel/phil/Luminal.jl/src/Luminal.jl) needs to transition to **position-agnostic graphs**. 
