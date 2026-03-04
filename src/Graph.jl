@@ -53,7 +53,7 @@ end
 
 Define a new input tensor on the graph.
 """
-function tensor(graph::Graph, shape::Vector{Int})
+function tensor(graph::Graph, shape::AbstractVector)
     st = ShapeTracker(shape)
     op = Function("InputTensor")
     inputs = Vector{Tuple{Int, Int, ShapeTracker}}()

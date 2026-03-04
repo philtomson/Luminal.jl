@@ -7,9 +7,9 @@ function broadcast_dims(dims1, dims2)
     N1 = length(dims1)
     N2 = length(dims2)
     N = max(N1, N2)
-    # Prepend 1s
-    d1 = [ones(Int, N - N1)..., dims1...]
-    d2 = [ones(Int, N - N2)..., dims2...]
+    # Append 1s (Left-aligned broadcasting for Julia column-major)
+    d1 = [dims1..., ones(Int, N - N1)...]
+    d2 = [dims2..., ones(Int, N - N2)...]
     res = Luminal.DimType[]
     for i in 1:N
         v1 = d1[i]
@@ -18,7 +18,7 @@ function broadcast_dims(dims1, dims2)
         # Helper to check for 1
         is_one(x) = (x isa Number && x == 1)
         
-        if v1 == v2
+        if isequal(v1, v2)
             push!(res, v1)
         elseif is_one(v1)
             push!(res, v2)
@@ -170,7 +170,7 @@ end
 # Movement Ops
 # ------------
 
-function reshape(a::GraphTensor, new_shape_vec::Vector{Int})
+function reshape(a::GraphTensor, new_shape_vec::AbstractVector)
     # Luminal philosophy: Reshape always works on contiguous data
     a_cont = contiguous(a)
     # Calculate target dimensions
@@ -191,7 +191,7 @@ function permute(a::GraphTensor, dims::Vector{Int})
     return add_op!(a.graph_ref, Permute(dims), inputs, output_shape)
 end
 
-function expand(a::GraphTensor, dim::Int, size::Int)
+function expand(a::GraphTensor, dim::Int, size::DimType)
     calc_shape = expand(a.shape, dim, size)
     final_dims = realized_dims(calc_shape)
     output_shape = ShapeTracker(final_dims)
@@ -210,7 +210,7 @@ function contiguous(a::GraphTensor)
     return add_op!(a.graph_ref, Contiguous(), inputs, output_shape)
 end
 
-function pad(a::GraphTensor, padding_vec::Vector{Tuple{Int, Int}})
+function pad(a::GraphTensor, padding_vec::AbstractVector)
     calc_shape = deepcopy(a.shape)
     pad!(calc_shape, padding_vec)
     final_dims = realized_dims(calc_shape)
@@ -219,13 +219,13 @@ function pad(a::GraphTensor, padding_vec::Vector{Tuple{Int, Int}})
     return add_op!(a.graph_ref, Pad(padding_vec), inputs, output_shape)
 end
 
-function pad_along(a::GraphTensor, axis::Int, left::Int, right::Int)
-    p = fill((0, 0), length(a.shape.indexes))
+function pad_along(a::GraphTensor, axis::Int, left::DimType, right::DimType)
+    p = Tuple{DimType, DimType}[(0, 0) for _ in 1:length(a.shape.indexes)]
     p[axis] = (left, right)
     return pad(a, p)
 end
 
-function slice(a::GraphTensor, slice_vec::Vector{Tuple{Int, Int}})
+function slice(a::GraphTensor, slice_vec::AbstractVector)
     calc_shape = deepcopy(a.shape)
     slice!(calc_shape, slice_vec)
     final_dims = realized_dims(calc_shape)
@@ -234,8 +234,8 @@ function slice(a::GraphTensor, slice_vec::Vector{Tuple{Int, Int}})
     return add_op!(a.graph_ref, Slice(slice_vec), inputs, output_shape)
 end
 
-function slice_along(a::GraphTensor, axis::Int, start::Int, stop::Int)
-    s = fill((0, typemax(Int)), length(a.shape.indexes))
+function slice_along(a::GraphTensor, axis::Int, start::DimType, stop::DimType)
+    s = Tuple{DimType, DimType}[(0, typemax(Int)) for _ in 1:length(a.shape.indexes)]
     s[axis] = (start, stop)
     return slice(a, s)
 end
@@ -255,8 +255,9 @@ function matmul(a::GraphTensor, b::GraphTensor)
     b_dims = realized_dims(b.shape)
     @assert length(a_dims) >= 2 && length(b_dims) >= 2 "Matmul inputs must be at least 2D"
     
-    # Simple matmul shape logic: (..., M, K) * (..., K, N) -> (..., M, N)
-    output_shape_vec = [a_dims[1:(end-1)]..., b_dims[end]]
+    # Left-aligned matmul shape logic: (M, K, ...) * (K, N, ...) -> (M, N, ...)
+    batch_dims = broadcast_dims(a_dims[3:end], b_dims[3:end])
+    output_shape_vec = [a_dims[1], b_dims[2], batch_dims...]
     output_shape = ShapeTracker(output_shape_vec)
 
     inputs = [(a.id, 0, a.shape), (b.id, 0, b.shape)]
@@ -329,7 +330,7 @@ end
 # arange and gather
 # -----------------
 
-function arange(graph::Graph, to::Int)
+function arange(graph::Graph, to::DimType)
     if to == 1
         return expand(constant(graph, 0.0f0), 1, 1)
     else
@@ -350,14 +351,19 @@ function cumsum_last_dim(a::GraphTensor)
     return add_op!(a.graph_ref, Function("CumSum"), inputs, output_shape)
 end
 
-function triu(graph::Graph, size::Int, diagonal::Int=0)
-    h = expand(arange(graph, size), 1, size) # (size, 1) then expanded to (size, size)
-    v = expand(arange(graph, size), 2, size) # (size) -> expand(2, size) -> (size, size)
-    # Wait, arange(size) is (size). 
-    # expand(arange(size), 1, size) -> (size, size) where 1st dim is expanded.
-    # So h is (size, size) where each row is [0, 1, ..., N-1].
-    # v is (size, size) where each column is [0, 1, ..., N-1].
-    return h - Float32(diagonal - 1) > v
+function triu(graph::Graph, size::DimType, diagonal::Int=0)
+    # h will be row index, v will be column index
+    # (size) -> expand(2, size) -> (size, size) where each row is [0, 1, ..., N-1]
+    v = expand(arange(graph, size), 1, size)
+    # (size) -> expand(1, size) -> (size, size) where each col is [0, 1, ..., N-1] 
+    h = expand(arange(graph, size), 2, size)
+    
+    # In Julia column-major (B, S):
+    # Dim 1 is S (rows), Dim 2 is B (columns) - actually for (S, S):
+    # h = expand(arange, 2, size) -> new dim is 2 (cols). so rows vary. h[i, j] = i-1
+    # v = expand(arange, 1, size) -> new dim is 1 (rows). so cols vary. v[i, j] = j-1
+    # We want Upper Triangle (col > row + diag - 1)
+    return v - Float32(diagonal - 1) > h
 end
 
 function gather(matrix::GraphTensor, indexes::GraphTensor)

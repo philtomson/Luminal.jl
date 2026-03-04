@@ -73,25 +73,41 @@ end
 # --- Compiled Graph Structure ---
 
 struct CompiledGraph
+    graph::Luminal.Graph
     steps::Vector{Base.Function}
     results::Vector{Any} 
     cache::Dict{Symbol, Any}
+    consumer_count::Vector{Int}
 end
 
-function (cg::CompiledGraph)(inputs::Dict, device::Luminal.AbstractDevice)
+function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Symbol, Int}(), device::Luminal.AbstractDevice = Luminal.get_device())
     for (k, v) in inputs
-        if !isassigned(cg.results, k)
-             error("Input node $k not found in compiled graph results.")
+        if !isassigned(cg.results, k) || cg.results[k] === nothing
+             # Allocate if not assigned
+             cg.results[k] = Luminal.to_device(v, device)
+        else
+             # Need to copy to existing or replace if size mismatch
+             if length(cg.results[k]) != length(v)
+                 cg.results[k] = Luminal.to_device(v, device)
+             else
+                 # If v is already on device, or we can copy
+                 if v isa CUDA.CuArray && cg.results[k] isa CUDA.CuArray
+                     copyto!(cg.results[k], v)
+                 else
+                     # CPU to GPU copy
+                     copyto!(cg.results[k], v)
+                 end
+             end
         end
-        if length(cg.results[k]) != length(v)
-             error("Input length mismatch for node $k: expected $(length(cg.results[k])), got $(length(v))")
-        end
-        copyto!(cg.results[k], v)
     end
+    
+    # Initialize live consumer counts for this run
+    # Nodes in graph.tensors are weights and persist
+    live_counts = copy(cg.consumer_count)
     
     function run_graph()
         for step in cg.steps
-            step(cg.results, device)
+            step(cg.results, device, sym_vals, live_counts)
         end
     end
     
@@ -176,15 +192,38 @@ function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible
     return op_to_sym(op, input_syms)
 end
 
+function evaluate_op_shapes(op::Luminal.Op, sym_vals::Dict{Symbol, Int})
+    if op isa Luminal.Expand
+        return Luminal.Expand(op.dim, Luminal.eval_dim(op.size, sym_vals))
+    elseif op isa Luminal.Reshape
+        return Luminal.Reshape([Luminal.eval_dim(d, sym_vals) for d in op.shape])
+    elseif op isa Luminal.Slice
+        return Luminal.Slice([(Luminal.eval_dim(s, sym_vals), Luminal.eval_dim(e, sym_vals)) for (s, e) in op.ranges])
+    elseif op isa Luminal.Pad
+        return Luminal.Pad([(Luminal.eval_dim(s, sym_vals), Luminal.eval_dim(e, sym_vals)) for (s, e) in op.padding])
+    elseif op isa Luminal.Unfold
+        return Luminal.Unfold(
+            [Luminal.eval_dim(d, sym_vals) for d in op.kernel_shape],
+            [Luminal.eval_dim(d, sym_vals) for d in op.stride_shape],
+            [Luminal.eval_dim(d, sym_vals) for d in op.dilation_shape]
+        )
+    else
+        return op
+    end
+end
+
 # --- Main Compile Function ---
 
-function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device())
+function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(), retain::Vector{Int}=Int[])
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
         for (id, _, _) in node.inputs
             consumer_count[id] += 1
         end
+    end
+    for id in retain
+        consumer_count[id] += 1
     end
 
     # 1. Identify Fusible Intermediates
@@ -214,30 +253,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
-    # 2. Allocate Results
+    # 2. Setup Results array (weights are pre-populated)
     results = Vector{Any}(undef, length(graph.nodes))
-    
     for (node_id, node) in enumerate(graph.nodes)
-        node_shape = graph.shapes[node_id]
-        dims_int = map(eval_dim, realized_dims(node_shape))
-        dtype = (compile_device isa Luminal.CUDADevice || compile_device isa Luminal.AMDDevice) ? Float16 : Float32
-        
-        # Reuse existing tensor if already loaded (e.g. weights)
         if haskey(graph.tensors, (node_id, 1))
             results[node_id] = graph.tensors[(node_id, 1)]
-            continue
-        end
-        if compile_device isa Luminal.CUDADevice
-            results[node_id] = CUDA.fill(dtype(0), dims_int...) 
-        else
-            results[node_id] = zeros(dtype, dims_int...)
-        end
-
-        if node.op isa Luminal.Constant
-             copyto!(results[node_id], to_device(node.op.value, compile_device))
-        elseif node.op isa Luminal.Function && node.op.name == "ARange"
-             n = dims_int[1]
-             copyto!(results[node_id], to_device(Float32.(collect(0:n-1)), compile_device))
         end
     end
 
@@ -248,16 +268,63 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         processed[node_id] && continue
         op = node.op
 
-        if op isa Luminal.Constant || (op isa Luminal.Function && (op.name == "ARange" || op.name == "InputTensor"))
+        if op isa Luminal.Constant
+            val = to_device(op.value, compile_device)
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                res[node_id] = val
+            end)
+            processed[node_id] = true
+            continue
+        elseif op isa Luminal.Function && op.name == "ARange"
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                node_shape = graph.shapes[node_id]
+                dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
+                n = dims_int[1]
+                res[node_id] = to_device(Float32.(collect(0:n-1)), dev)
+            end)
+            processed[node_id] = true
+            continue
+        elseif op isa Luminal.Function && op.name == "InputTensor"
             processed[node_id] = true
             continue
         end
 
         if !is_elementwise(op) || (compile_device isa Luminal.CUDADevice && !(node_id in fusible_intermediates))
             input_specs = node.inputs
-            step_args = [realize_view(results[id], st) for (id, _, st) in input_specs]
-            target_buf = results[node_id]
-            push!(steps, (results, device) -> execute_op!(target_buf, op, step_args...))
+            node_shape = graph.shapes[node_id]
+            is_persistent = haskey(graph.tensors, (node_id, 1))
+            dtype = (compile_device isa Luminal.CUDADevice || compile_device isa Luminal.AMDDevice) ? Float32 : Float32
+
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                # 1. Allocate if needed
+                if !is_persistent
+                    dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
+                    sz = Tuple(dims_int)
+                    if !isassigned(res, node_id) || res[node_id] === nothing || size(res[node_id]) != sz
+                        if dev isa Luminal.CUDADevice
+                            res[node_id] = CUDA.fill(dtype(0), dims_int...) 
+                        else
+                            res[node_id] = zeros(dtype, dims_int...)
+                        end
+                    end
+                end
+
+                # 2. Evaluate shapes and arguments
+                # Operations with sizes/dimensions need updating inside
+                # For now, we evaluate shapes for the realize_view
+                step_args = [realize_view(res[id], evaluate_shapes(st, sym_vals)) for (id, _, st) in input_specs]
+                
+                # 3. Execute
+                execute_op!(res[node_id], evaluate_op_shapes(op, sym_vals), step_args...)
+
+                # 4. Free dead inputs
+                for (id, _, _) in input_specs
+                    live[id] -= 1
+                    if live[id] == 0 && !haskey(graph.tensors, (id, 1))
+                        res[id] = nothing
+                    end
+                end
+            end)
             processed[node_id] = true
         else
             if !(node_id in fusible_intermediates)
@@ -341,8 +408,6 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     end
                 end
                 
-                println("Fusing node $node_id via global base kernel:")
-                flush(stdout)
                 
                 Core.eval(Luminal, kernel_ast)
                 
@@ -350,21 +415,35 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 target_rank = length(realized_dims(graph.shapes[node_id]))
                 function align_rank(val, rank)
                     if ndims(val) >= rank return val end
-                    return Base.reshape(val, ones(Int, rank - ndims(val))..., size(val)...)
+                    return Base.reshape(val, size(val)..., ones(Int, rank - ndims(val))...)
                 end
                 
-                input_steps = [align_rank(realize_view(results[id], st), target_rank) for (id, st, _) in group_inputs]
-                target_buf = results[node_id]
-                
-                push!(steps, (results, device) -> begin
-                    # Standard broadcast using a purely global, rigidly typed generic Julia function
-                    # The `execute_op!` function already does `broadcast!(op.f, out, inputs...)`
+                input_node_shapes = [evaluate_shapes(st, Dict{Symbol,Int}()) for (_, st, _) in group_inputs]
+                # Wait, fusion requires static target_rank and align_rank. We can fallback to eval if rank is constant. 
+                # Since fusion is disabled on CUDA this branch is mostly CPU only.
+                # Skip evaluating shapes dynamically for CPU fusion to save time if we don't need it.
+                push!(steps, (res, dev, sym_vals, live) -> begin
+                    input_steps = [align_rank(realize_view(res[id], evaluate_shapes(st, sym_vals)), target_rank) for (id, st, _) in group_inputs]
+                    
+                    if !isassigned(res, node_id) || res[node_id] === nothing
+                        dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(graph.shapes[node_id]))
+                        res[node_id] = zeros(Float32, dims_int...)
+                    end
+                    target_buf = res[node_id]
+                    
                     Base.invokelatest(execute_op!, target_buf, fused_op, input_steps...)
+                    
+                    for (id, _, _) in group_inputs
+                        live[id] -= 1
+                        if live[id] == 0 && !haskey(graph.tensors, (id, 1))
+                            res[id] = nothing
+                        end
+                    end
                 end)
                 processed[node_id] = true
             end
         end
     end
 
-    return CompiledGraph(steps, results, Dict{Symbol, Any}())
+    return CompiledGraph(graph, steps, results, Dict{Symbol, Any}(), consumer_count)
 end

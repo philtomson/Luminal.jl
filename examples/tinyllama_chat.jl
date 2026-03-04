@@ -18,6 +18,7 @@ function main()
     model_dir    = length(ARGS) >= 1 ? ARGS[1] : "/devel/phil/Llama-3.2"
     prompt       = length(ARGS) >= 2 ? ARGS[2] : "Once upon a time"
     max_tokens   = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 100
+    rope_base    = length(ARGS) >= 4 ? parse(Float32, ARGS[4]) : 10000.0f0
 
     println("=========================================")
     println("   Luminal.jl - TinyLlama Text Generation")
@@ -66,13 +67,13 @@ function main()
                                max_new_tokens=max_tokens,
                                max_seq=256,
                                device=device,
-                               rope_base=10000f0)  # TinyLlama uses Llama-2 RoPE base
+                               rope_base=rope_base)  # Decided by command-line or default
     t1 = time()
 
     println(response)
     println("-" ^ 40)
 
-    n_gen = length(encode(tok, response))
+    n_gen = length(Luminal.encode(tok, response))
     elapsed = t1 - t0
     @printf "\n[Stats] %d tokens in %.1fs  (%.1f tok/s)\n" n_gen elapsed (n_gen / elapsed)
     println("=========================================")

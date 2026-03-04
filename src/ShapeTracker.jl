@@ -109,7 +109,7 @@ end
 
 Return a new ShapeTracker with a new dimension of `size` inserted at `dim`.
 """
-function expand(st::ShapeTracker, dim::Int, new_size::Int)
+function expand(st::ShapeTracker, dim::Int, new_size::Luminal.DimType)
     new_st = deepcopy(st)
     expand_dim!(new_st, dim, new_size)
     return new_st
@@ -151,7 +151,55 @@ function realized_dims(st::ShapeTracker)
     return Luminal.DimType[pad_mask_dim(st.dims[i], st.padding[i], st.mask[i]) for i in st.indexes]
 end
 
+function evaluate_shapes(st::ShapeTracker, sym_vals::Dict{Symbol, Int})
+    # Create a new ShapeTracker with concrete Int dimensions 
+    new_dims = Int[]
+    for i in 1:length(st.dims)
+        push!(new_dims, Luminal.eval_dim(st.dims[i], sym_vals))
+    end
+    
+    new_st = ShapeTracker(new_dims)
+    new_st.indexes = copy(st.indexes)
+    new_st.fake = copy(st.fake)
+    
+    # Evaluate mask and padding
+    new_st.mask = [(Luminal.eval_dim(first(m), sym_vals), Luminal.eval_dim(last(m), sym_vals)) for m in st.mask]
+    new_st.padding = [(Luminal.eval_dim(first(p), sym_vals), Luminal.eval_dim(last(p), sym_vals)) for p in st.padding]
+    
+    return new_st
+end
+
+function _sym_add(a, b)
+    if a isa Int && b isa Int
+        return a + b
+    elseif a isa Int && a == 0 return b
+    elseif b isa Int && b == 0 return a
+    else
+        return SymbolicUtils.Term(+, Any[a, b])
+    end
+end
+
+function _sym_sub(a, b)
+    if a isa Int && b isa Int
+        return a - b
+    elseif b isa Int && b == 0 return a
+    else
+        return SymbolicUtils.Term(-, Any[a, b])
+    end
+end
+
+function _sym_min(a, b)
+    if a isa Int && b isa Int
+        return min(a, b)
+    elseif b isa Int && b == typemax(Int) return a
+    elseif a isa Int && a == typemax(Int) return b
+    else
+        # Simplification: we don't strictly support min for symbolic yet, assume unbound limit
+        return a
+    end
+end
+
 function pad_mask_dim(dim, padding, mask)
-    # (padding.0 + padding.1 + dim).min(mask.1) - mask.0
-    return min(padding[1] + padding[2] + dim, mask[2]) - mask[1]
+    b = _sym_add(_sym_add(padding[1], padding[2]), dim)
+    return _sym_sub(_sym_min(b, mask[2]), mask[1])
 end

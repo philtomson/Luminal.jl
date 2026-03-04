@@ -61,25 +61,25 @@ end
 
 struct Expand <: Op
     dim::Int
-    size::Int # Using Int for size, corresponds to Expression in Rust
+    size::DimType # Corresponds to Expression in Rust
 end
 
 struct Reshape <: Op
-    shape::Vector{Int} # Using Int for shape dimensions
+    shape::Vector{DimType}
 end
 
 struct Slice <: Op
-    ranges::Vector{Tuple{Int, Int}}
+    ranges::Vector{Tuple{DimType, DimType}}
 end
 
 struct Pad <: Op
-    padding::Vector{Tuple{Int, Int}}
+    padding::Vector{Tuple{DimType, DimType}}
 end
 
 struct Unfold <: Op
-    kernel_shape::Vector{Int}
-    stride_shape::Vector{Int}
-    dilation_shape::Vector{Int}
+    kernel_shape::Vector{DimType}
+    stride_shape::Vector{DimType}
+    dilation_shape::Vector{DimType}
 end
 
 # Special Ops

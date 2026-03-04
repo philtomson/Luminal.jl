@@ -61,9 +61,16 @@ function llama_generate(model,
     pfx_graph = Graph()
     pfx_reg   = WeightRegistry()
     # Rebuild model structure for the prefill length graph
-    pfx_model = _rebuild_model_like(model, pfx_graph, pfx_reg)
-    pfx_input = Luminal.tensor(pfx_graph, [1, plen])
-    pfx_out   = pfx_model(pfx_input, 0)
+    pfx_model = _rebuild_model_like(model, pfx_graph, pfx_reg; rope_base=rope_base)
+    pfx_input = Luminal.tensor(pfx_graph, [plen, 1])
+    pfx_out, pfx_kvs = pfx_model(pfx_input, 0; return_kv=true)
+    
+    # Mark K/V tensors for retrieval so we can populate the cache
+    push!(pfx_graph.to_retrieve, pfx_out.id)
+    for (k, v) in pfx_kvs
+        push!(pfx_graph.to_retrieve, k.id)
+        push!(pfx_graph.to_retrieve, v.id)
+    end
 
     @info "Loading weights for prefill graph..."
     # We load ALL weights into a dictionary on the target device once, 
@@ -71,14 +78,17 @@ function llama_generate(model,
     weights_dict = load_weights_to_dict(model_dir; device=target_device)
     
     load_weights!(pfx_graph, pfx_reg, weights_dict; device=target_device)
-    pfx_exec = compile(pfx_graph; device=target_device)
+    
+    # We must explicitly retain nodes we want to retrieve 
+    retain_pfx = collect(pfx_graph.to_retrieve)
+    pfx_exec = compile(pfx_graph; device=target_device, retain=retain_pfx)
 
-    pfx_inputs = Dict{Int,Any}(pfx_input.id => Float32.(Base.reshape(prompt_ids, 1, plen)))
-    pfx_results = pfx_exec(pfx_inputs, target_device)
-    prefill_logits = Array{Float32}(pfx_results[pfx_out.id])  # (1, plen, vocab)
+    pfx_inputs = Dict{Int,Any}(pfx_input.id => Float32.(Base.reshape(prompt_ids, plen, 1)))
+    pfx_results = pfx_exec(pfx_inputs; device=target_device)
+    prefill_logits = Array{Float32}(pfx_results[pfx_out.id])  # (vocab, plen, 1)
 
     # Greedy-pick the first generated token from the last position of prefill
-    first_token = argmax(view(prefill_logits, 1, plen, :)) - 1  # 0-indexed
+    first_token = argmax(view(prefill_logits, :, plen, 1)) - 1  # 0-indexed
 
     eos_id = tokenizer.eos_id
     if first_token == eos_id
@@ -100,51 +110,56 @@ function llama_generate(model,
     if target_device isa Luminal.CUDADevice
         @info "VRAM before decode loop" available_mb=(CUDA.available_memory()/1024/1024)
     end
-
+    
     first_attn = model.layers[1].attention
     cache = LlamaKVCacheState(
         length(model.layers), first_attn.n_kv_heads, first_attn.head_dim;
-        max_seq=max_seq)
+        batch=1, max_seq=max_seq)
 
     # Step 0 = position immediately after the prefill sequence
     # (step_pos semantics: position in the *cache* of the current token)
     start_pos = plen  # first decode token lands at position plen in the cache
+    cache.step_pos = start_pos
+
+    # Populate cache from prefill results
+    for (i, (k, v)) in enumerate(pfx_kvs)
+        # Prefill K/V shape: (head_dim, plen, kv_heads, batch)
+        # Cache slot shape: (head_dim, max_seq, kv_heads, batch)
+        k_val = Array{Float16}(pfx_results[k.id])
+        v_val = Array{Float16}(pfx_results[v.id])
+        
+        # In-place update of the cache slices
+        cache.self_cache[i][1][:, 1:plen, :, :] = k_val
+        cache.self_cache[i][2][:, 1:plen, :, :] = v_val
+    end
+
+    @info "Compiling position-agnostic decode graph..."
+    dg = Base.invokelatest(Graph)
+    dreg = WeightRegistry()
+    dm = _rebuild_model_like(model, dg, dreg; rope_base=rope_base)
+    pos_sym = Luminal.Sym{Int}(:pos)
+    idg = build_llama_decode_step!(dm, dg, pos_sym;
+                                   max_seq=max_seq,
+                                   rope_base=rope_base)
+    
+    load_weights!(dg, dreg, weights_dict; device=target_device)
+    retain_nodes = vcat(
+        idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
+        idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids
+    )
+    exec_fn = compile(dg; device=target_device, retain=retain_nodes)
 
     for step in 0:(max_new_tokens - 2)
-        # Clear VRAM and trigger GC before the next graph is compiled
-        GC.gc()
-        if target_device isa Luminal.CUDADevice
-            CUDA.reclaim()
-        end
-
         pos = start_pos + step
-        dg = Graph()
-        dreg = WeightRegistry()
-        dm = _rebuild_model_like(model, dg, dreg)
-        idg = build_llama_decode_step!(dm, dg, pos;
-                                       max_seq=max_seq,
-                                       rope_base=rope_base)
-        
-        load_weights!(dg, dreg, weights_dict; device=target_device)
-        exec_fn = compile(dg; device=target_device)
-
         current_token = generated[end]
-        logits = llama_decode_step!(exec_fn, idg, cache, current_token; device=target_device)
-        next_token = argmax(view(Array{Float32}(logits), 1, 1, :)) - 1  # 0-indexed
+        
+        logits = llama_decode_step!(exec_fn, idg, cache, current_token; 
+                                    sym_vals=Dict(:pos => pos),
+                                    device=target_device)
+        next_token = argmax(view(Array{Float32}(logits), :, 1, 1)) - 1  # 0-indexed
 
         push!(generated, next_token)
         next_token == eos_id && break
-        
-        # Explicitly clear this step's memory
-        exec_fn = nothing
-        dg = nothing
-        dreg = nothing
-        dm = nothing
-        dg = nothing
-        GC.gc()
-        if target_device isa Luminal.CUDADevice
-            CUDA.reclaim()
-        end
     end
 
     # 5. Decode token IDs to text (skip prompt tokens)
@@ -157,7 +172,8 @@ end
 Clone the model architecture into a new `graph` with a fresh `reg`,
 using the same hyperparameters as the original. Supports `Llama` and `Phi3`.
 """
-function _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry)
+function _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry;
+                            rope_base=model.rope_base)
     attn   = model.layers[1].attention
     n_h    = attn.n_heads
     n_kv   = attn.n_kv_heads
@@ -169,10 +185,12 @@ function _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegi
                  vocab_size=vsize, hidden=hidden,
                  n_layers=length(model.layers),
                  n_heads=n_h, n_kv_heads=n_kv,
-                 intermediate=inter)
+                 intermediate=inter,
+                 rope_base=rope_base)
 end
 
-function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegistry)
+function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegistry;
+                            rope_base=model.rope_base)
     attn   = model.layers[1].attention
     n_h    = attn.n_heads
     n_kv   = attn.n_kv_heads
@@ -184,7 +202,8 @@ function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegis
                 vocab_size=vsize, hidden=hidden,
                 n_layers=length(model.layers),
                 n_heads=n_h, n_kv_heads=n_kv,
-                intermediate=inter)
+                intermediate=inter,
+                rope_base=rope_base)
 end
 
 export llama_generate

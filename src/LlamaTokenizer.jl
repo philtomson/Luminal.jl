@@ -141,8 +141,7 @@ function encode(tok::LlamaTokenizer, text::String; bos::Bool=false, eos::Bool=fa
         if id != -1
             push!(ids, id)
         else
-            # Byte fallback or unknown
-            # For Llama-2, unknown chars are often UTF-8 bytes like <0xXX>
+            # Byte fallback for unknown tokens: map each UTF-8 byte to its vocab ID
             for b in codeunits(t)
                 hex = uppercase(string(b, base=16, pad=2))
                 byte_token = "<0x$hex>"

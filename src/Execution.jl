@@ -54,22 +54,38 @@ function batch_matmul(A, B)
 end
 
 function batch_matmul!(C, A, B)
-    println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
+    # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
+    
+    # 2D * 2D
     if ndims(A) == 2 && ndims(B) == 2
         mul!(C, A, B)
         return C
     end
     
+    # Linear: 2D * 3D (Out, In) * (In, S, B) -> (Out, S, B)
+    if ndims(A) == 2 && ndims(B) == 3
+        # Use single large gemm by flattening batch and sequence
+        out_dim, in_dim = size(A)
+        in_dim2, s, b = size(B)
+        @assert in_dim == in_dim2 "Inner dimensions must match: $in_dim vs $in_dim2"
+        
+        # mul! works on reshaped views
+        mul!(Base.reshape(C, out_dim, s * b), A, Base.reshape(B, in_dim, s * b))
+        return C
+    end
+
+    # Linear: 3D * 2D (B, S, In) * (In, Out) -> (B, S, Out)
     if ndims(A) == 3 && ndims(B) == 2
-        B1 = size(A, 1)
-        for i in 1:B1
-            # View or slice? mul! works on views.
-            # C[i, :, :] = A[i, :, :] * B
-            mul!(view(C, i, :, :), view(A, i, :, :), B)
-        end
+        batch, s, in_dim = size(A)
+        in_dim2, out_dim = size(B)
+        @assert in_dim == in_dim2 "Inner dimensions must match: $in_dim vs $in_dim2"
+        
+        # mul! works on reshaped views
+        mul!(Base.reshape(C, batch * s, out_dim), Base.reshape(A, batch * s, in_dim), B)
         return C
     end
     
+    # Attention: 3D * 3D (B, M, K) * (B, K, N) -> (B, M, N)
     if ndims(A) == 3 && ndims(B) == 3
         B1 = size(A, 1)
         for i in 1:B1
@@ -78,15 +94,19 @@ function batch_matmul!(C, A, B)
         return C
     end
     
+    # Attention: 4D * 4D (H, B, S, D) * (H, B, D, S) -> (H, B, S, S)
+    # Note: In Julia column-major, (S, D) should be the fastest dimensions for efficient view matmul.
+    # So (S, D, H, B) or (D, S, H, B) are better.
     if ndims(A) == 4 && ndims(B) == 4
-        B1, B2 = size(A, 1), size(A, 2)
+        # Loop over the last two dimensions
+        B1, B2 = size(A, 3), size(A, 4)
         for i in 1:B1, j in 1:B2
-            mul!(view(C, i, j, :, :), view(A, i, j, :, :), view(B, i, j, :, :))
+            mul!(view(C, :, :, i, j), view(A, :, :, i, j), view(B, :, :, i, j))
         end
         return C
     end
     
-    error("Batch matmul! not implemented for $(ndims(A))D and $(ndims(B))D")
+    error("Batch matmul! not implemented for $(ndims(A))D and $(ndims(B))D (Shapes: $(size(A)) and $(size(B)))")
 end
 
 function realize_view(data, st::ShapeTracker)
@@ -225,26 +245,23 @@ execute_op(op::Sin, a) = sin.(a)
 execute_op(op::Cos, a) = cos.(a)
 execute_op(op::Sqrt, a) = sqrt.(a)
 execute_op(op::Recip, a) = 1.0f0 ./ a
-execute_op(op::Reshape, a) = (res = Base.reshape(a, op.shape...); println("Reshape: $(size(a)) -> $(size(res))"); res)
-execute_op(op::Permute, a) = (res = Base.permutedims(a, op.dims); println("Permute: $(size(a)) -> $(size(res)) with dims $(op.dims)"); res)
+execute_op(op::Reshape, a) = Base.reshape(a, op.shape...)
+execute_op(op::Permute, a) = Base.permutedims(a, op.dims)
 execute_op(op::Contiguous, a) = copy(a)
-execute_op(op::MatMul, a, b) = (res = batch_matmul(a, b); println("MatMul: $(size(a)) * $(size(b)) -> $(size(res))"); res)
-execute_op(op::SumReduce, a) = (res = dropdims(Base.sum(a, dims=op.dim), dims=op.dim); println("SumReduce: $(size(a)) dim $(op.dim) -> $(size(res))"); res)
-execute_op(op::MaxReduce, a) = (res = dropdims(Base.maximum(a, dims=op.dim), dims=op.dim); println("MaxReduce: $(size(a)) dim $(op.dim) -> $(size(res))"); res)
+execute_op(op::MatMul, a, b) = batch_matmul(a, b)
+execute_op(op::SumReduce, a) = dropdims(Base.sum(a, dims=op.dim), dims=op.dim)
+execute_op(op::MaxReduce, a) = dropdims(Base.maximum(a, dims=op.dim), dims=op.dim)
 execute_op(op::Slice, a) = execute_slice(a, op.ranges)
 execute_op(op::Pad, a) = execute_pad(a, op.padding)
 execute_op(op::Constant, device) = to_device(op.value, device)
 
 function execute_op(op::Expand, a)
     curr_sz = [size(a)...]
-    println("Expand input size: $(size(a)), dim: $(op.dim), size: $(op.size)")
     insert!(curr_sz, op.dim, 1)
     reshaped = Base.reshape(a, curr_sz...)
     repeats = ones(Int, length(curr_sz))
     repeats[op.dim] = op.size
-    res = repeat(reshaped, outer=repeats)
-    println("Expand result size: $(size(res))")
-    return res
+    return repeat(reshaped, outer=repeats)
 end
 
 execute_op(op::FusedElementwiseOp, inputs...) = broadcast(op.f, inputs...)
@@ -271,12 +288,31 @@ end
 
 # --- Dispatchable Execute functions (In-Place) ---
 
-execute_op!(out, op::Add, a, b) = broadcast!(+, out, a, b)
-execute_op!(out, op::Mul, a, b) = broadcast!(*, out, a, b)
-execute_op!(out, op::Mod, a, b) = broadcast!(%, out, a, b)
-execute_op!(out, op::LessThan, a, b) = broadcast!((x,y)->Float32(x<y), out, a, b)
-execute_op!(out, op::FusedMulAdd, a, b, c) = broadcast!((x,y,z)->x*y+z, out, a, b, c)
-execute_op!(out, op::FusedAddReLU, a, b) = broadcast!((x,y)->max(x+y, 0), out, a, b)
+function _align_broadcast(x, out)
+    nd = ndims(x)
+    nout = ndims(out)
+    if nd > 0 && nd < nout
+        return Base.reshape(x, (size(x)..., ntuple(i->1, nout - nd)...))
+    end
+    return x
+end
+
+function execute_op!(out, op::Add, a, b)
+    a_aligned = _align_broadcast(a, out)
+    b_aligned = _align_broadcast(b, out)
+    broadcast!(+, out, a_aligned, b_aligned)
+end
+
+function execute_op!(out, op::Mul, a, b)
+    a_aligned = _align_broadcast(a, out)
+    b_aligned = _align_broadcast(b, out)
+    broadcast!(*, out, a_aligned, b_aligned)
+end
+
+execute_op!(out, op::Mod, a, b) = broadcast!(%, out, _align_broadcast(a, out), _align_broadcast(b, out))
+execute_op!(out, op::LessThan, a, b) = broadcast!((x,y)->Float32(x<y), out, _align_broadcast(a, out), _align_broadcast(b, out))
+execute_op!(out, op::FusedMulAdd, a, b, c) = broadcast!((x,y,z)->x*y+z, out, _align_broadcast(a, out), _align_broadcast(b, out), _align_broadcast(c, out))
+execute_op!(out, op::FusedAddReLU, a, b) = broadcast!((x,y)->max(x+y, 0), out, _align_broadcast(a, out), _align_broadcast(b, out))
 execute_op!(out, op::Log2, a) = broadcast!(log2, out, a)
 execute_op!(out, op::Exp2, a) = broadcast!(exp2, out, a)
 execute_op!(out, op::Sin, a) = broadcast!(sin, out, a)
@@ -289,7 +325,7 @@ function execute_op!(out, op::Reshape, a)
     # Usually copyto!(dest, src).
     # ensure 'a' is viewed as matching length.
     if length(out) != length(a)
-        error("Length mismatch in Reshape!: $(length(out)) vs $(length(a))")
+        error("Length mismatch in Reshape!: $(length(out)) vs $(length(a)). size(out)=$(size(out)), size(a)=$(size(a))")
     end
     copyto!(out, a)
     return out
@@ -661,11 +697,19 @@ function execute(graph::Graph, output_id::Int, initial_inputs::Dict, device::Abs
     return res_dict[output_id]
 end
 
-function eval_dim(d)
+function eval_dim(d, sym_vals::Dict{Symbol, Int}=Dict{Symbol, Int}())
     if d isa Int
         return d
     elseif d isa BasicSymbolic
-        error("Cannot evaluate symbolic dimension $d without context.")
+        # Substitute symbols using the provided dictionary
+        # Convert Dict{Symbol, Int} to Dict{Any, Any} for SymbolicUtils.substitute
+        subs_dict = Dict{Any, Any}(Sym{Int}(k) => v for (k, v) in sym_vals)
+        val = substitute(d, subs_dict)
+        if val isa Int
+            return val
+        else
+            error("Cannot evaluate symbolic dimension $d to Int. Missing context? Residual part: $val")
+        end
     else
         return Int(d)
     end

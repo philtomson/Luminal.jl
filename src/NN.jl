@@ -20,15 +20,17 @@ function Linear(in_features::Int, out_features::Int, graph::Luminal.Graph; bias=
 end
 
 function (l::Linear)(x::Luminal.GraphTensor)
-    # x: (batch, in_features)
-    # weight: (out_features, in_features)
-    # out: (batch, out_features)
-    out = Luminal.matmul(x, Luminal.permute(l.weight, [2, 1]))
+    # x is (In, Seq..., Batch)
+    # l.weight is (Out, In)
+    # out = W * x -> (Out, Seq..., Batch)
+    out = Luminal.matmul(l.weight, x)
     if l.bias !== nothing
-        # Expand bias to match batch dimension
-        # out.shape: (batch, out_features)
-        # l.bias: (out_features)
-        b_expanded = Luminal.expand(l.bias, 1, Luminal.realized_dims(out.shape)[1])
+        # Expand bias (Out) to match out shape
+        dims = Luminal.realized_dims(out.shape)
+        b_expanded = l.bias
+        for i in 2:length(dims)
+            b_expanded = Luminal.expand(b_expanded, i, dims[i])
+        end
         out = out + b_expanded
     end
     return out
@@ -114,7 +116,18 @@ function Embedding(vocab_size::Int, embed_dim::Int, graph::Luminal.Graph)
 end
 
 function (e::Embedding)(x::Luminal.GraphTensor)
-    return Luminal.gather(e.weight, x)
+    # gather(weight(V, H), x(S, B)) -> (S, B, H)
+    out = Luminal.gather(e.weight, x)
+    # Align to (H, S, B) 
+    rank = length(Luminal.realized_dims(out.shape))
+    if rank == 3
+        # (S, B, H) -> (H, S, B)
+        return Luminal.permute(out, [3, 1, 2])
+    elseif rank == 2
+        # (S, H) -> (H, S)
+        return Luminal.permute(out, [2, 1])
+    end
+    return out
 end
 
 # LayerNorm / RMSNorm
@@ -136,37 +149,16 @@ function RMSNorm(dim::Int, graph::Luminal.Graph; epsilon=1f-5)
 end
 
 function (ln::LayerNorm)(x::Luminal.GraphTensor)
-    # x: (batch, ..., dim)
-    dims = Luminal.realized_dims(x.shape)
-    axis = length(dims)
-    
-    out = x
-    if ln.mean_norm
-        out = Luminal.mean_norm(out, axis)
-    end
-    out = Luminal.std_norm(out, axis, ln.epsilon)
+    # x is (Hidden, Seq..., Batch)
+    # normalize over dimension 1 (Hidden)
+    out = Luminal.layer_norm(x, 1, ln.epsilon)
     
     if ln.weight !== nothing
-        # Expand weight to match input shape except the last dimension.
-        # If x is (B, ..., D), weight is (D). We need to expand weight to (B, ..., D).
-        # This is a bit tricky with my current expand. 
-        # For now, let's just do a simple expansion for common cases.
-        w_dims = Luminal.realized_dims(ln.weight.shape)
-        target_dims = Luminal.realized_dims(out.shape)
-        w_expanded = ln.weight
-        for i in 1:(length(target_dims)-1)
-            w_expanded = Luminal.expand(w_expanded, i, target_dims[i])
-        end
-        out = out * w_expanded
+        out = out * ln.weight
     end
     
     if ln.bias !== nothing
-        b_expanded = ln.bias
-        target_dims = Luminal.realized_dims(out.shape)
-        for i in 1:(length(target_dims)-1)
-            b_expanded = Luminal.expand(b_expanded, i, target_dims[i])
-        end
-        out = out + b_expanded
+        out = out + ln.bias
     end
     
     return out
@@ -250,70 +242,68 @@ function (m::Mlp)(x::Luminal.GraphTensor)
 end
 
 # RoPE (Rotary Positional Embeddings)
-function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq::Int; base=10000.0f0)
-    # input: batch, n_heads, seq, head_dim
+function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=10000.0f0)
+    # input: D, S, H, B
     dims = Luminal.realized_dims(input.shape)
-    batch, n_heads, seq, head_dim = dims[1], dims[2], dims[3], dims[4]
+    head_dim, seq, n_heads, batch = dims[1], dims[2], dims[3], dims[4]
     
     graph = input.graph_ref
     
     # Get freqs
     half_dim = div(head_dim, 2)
     freqs = Luminal.arange(graph, half_dim) * 2.0f0 / Float32(head_dim)
-    inv_freqs = Luminal.reciprocal(Luminal.exp2(freqs * log2(Float32(base))))
+    # inv_freqs = 1.0 / base^(2i/d)
+    # Using exp2(-x) to avoid overflow in intermediate exp2(x) when base=500k
+    inv_freqs = Luminal.exp2(-freqs * log2(Float32(base)))
     
-    pos = Luminal.arange(graph, seq) + Float32(prev_seq)
+    pos_seq = Luminal.arange(graph, seq) # shape (seq)
+    if prev_seq isa Int
+        pos = pos_seq + Float32(prev_seq)
+    else
+        pos = pos_seq + prev_seq
+    end
     
     # emb = pos @ inv_freqs
     # pos: (seq), inv_freqs: (half_dim)
     # emb: (seq, half_dim)
     emb = Luminal.matmul(Luminal.expand(pos, 2, 1), Luminal.expand(inv_freqs, 1, 1))
     
-    # Split input into evens and odds along last dimension
-    # input is (B, H, S, D) -> reshape to (B, H, S, D/2, 2)
-    split = Luminal.reshape(input, [batch, n_heads, seq, half_dim, 2])
-    x0 = Luminal.slice_along(split, 5, 0, 1) # slice last dim, start 0, stop 1
-    x1 = Luminal.slice_along(split, 5, 1, 2) # slice last dim, start 1, stop 2
+    # Align emb to (half_dim, seq) for broadcasting over (half_dim, seq, H, B)
+    emb_t = Luminal.permute(emb, [2, 1])
     
-    # Apply sin/cos
-    # emb is (seq, half_dim), needs to be expanded to (batch, n_heads, seq, half_dim)
-    # or just broadcasted.
-    # In Julia, we'll expand it manually for now to be safe.
-    emb_expanded = Luminal.expand(Luminal.expand(emb, 1, n_heads), 1, batch)
+    # Split input into halves along first dimension (rotate half)
+    x0 = Luminal.slice_along(input, 1, 0, half_dim)
+    x1 = Luminal.slice_along(input, 1, half_dim, head_dim)
+    
+    # Expand emb_t to (half_dim, seq, n_heads, batch)
+    emb_expanded = Luminal.expand(Luminal.expand(emb_t, 3, n_heads), 4, batch)
     
     sin_emb = Luminal.sin(emb_expanded)
     cos_emb = Luminal.cos(emb_expanded)
     
-    # Reshape x0, x1 to (B, H, S, D/2)
-    # slice returned non-contiguous tensors, so we must make them contiguous
-    x0 = Luminal.reshape(Luminal.contiguous(x0), [batch, n_heads, seq, half_dim])
-    x1 = Luminal.reshape(Luminal.contiguous(x1), [batch, n_heads, seq, half_dim])
-    
+    # Standard Llama RoPE: 
+    # out_0 = x0 * cos - x1 * sin
+    # out_1 = x1 * cos + x0 * sin
     x0_out = x0 * cos_emb - x1 * sin_emb
-    x1_out = x0 * sin_emb + x1 * cos_emb
+    x1_out = x1 * cos_emb + x0 * sin_emb
     
-    # Combine back: concat along last dimension
-    # x0_out, x1_out are (B, H, S, D/2)
-    # Result should be (B, H, S, D/2, 2) or (B, H, S, D)
-    # Luminal Rust uses concat_along(4) which is the head_dim/2 dimension.
-    # Wait, in Rust it's (B, H, S, D/2, 2) and they concat along the '2' dimension.
-    
-    res = Luminal.concat_along(Luminal.expand(x0_out, 5, 1), Luminal.expand(x1_out, 5, 1), 5)
-    return Luminal.reshape(res, [batch, n_heads, seq, head_dim])
+    return Luminal.concat_along(x0_out, x1_out, 1)
 end
 
 function repeat_kv(keys::Luminal.GraphTensor, groups::Int)
     if groups == 1
         return keys
     end
-    # keys: (B, KV_H, S, D)
+    # keys: (D, S, KV_H, B)
     dims = Luminal.realized_dims(keys.shape)
-    batch, kv_heads, seq, head_dim = dims[1], dims[2], dims[3], dims[4]
+    head_dim, seq, kv_heads, batch = dims[1], dims[2], dims[3], dims[4]
     
-    # expand to (B, KV_H, groups, S, D)
+    # expand to (D, S, groups, KV_H, B)
+    # This ensures that 'groups' is faster than 'KV_H' (in Julia column-major),
+    # so when we reshape to (D, S, H, B), we get (k0, k0, ..., k1, k1, ...)
     expanded = Luminal.expand(keys, 3, groups)
-    # reshape to (B, KV_H * groups, S, D)
-    return Luminal.reshape(expanded, [batch, kv_heads * groups, seq, head_dim])
+    # reshape to (D, S, KV_H * groups, B)
+    return Luminal.reshape(expanded, [head_dim, seq, kv_heads * groups, batch])
 end
 
 # SelfAttention
@@ -340,24 +330,32 @@ function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Lumina
     )
 end
 
-function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0)
-    # x: (batch, seq, hidden)
-    batch, seq, hidden = Luminal.realized_dims(x.shape)
+function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0, return_kv::Bool=false)
+    # x: (hidden, seq, batch)
+    hidden, seq, batch = Luminal.realized_dims(x.shape)
     
-    queries = Luminal.reshape(sa.q_proj(x), [batch, seq, sa.n_heads, sa.head_dim])
-    queries = Luminal.permute(queries, [1, 3, 2, 4]) # (B, H, S, D)
+    # Project queries, keys, values
+    # Llama weights are packed as (Heads * HeadDim, In). 
+    # In Julia column-major matrix W(Out, In), HeadDim is the faster dimension.
+    # W * x -> (Heads * HeadDim, Seq, Batch)
+    queries = Luminal.reshape(sa.q_proj(x), [sa.head_dim, sa.n_heads, seq, batch])
+    queries = Luminal.permute(queries, [1, 3, 2, 4]) # (D, S, H, B)
     
-    keys = Luminal.reshape(sa.k_proj(x), [batch, seq, sa.n_kv_heads, sa.head_dim])
-    keys = Luminal.permute(keys, [1, 3, 2, 4]) # (B, KV_H, S, D)
+    keys = Luminal.reshape(sa.k_proj(x), [sa.head_dim, sa.n_kv_heads, seq, batch])
+    keys = Luminal.permute(keys, [1, 3, 2, 4]) # (D, S, KV_H, B)
     
-    values = Luminal.reshape(sa.v_proj(x), [batch, seq, sa.n_kv_heads, sa.head_dim])
-    values = Luminal.permute(values, [1, 3, 2, 4]) # (B, KV_H, S, D)
+    values = Luminal.reshape(sa.v_proj(x), [sa.head_dim, sa.n_kv_heads, seq, batch])
+    values = Luminal.permute(values, [1, 3, 2, 4]) # (D, S, KV_H, B)
     
     # RoPE
     queries = apply_rotary_embeddings(queries, prev_seq; base=rope_base)
     keys = apply_rotary_embeddings(keys, prev_seq; base=rope_base)
     
-    # Attention: (Q @ K.T) / sqrt(D)
+    # Save keys/values before repeatability expansion for GQA
+    new_keys = keys
+    new_values = values
+
+    # Attention: (Q^T @ K) / sqrt(D)
     # GQA: Repeat KV heads to match Q heads
     if sa.n_kv_heads < sa.n_heads
         groups = div(sa.n_heads, sa.n_kv_heads)
@@ -365,25 +363,36 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
         values = repeat_kv(values, groups)
     end
     
-    # (B, H, S, D) @ (B, H, D, S) -> (B, H, S, S)
-    weights = Luminal.matmul(queries, Luminal.permute(keys, [1, 2, 4, 3])) * (1.0f0 / sqrt(Float32(sa.head_dim)))
+    # (S, D, H, B) @ (D, S, H, B) -> (S, S, H, B)
+    # Use permute to make (S, D) the leading dims for matmul
+    q_t = Luminal.permute(queries, [2, 1, 3, 4])
+    weights = Luminal.matmul(q_t, keys) * (1.0f0 / sqrt(Float32(sa.head_dim)))
     
     # Mask
     if seq > 1
-        mask = Luminal.triu(x.graph_ref, seq, 1) * -1f9
-        # Expand mask to (B, H, S, S)
-        mask_expanded = Luminal.expand(Luminal.expand(mask, 1, sa.n_heads), 1, batch)
+        mask = Luminal.triu(x.graph_ref, seq, 1) * -9f9
+        # Expand mask (S, S) to (S, S, H, B)
+        mask_expanded = Luminal.expand(Luminal.expand(mask, 3, sa.n_heads), 4, batch)
         weights = weights + mask_expanded
     end
     
-    probs = Luminal.softmax(weights, 4)
+    probs = Luminal.softmax(weights, 2) # Softmax over dimension 2 (columns S_k)
     
-    # (B, H, S, S) @ (B, H, S, D) -> (B, H, S, D)
-    out = Luminal.matmul(probs, values)
-    out = Luminal.permute(out, [1, 3, 2, 4]) # (B, S, H, D)
-    out = Luminal.reshape(out, [batch, seq, hidden])
+    # (S, S, H, B) @ (S, D, H, B) -> (S, D, H, B) 
+    # Wait, (S, S) * (S, D) -> (S, D). Correct!
+    v_t = Luminal.permute(values, [2, 1, 3, 4])
+    out = Luminal.matmul(probs, v_t)
     
-    return sa.o_proj(out)
+    # (S, D, H, B) -> (D, H, S, B) -> (Hidden, S, Batch)
+    out = Luminal.permute(out, [2, 3, 1, 4])
+    out = Luminal.reshape(out, [hidden, seq, batch])
+    
+    out = sa.o_proj(out)
+    
+    if return_kv
+        return out, new_keys, new_values
+    end
+    return out
 end
 
 # Transformer Block
@@ -403,14 +412,21 @@ function TransformerBlock(hidden::Int, n_heads::Int, n_kv_heads::Int, intermedia
     )
 end
 
-function (tb::TransformerBlock)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0)
+function (tb::TransformerBlock)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0, return_kv::Bool=false)
     normed_x = tb.attention_norm(x)
-    attn_out = tb.attention(normed_x, prev_seq; rope_base=rope_base)
-    x = x + attn_out
+    if return_kv
+        attn_out, k, v = tb.attention(normed_x, prev_seq; rope_base=rope_base, return_kv=true)
+        x = x + attn_out
+    else
+        attn_out = tb.attention(normed_x, prev_seq; rope_base=rope_base)
+        x = x + attn_out
+        k, v = nothing, nothing
+    end
     
     normed_x = tb.feed_forward_norm(x)
     ff_out = tb.feed_forward(normed_x)
-    return x + ff_out
+    out = x + ff_out
+    return return_kv ? (out, k, v) : out
 end
 
 # Top-level Llama Model
@@ -419,6 +435,7 @@ struct Llama
     layers::Vector{TransformerBlock}
     norm::LayerNorm
     head::Linear
+    rope_base::Float32
 end
 
 function Llama(graph::Luminal.Graph, reg=nothing; 
@@ -427,7 +444,8 @@ function Llama(graph::Luminal.Graph, reg=nothing;
                n_layers=32, 
                n_heads=32, 
                n_kv_heads=8, 
-               intermediate=14336)
+               intermediate=14336,
+               rope_base=500000.0f0)
     
     pfx = "model"
     layers = [TransformerBlock(hidden, n_heads, n_kv_heads, intermediate, graph, reg, "$(pfx).layers.$(i-1)") for i in 1:n_layers]
@@ -441,17 +459,25 @@ function Llama(graph::Luminal.Graph, reg=nothing;
         Embedding(emb_weight),
         layers,
         _rmsnorm(hidden, graph, reg, "$(pfx).norm"),
-        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
+        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false),
+        rope_base
     )
 end
 
-function (l::Llama)(input::Luminal.GraphTensor, prev_seq::Int)
+function (l::Llama)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false)
     x = l.embedding(input)
+    kvs = Tuple{Luminal.GraphTensor, Luminal.GraphTensor}[]
     for layer in l.layers
-        x = layer(x, prev_seq; rope_base=500000.0f0)
+        if return_kv
+            x, k, v = layer(x, prev_seq; rope_base=l.rope_base, return_kv=true)
+            push!(kvs, (k, v))
+        else
+            x = layer(x, prev_seq; rope_base=l.rope_base)
+        end
     end
     x = l.norm(x)
-    return l.head(x)
+    logits = l.head(x)
+    return return_kv ? (logits, kvs) : logits
 end
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -463,6 +489,7 @@ struct Phi3
     layers::Vector{TransformerBlock}
     norm::LayerNorm
     head::Linear
+    rope_base::Float32
 end
 
 """
@@ -476,7 +503,8 @@ function Phi3(graph::Luminal.Graph, reg=nothing;
                n_layers=32, 
                n_heads=32, 
                n_kv_heads=8, 
-               intermediate=8192)
+               intermediate=8192,
+               rope_base=10000.0f0)
     
     pfx = "model"
     # Phi-3 uses similar layer naming to Llama but sometimes with slight variations.
@@ -492,19 +520,27 @@ function Phi3(graph::Luminal.Graph, reg=nothing;
         Embedding(emb_weight),
         layers,
         _rmsnorm(hidden, graph, reg, "$(pfx).norm"),
-        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
+        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false),
+        rope_base
     )
 end
 
-function (l::Phi3)(input::Luminal.GraphTensor, prev_seq::Int)
-    x = l.embedding(input)
-    for layer in l.layers
-        # Phi-3 mini uses RoPE base 10000.0
-        x = layer(x, prev_seq; rope_base=10000.0f0)
+function (p::Phi3)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false)
+    x = p.embedding(input)
+    kvs = Tuple{Luminal.GraphTensor, Luminal.GraphTensor}[]
+    for layer in p.layers
+        if return_kv
+            x, k, v = layer(x, prev_seq; rope_base=p.rope_base, return_kv=true)
+            push!(kvs, (k, v))
+        else
+            x = layer(x, prev_seq; rope_base=p.rope_base)
+        end
     end
-    x = l.norm(x)
-    return l.head(x)
+    x = p.norm(x)
+    logits = p.head(x)
+    return return_kv ? (logits, kvs) : logits
 end
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Llama KV-Cache Infrastructure
@@ -534,8 +570,8 @@ end
 """
 function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
                             batch::Int=1, max_seq::Int=2048)
-    self = [(zeros(Float16, batch, n_kv_heads, max_seq, head_dim),
-             zeros(Float16, batch, n_kv_heads, max_seq, head_dim))
+    self = [(zeros(Float16, head_dim, max_seq, n_kv_heads, batch),
+             zeros(Float16, head_dim, max_seq, n_kv_heads, batch))
             for _ in 1:n_layers]
     return LlamaKVCacheState(0, max_seq, self)
 end
@@ -552,51 +588,42 @@ Returns `(output, new_k, new_v)`.
 """
 function llama_self_attn_cached(sa::SelfAttention,
                                  x::Luminal.GraphTensor,
-                                 step_pos::Int,
+                                 step_pos::Luminal.DimType,
+                                 step_pos_tensor::Luminal.GraphTensor,
                                  past_k::Luminal.GraphTensor,
                                  past_v::Luminal.GraphTensor;
                                  rope_base::Float32=500000f0)
-    batch, _, hidden = Luminal.realized_dims(x.shape)
+    hidden, _, batch = Luminal.realized_dims(x.shape)
 
-    # Project current token: (batch, 1, hidden) → (batch, H/KV_H, 1, head_dim)
-    q_raw = Luminal.reshape(sa.q_proj(x), [batch, 1, sa.n_heads, sa.head_dim])
-    q     = Luminal.permute(q_raw, [1, 3, 2, 4])   # (B, H, 1, D)
+    # Project current token: (Hidden, 1, B) -> (D, H, 1, B)
+    q_raw = Luminal.reshape(sa.q_proj(x), [sa.head_dim, sa.n_heads, 1, batch])
+    q     = Luminal.permute(q_raw, [1, 3, 2, 4])   # (D, 1, H, B)
 
-    k_raw = Luminal.reshape(sa.k_proj(x), [batch, 1, sa.n_kv_heads, sa.head_dim])
-    k_new = Luminal.contiguous(Luminal.permute(k_raw, [1, 3, 2, 4]))  # (B, KV_H, 1, D)
+    k_raw = Luminal.reshape(sa.k_proj(x), [sa.head_dim, sa.n_kv_heads, 1, batch])
+    k_new = Luminal.permute(k_raw, [1, 3, 2, 4])  # (D, 1, KV_H, B)
 
-    v_raw = Luminal.reshape(sa.v_proj(x), [batch, 1, sa.n_kv_heads, sa.head_dim])
-    v_new = Luminal.permute(v_raw, [1, 3, 2, 4])   # (B, KV_H, 1, D)
+    v_raw = Luminal.reshape(sa.v_proj(x), [sa.head_dim, sa.n_kv_heads, 1, batch])
+    v_new = Luminal.permute(v_raw, [1, 3, 2, 4])   # (D, 1, KV_H, B)
 
-    # Apply RoPE to q and k_new at position step_pos
-    q     = apply_rotary_embeddings(q,     step_pos; base=rope_base)
-    k_new = apply_rotary_embeddings(k_new, step_pos; base=rope_base)
+    # Apply RoPE
+    q     = apply_rotary_embeddings(q,     step_pos_tensor; base=rope_base)
+    k_new = apply_rotary_embeddings(k_new, step_pos_tensor; base=rope_base)
 
-    # Scatter new k/v into the cache (same helper as Whisper KV scatter)
-    max_seq = Luminal.realized_dims(past_k.shape)[3]
-    suffix_len = max_seq - step_pos - 1
+    max_seq = Luminal.realized_dims(past_k.shape)[2]
 
     function _kv_scatter_llama(past, slot)
-        if step_pos == 0
-            return Luminal.concat_along(slot,
-                       Luminal.slice_along(past, 3, 1, max_seq), 3)
-        elseif suffix_len == 0
-            return Luminal.concat_along(
-                       Luminal.slice_along(past, 3, 0, step_pos), slot, 3)
-        else
-            return Luminal.concat_along(
-                       Luminal.concat_along(
-                           Luminal.slice_along(past, 3, 0, step_pos), slot, 3),
-                       Luminal.slice_along(past, 3, step_pos + 1, max_seq), 3)
-        end
+        return Luminal.concat_along(
+                   Luminal.concat_along(
+                       Luminal.slice_along(past, 2, 0, step_pos), slot, 2),
+                   Luminal.slice_along(past, 2, step_pos + 1, max_seq), 2)
     end
 
     new_k = _kv_scatter_llama(past_k, k_new)
     new_v = _kv_scatter_llama(past_v, v_new)
 
     # Attend over [0 : step_pos + 1]
-    k_ctx   = Luminal.slice_along(new_k, 3, 0, step_pos + 1)   # (B, KV_H, ctx, D)
-    v_ctx   = Luminal.slice_along(new_v, 3, 0, step_pos + 1)   # (B, KV_H, ctx, D)
+    k_ctx   = Luminal.slice_along(new_k, 2, 0, step_pos + 1)   # (D, ctx, KV_H, B)
+    v_ctx   = Luminal.slice_along(new_v, 2, 0, step_pos + 1)   # (D, ctx, KV_H, B)
 
     # GQA: repeat KV heads to match Q heads
     if sa.n_kv_heads < sa.n_heads
@@ -605,11 +632,17 @@ function llama_self_attn_cached(sa::SelfAttention,
         v_ctx = repeat_kv(v_ctx, groups)
     end
 
-    k_ctx_t = Luminal.contiguous(Luminal.permute(k_ctx, [1, 2, 4, 3]))   # (B, H, D, ctx)
-    weights  = Luminal.matmul(q, k_ctx_t) * (1.0f0 / sqrt(Float32(sa.head_dim)))
-    probs    = Luminal.softmax(weights, 4)
-    out      = Luminal.matmul(probs, v_ctx)   # (B, H, 1, D)
-    out      = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [batch, 1, hidden])
+    # weights: (1, D, H, B) * (D, ctx, H, B) -> (1, ctx, H, B)
+    q_t = Luminal.permute(q, [2, 1, 3, 4]) # (1, D, H, B)
+    weights  = Luminal.matmul(q_t, k_ctx) * (1.0f0 / sqrt(Float32(sa.head_dim)))
+    probs    = Luminal.softmax(weights, 2) # Softmax over ctx
+    
+    # out: (1, ctx, H, B) * (ctx, D, H, B) -> (1, D, H, B)
+    v_ctx_t = Luminal.permute(v_ctx, [2, 1, 3, 4])
+    out      = Luminal.matmul(probs, v_ctx_t)   # (1, D, H, B)
+    
+    # Back to (Hidden, 1, Batch)
+    out      = Luminal.reshape(Luminal.permute(out, [2, 3, 1, 4]), [hidden, 1, batch])
 
     return sa.o_proj(out), new_k, new_v
 end
@@ -622,12 +655,13 @@ Node IDs for driving one step of the incremental Llama decode graph.
 """
 struct LlamaDecodeGraph
     token_input_id::Int
+    pos_input_id::Int
     self_k_ids::Vector{Int}
     self_v_ids::Vector{Int}
     logits_id::Int
     new_self_k_ids::Vector{Int}
     new_self_v_ids::Vector{Int}
-    step_pos::Int
+    step_pos::Luminal.DimType
 end
 
 
@@ -642,7 +676,7 @@ Returns a `LlamaDecodeGraph`.
 """
 function build_llama_decode_step!(model,
                                    graph::Luminal.Graph,
-                                   step_pos::Int;
+                                   step_pos::Luminal.DimType;
                                    max_seq::Int=2048,
                                    batch::Int=1,
                                    rope_base::Float32=500000f0)
@@ -652,11 +686,12 @@ function build_llama_decode_step!(model,
     head_dim   = first_attn.head_dim
 
     # ── Inputs ────────────────────────────────────────────────────────────────
-    token_in = Luminal.tensor(graph, [batch, 1])
+    token_in = Luminal.tensor(graph, [1, batch])
+    pos_tensor = Luminal.tensor(graph, [1])
 
-    self_k_tensors = [Luminal.tensor(graph, [batch, n_kv_heads, max_seq, head_dim])
+    self_k_tensors = [Luminal.tensor(graph, [head_dim, max_seq, n_kv_heads, batch])
                       for _ in 1:n_layers]
-    self_v_tensors = [Luminal.tensor(graph, [batch, n_kv_heads, max_seq, head_dim])
+    self_v_tensors = [Luminal.tensor(graph, [head_dim, max_seq, n_kv_heads, batch])
                       for _ in 1:n_layers]
 
     # ── Embedding ─────────────────────────────────────────────────────────────
@@ -669,7 +704,7 @@ function build_llama_decode_step!(model,
     for (i, layer) in enumerate(model.layers)
         normed = layer.attention_norm(x)
         attn_out, nk, nv = llama_self_attn_cached(
-            layer.attention, normed, step_pos,
+            layer.attention, normed, step_pos, pos_tensor,
             self_k_tensors[i], self_v_tensors[i];
             rope_base=rope_base)
         x = x + attn_out
@@ -681,11 +716,12 @@ function build_llama_decode_step!(model,
     end
 
     # ── Head ─────────────────────────────────────────────────────────────────
-    out    = model.norm(x)   # (batch, 1, hidden)
-    logits = model.head(out) # (batch, 1, vocab)
+    out    = model.norm(x)   # (Hidden, 1, Batch)
+    logits = model.head(out) # (Vocab, 1, Batch)
 
     return LlamaDecodeGraph(
         token_in.id,
+        pos_tensor.id,
         [t.id for t in self_k_tensors],
         [t.id for t in self_v_tensors],
         logits.id,
@@ -710,16 +746,18 @@ function llama_decode_step!(exec_fn,
                              idg::LlamaDecodeGraph,
                              cache::LlamaKVCacheState,
                              token_id::Int;
+                             sym_vals::Dict{Symbol, Int}=Dict{Symbol, Int}(),
                              device=Luminal.get_device())
     inputs = Dict{Int, Any}()
     inputs[idg.token_input_id] = Float32[token_id;;]  # (1,1)
+    inputs[idg.pos_input_id] = Float32[cache.step_pos] # (1,)
 
     for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
         inputs[k_id] = Luminal.to_device(Dict(k_id => cache.self_cache[i][1]), device)[k_id]
         inputs[v_id] = Luminal.to_device(Dict(v_id => cache.self_cache[i][2]), device)[v_id]
     end
 
-    results = exec_fn(inputs, device)
+    results = exec_fn(inputs; sym_vals=sym_vals, device=device)
     logits  = results[idg.logits_id]
 
     # Update cache

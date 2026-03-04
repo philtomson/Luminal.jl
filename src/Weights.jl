@@ -206,12 +206,12 @@ function load_weights_to_dict(path::String;
                     permuted = Array(permutedims(permuted, length(shape):-1:1))
                 end
                 
-                # Convert to Float16 if on GPU to save memory
-                if device isa Luminal.CUDADevice || device isa Luminal.AMDDevice
-                    permuted = convert(Array{Float16}, permuted)
-                else
+                # Use Float32 even on GPU (diagnostics)
+                # if device isa Luminal.CUDADevice || device isa Luminal.AMDDevice
+                #     permuted = convert(Array{Float16}, permuted)
+                # else
                     permuted = convert(Array{Float32}, permuted)
-                end
+                # end
 
                 tensors[key] = Luminal.to_device(permuted, device)
             end
