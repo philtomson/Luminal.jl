@@ -9,6 +9,8 @@ using Luminal.SymbolicIntegration # For luminal_to_symbolic and luminal_relu
 # Import execution functions for compiled thunk
 using Luminal: execute_op, execute_op!, realize_view, to_device, realized_dims, eval_dim, execute_with_capture
 using CUDA
+using AMDGPU
+using GPUArrays
 using KernelAbstractions
 using RuntimeGeneratedFunctions
 RuntimeGeneratedFunctions.init(@__MODULE__)
@@ -230,9 +232,9 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     compile_device = device 
     fusible_intermediates = Set{Int}()
     
-    # Disable dynamic fusion generation on CUDA backend since Julia 1.12 World Age
+    # Disable dynamic fusion generation on GPU backends since Julia 1.12 World Age
     # actively blocks runtime JIT caching of dynamically created AST kernels inside modules.
-    if !(compile_device isa Luminal.CUDADevice)
+    if !(compile_device isa Luminal.AbstractGPUDevice)
         for (node_id, node) in enumerate(graph.nodes)
             if is_elementwise(node.op) && consumer_count[node_id] == 1
                  # Find consumer
@@ -289,11 +291,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             continue
         end
 
-        if !is_elementwise(op) || (compile_device isa Luminal.CUDADevice && !(node_id in fusible_intermediates))
+        if !is_elementwise(op) || (compile_device isa Luminal.AbstractGPUDevice && !(node_id in fusible_intermediates))
             input_specs = node.inputs
             node_shape = graph.shapes[node_id]
             is_persistent = haskey(graph.tensors, (node_id, 1))
-            dtype = (compile_device isa Luminal.CUDADevice || compile_device isa Luminal.AMDDevice) ? Float32 : Float32
+            dtype = (compile_device isa Luminal.AbstractGPUDevice) ? Float32 : Float32
 
             push!(steps, (res, dev, sym_vals, live) -> begin
                 # 1. Allocate if needed
@@ -301,11 +303,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
                     sz = Tuple(dims_int)
                     if !isassigned(res, node_id) || res[node_id] === nothing || size(res[node_id]) != sz
-                        if dev isa Luminal.CUDADevice
-                            res[node_id] = CUDA.fill(dtype(0), dims_int...) 
-                        else
-                            res[node_id] = zeros(dtype, dims_int...)
-                        end
+                        res[node_id] = Luminal.zero_tensor(dev, dtype, dims_int...)
                     end
                 end
 

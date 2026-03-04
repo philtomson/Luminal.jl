@@ -8,7 +8,7 @@ module Decoding
 using ..Luminal
 using ..Luminal.NN
 using ..Luminal.LlamaTokenization
-using CUDA
+using AMDGPU
 
 export greedy_decode, llama_generate
 
@@ -102,13 +102,12 @@ function llama_generate(model,
     pfx_graph = nothing
     prefill_logits = nothing
     GC.gc()
-    if target_device isa Luminal.CUDADevice
-        CUDA.reclaim()
-    end
+    Luminal.reclaim!(target_device)
 
     # 4. KV-cached decode loop
-    if target_device isa Luminal.CUDADevice
-        @info "VRAM before decode loop" available_mb=(CUDA.available_memory()/1024/1024)
+    avail = Luminal.available_memory(target_device)
+    if avail >= 0
+        @info "VRAM before decode loop" available_mb=avail
     end
     
     first_attn = model.layers[1].attention

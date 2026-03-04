@@ -22,7 +22,7 @@ function main()
     n_heads = 32
     n_kv_heads = 4
     intermediate = 5632
-    rope_base = 10000.0f0 # Matches config.json
+    rope_base = 500000.0f0 # Testing 500k instead of 10k
     
     graph = Graph()
     reg = WeightRegistry()

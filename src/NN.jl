@@ -151,7 +151,8 @@ end
 function (ln::LayerNorm)(x::Luminal.GraphTensor)
     # x is (Hidden, Seq..., Batch)
     # normalize over dimension 1 (Hidden)
-    out = Luminal.layer_norm(x, 1, ln.epsilon)
+    # Use layer_norm (with mean subtraction) or std_norm (RMS) based on flag
+    out = ln.mean_norm ? Luminal.layer_norm(x, 1, ln.epsilon) : Luminal.std_norm(x, 1, ln.epsilon)
     
     if ln.weight !== nothing
         out = out * ln.weight

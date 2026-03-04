@@ -3,7 +3,10 @@
 
 
 using CUDA
+using AMDGPU
 using LinearAlgebra
+using GPUArrays
+using KernelAbstractions
 
 
 export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp
@@ -398,30 +401,34 @@ function execute_op!(out, op::Expand, a)
     return out
 end
 
-# CUDA Kernel for Flash Attention Forward
-function flash_attn_fwd_kernel(O, Q, K, V, B, H, N, d, scale, causal)
-    i = blockIdx().x # sequence index (1 to N)
-    bh = blockIdx().y # batch*head index (1 to B*H)
-    # Correcting for 1-based indexing in Julia
+# Backend-agnostic Flash Attention Forward
+@kernel function flash_attn_fwd_kernel(O, Q, K, V, B, H, N, d, scale, causal)
+    # sequence index (1 to N) and batch*head index (1 to B*H)
+    group = @index(Group, Cartesian)
+    i = group[1]
+    bh = group[2]
+    
     b = (bh - 1) ÷ H + 1
     h = (bh - 1) % H + 1
-    tid = threadIdx().x
+    tid = @index(Local, Linear)
     
     # Shared memory for row accumulation
-    s_Q = CUDA.@cuDynamicSharedMem(Float32, d)
-    s_O = CUDA.@cuDynamicSharedMem(Float32, d, d * sizeof(Float32))
-    s_acc = CUDA.@cuDynamicSharedMem(Float32, blockDim().x, 2 * d * sizeof(Float32))
+    # Note: Using a fixed size for d (head_dim) and acc (reduction) to ensure compatibility.
+    # Typical head dims: 64, 128. acc max threads: 256.
+    s_Q = @localmem Float32 (128,)
+    s_O = @localmem Float32 (128,)
+    s_acc = @localmem Float32 (256,)
 
     # Load Q row
     if tid <= d
-        s_Q[tid] = Q[b, h, i, tid]
+        s_Q[tid] = Q[tid, i, h, b]
         s_O[tid] = 0.0f0
     end
     
     m_i = -1f32 / 0f32
     l_i = 0.0f0
     
-    sync_threads()
+    @synchronize
     
     for j in 1:N
         if causal && j > i continue end
@@ -429,23 +436,24 @@ function flash_attn_fwd_kernel(O, Q, K, V, B, H, N, d, scale, causal)
         # 1. Compute S_ij = sum(Q[i, :] * K[j, :]) * scale
         val = 0.0f0
         if tid <= d
-            val = s_Q[tid] * K[b, h, j, tid]
+            val = s_Q[tid] * K[tid, j, h, b]
         end
         s_acc[tid] = val
-        sync_threads()
+        @synchronize
         
         # Parallel reduction for dot product
-        # Using a simple block reduction
         s = 1
-        while s < blockDim().x
+        # Use groupsize directly if available
+        gs = @groupsize()[1]
+        while s < gs
             s *= 2
         end
         s ÷= 2
         while s >= 1
-            if tid <= s && tid + s <= blockDim().x
+            if tid <= s && tid + s <= gs
                 s_acc[tid] += s_acc[tid + s]
             end
-            sync_threads()
+            @synchronize
             s ÷= 2
         end
         dot = s_acc[1] * scale
@@ -455,26 +463,24 @@ function flash_attn_fwd_kernel(O, Q, K, V, B, H, N, d, scale, causal)
         m_next = max(m_i, m_curr)
         p = exp(m_curr - m_next)
         scale_old = exp(m_i - m_next)
-        # Avoid NaN if m_i and m_curr are both -Inf (masked)
         if isnan(scale_old) scale_old = 0.0f0 end
         
         l_next = l_i * scale_old + p
         
         # 3. Update Output row (unnormalized)
         if tid <= d
-            s_O[tid] = s_O[tid] * scale_old + p * V[b, h, j, tid]
+            s_O[tid] = s_O[tid] * scale_old + p * V[tid, j, h, b]
         end
         
         m_i = m_next
         l_i = l_next
-        sync_threads()
+        @synchronize
     end
     
     # Final normalization and write back
     if tid <= d
-        O[b, h, i, tid] = s_O[tid] / l_i
+        O[tid, i, h, b] = s_O[tid] / l_i
     end
-    return
 end
 
 # CPU Fallback for Flash Attention
@@ -519,16 +525,13 @@ function unfold_1d_cpu!(out_2d, a_2d, O, K, S, D)
     return
 end
 
-function unfold_1d_cuda_kernel!(out_2d, a_2d, O, K, S, D)
-    bc = blockIdx().x
-    o = blockIdx().y
-    k = threadIdx().x
+@kernel function unfold_1d_kernel(out_2d, a_2d, O, K, S, D)
+    k, o, bc = @index(Global, NTuple)
     
     if k <= K && o <= O && bc <= size(a_2d, 1)
         a_idx = (o - 1) * S + (k - 1) * D + 1
-        out_2d[bc, o, k] = a_2d[bc, a_idx]
+        @inbounds out_2d[bc, o, k] = a_2d[bc, a_idx]
     end
-    return
 end
 
 function execute_op!(out, op::Unfold, a)
@@ -546,10 +549,11 @@ function execute_op!(out, op::Unfold, a)
         out_2d = Base.reshape(out, BC, O, K)
         a_2d = Base.reshape(a, BC, L)
         
-        if a isa CuArray
-            threads = min(K, 1024)
-            blocks = (BC, O)
-            @cuda threads=threads blocks=blocks unfold_1d_cuda_kernel!(out_2d, a_2d, O, K, S, D)
+        if a isa AnyGPUArray
+            backend = KernelAbstractions.get_backend(a)
+            kernel! = unfold_1d_kernel(backend)
+            kernel!(out_2d, a_2d, O, K, S, D, ndrange=(K, O, BC))
+            KernelAbstractions.synchronize(backend)
         else
             unfold_1d_cpu!(out_2d, a_2d, O, K, S, D)
         end
@@ -591,22 +595,27 @@ function execute_op!(out, op::FusedElementwiseOp, inputs...)
 end
 
 function execute_op!(out, op::FlashAttentionOp, q, k, v)
-    if q isa CuArray
-        B, H, N, d = size(q)
-        # We need to ensure out has same shape
+    if q isa AnyGPUArray
+        d, N, H, B = size(q)
+        backend = KernelAbstractions.get_backend(q)
         # Grid: (N, B*H)
         # Block: (max(d, 32),)
         threads = max(32, 1 << (31 - leading_zeros(d - 1) + 1)) # Next power of 2
-        shmem = (2 * d + threads) * sizeof(Float32)
-        @cuda threads=threads blocks=(N, B*H) shmem=shmem flash_attn_fwd_kernel(out, q, k, v, B, H, N, d, op.scale, op.causal)
+        # Ensure we don't exceed max threads
+        threads = min(threads, 256)
+        
+        kernel! = flash_attn_fwd_kernel(backend)
+        kernel!(out, q, k, v, B, H, N, d, op.scale, op.causal, 
+                ndrange=(N * threads, B*H), workgroupsize=(threads, 1))
+        KernelAbstractions.synchronize(backend)
     else
         copyto!(out, flash_attn_cpu(q, k, v, op.scale, op.causal))
     end
     return out
 end
 
-function _gather_kernel!(out, x, indices)
-    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+@kernel function _gather_kernel(out, x, indices)
+    i = @index(Global)
     if i <= length(out)
         S = length(indices)
         row = (i - 1) % S + 1
@@ -619,7 +628,6 @@ function _gather_kernel!(out, x, indices)
             @inbounds out[i] = 0.0f0
         end
     end
-    return nothing
 end
 
 function execute_op!(out, op::Function, inputs...)
@@ -629,10 +637,11 @@ function execute_op!(out, op::Function, inputs...)
         error("ARange requires context")
     elseif op.name == "Gather"
         # inputs[1][indices, :] -> out
-        if typeof(out) <: CUDA.CuArray
-            threads = 256
-            blocks = ceil(Int, length(out) / threads)
-            CUDA.@cuda(threads=threads, blocks=blocks, _gather_kernel!(out, inputs[1], inputs[2]))
+        if typeof(out) <: AnyGPUArray
+            backend = KernelAbstractions.get_backend(out)
+            kernel! = _gather_kernel(backend)
+            kernel!(out, inputs[1], inputs[2], ndrange=length(out))
+            KernelAbstractions.synchronize(backend)
         else
             indices = Int.(inputs[2]) .+ 1
             copyto!(out, inputs[1][indices, :])
