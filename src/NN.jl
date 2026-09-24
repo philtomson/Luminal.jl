@@ -581,14 +581,19 @@ end
 
 
 """
-    llama_self_attn_cached(sa, x, step_pos, past_k, past_v; rope_base=500000f0)
+    llama_self_attn_cached(sa, x, step_pos, step_pos_tensor, past_k, past_v; rope_base=500000f0)
 
 Single-token cached self-attention for Llama decoder-only models.
-- `x` : (batch, 1, hidden)
-- `step_pos` : current 0-indexed decode position
-- `past_k`, `past_v` : (batch, n_kv_heads, max_seq, head_dim)
+- `x` : (hidden, 1, batch)
+- `step_pos_tensor` : (1,) current 0-indexed decode position, as data
+- `past_k`, `past_v` : (head_dim, max_seq, n_kv_heads, batch); slots `>= pos` are ignored
 Returns `(output, k_new, v_new)`, where `k_new`/`v_new` are this token's
 (D, 1, KV_H, B) K/V slot, to be written into the cache at `step_pos`.
+
+All shapes are static (independent of the position), so the step can be
+captured once and replayed. The cache is scored in place under a mask
+instead of being sliced, and grouped-query attention is computed per KV head
+without materializing repeated K/V.
 """
 function llama_self_attn_cached(sa::SelfAttention,
                                  x::Luminal.GraphTensor,
@@ -598,45 +603,37 @@ function llama_self_attn_cached(sa::SelfAttention,
                                  past_v::Luminal.GraphTensor;
                                  rope_base::Float32=500000f0)
     hidden, _, batch = Luminal.realized_dims(x.shape)
+    D, KVH = sa.head_dim, sa.n_kv_heads
+    G = div(sa.n_heads, KVH)              # query heads per KV head
+    max_seq = Luminal.realized_dims(past_k.shape)[2]
 
-    # Project current token: (Hidden, 1, B) -> (D, H, 1, B)
-    q_raw = Luminal.reshape(sa.q_proj(x), [sa.head_dim, sa.n_heads, 1, batch])
-    q     = Luminal.permute(q_raw, [1, 3, 2, 4])   # (D, 1, H, B)
-
-    k_raw = Luminal.reshape(sa.k_proj(x), [sa.head_dim, sa.n_kv_heads, 1, batch])
-    k_new = Luminal.permute(k_raw, [1, 3, 2, 4])  # (D, 1, KV_H, B)
-
-    v_raw = Luminal.reshape(sa.v_proj(x), [sa.head_dim, sa.n_kv_heads, 1, batch])
-    v_new = Luminal.permute(v_raw, [1, 3, 2, 4])   # (D, 1, KV_H, B)
-
-    # Apply RoPE
+    # Project current token: (Hidden, 1, B) -> (D, 1, H, B), then RoPE
+    q     = Luminal.permute(Luminal.reshape(sa.q_proj(x), [D, sa.n_heads, 1, batch]), [1, 3, 2, 4])
+    k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
+    v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
     q     = apply_rotary_embeddings(q,     step_pos_tensor; base=rope_base)
     k_new = apply_rotary_embeddings(k_new, step_pos_tensor; base=rope_base)
 
-    # Attend over [0 : step_pos + 1]: the cached prefix plus the current token.
-    # The cache itself is not rebuilt here; the caller writes k_new/v_new into
-    # slot step_pos of the device-resident cache after the step.
-    k_ctx = Luminal.concat_along(Luminal.slice_along(past_k, 2, 0, step_pos), k_new, 2)  # (D, ctx, KV_H, B)
-    v_ctx = Luminal.concat_along(Luminal.slice_along(past_v, 2, 0, step_pos), v_new, 2)  # (D, ctx, KV_H, B)
+    # Group query heads by KV head: head h = g + G*kv, the order repeat_kv uses.
+    # (D, 1, H, B) -> (D, G, KVH, B) -> q_t (G, D, KVH, B)
+    q_t = Luminal.permute(Luminal.reshape(q, [D, G, KVH, batch]), [2, 1, 3, 4])
+    scale = 1.0f0 / sqrt(Float32(D))
 
-    # GQA: repeat KV heads to match Q heads
-    if sa.n_kv_heads < sa.n_heads
-        groups = div(sa.n_heads, sa.n_kv_heads)
-        k_ctx = repeat_kv(k_ctx, groups)
-        v_ctx = repeat_kv(v_ctx, groups)
-    end
+    # Scores against the cache (G, max_seq, KVH, B), masking slots >= pos, and
+    # against the current token (G, 1, KVH, B); only these small score tensors
+    # are concatenated, never K/V.
+    valid = Luminal.arange(x.graph_ref, max_seq) < step_pos_tensor        # 1 where j < pos
+    mask  = Luminal.reshape((valid - 1.0f0) * 1f9, [1, max_seq])         # 0 or -1e9
+    s_past = Luminal.matmul(q_t, past_k) * scale + mask
+    s_new  = Luminal.matmul(q_t, k_new) * scale
+    probs  = Luminal.softmax(Luminal.concat_along(s_past, s_new, 2), 2)  # (G, max_seq+1, KVH, B)
+    p_past = Luminal.slice_along(probs, 2, 0, max_seq)
+    p_new  = Luminal.slice_along(probs, 2, max_seq, max_seq + 1)
 
-    # weights: (1, D, H, B) * (D, ctx, H, B) -> (1, ctx, H, B)
-    q_t = Luminal.permute(q, [2, 1, 3, 4]) # (1, D, H, B)
-    weights  = Luminal.matmul(q_t, k_ctx) * (1.0f0 / sqrt(Float32(sa.head_dim)))
-    probs    = Luminal.softmax(weights, 2) # Softmax over ctx
-    
-    # out: (1, ctx, H, B) * (ctx, D, H, B) -> (1, D, H, B)
-    v_ctx_t = Luminal.permute(v_ctx, [2, 1, 3, 4])
-    out      = Luminal.matmul(probs, v_ctx_t)   # (1, D, H, B)
-    
-    # Back to (Hidden, 1, Batch)
-    out      = Luminal.reshape(Luminal.permute(out, [2, 3, 1, 4]), [hidden, 1, batch])
+    # out^T = V * p^T lands directly in (D, G, KVH, B) = (D, H) head order
+    out = Luminal.matmul(past_v, Luminal.permute(p_past, [2, 1, 3, 4])) +
+          Luminal.matmul(v_new,  Luminal.permute(p_new,  [2, 1, 3, 4]))
+    out = Luminal.reshape(out, [hidden, 1, batch])
 
     return sa.o_proj(out), k_new, v_new
 end

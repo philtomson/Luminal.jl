@@ -105,6 +105,12 @@ function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Sy
         end
     end
     
+    if get(cg.cache, :capture, false)
+        # Everything a captured replay bakes in: symbolic dims and input buffers
+        # (sym_vals only matter if some shape depends on them)
+        cg.cache[:key] = (cg.cache[:dynamic] ? copy(sym_vals) : nothing,
+                          sort!([(k, objectid(cg.results[k])) for k in keys(inputs)]))
+    end
     execute_with_capture(device, run_graph, cg.cache)
     return cg.results
 end
@@ -296,7 +302,7 @@ end
 
 """
     compile(graph; device=get_device(), retain=Int[], free_intermediates=true, fuse=true,
-            weight_dtype=Float32)
+            weight_dtype=Float32, capture=false)
 
 Build an executable `CompiledGraph`. With `free_intermediates=true` each
 intermediate buffer is released as soon as its last consumer has run (lowest
@@ -307,10 +313,15 @@ Retained outputs are overwritten by the next run in either mode.
 `fuse=true` merges chains of elementwise ops into single kernels.
 `weight_dtype=Float16` stores GPU weights that are only ever used as the left
 operand of matmuls in Float16 (see `HalfWeight`); compute stays Float32.
+`capture=true` (AMD GPUs) records a run into a HIP graph and replays it on
+later runs with the same symbolic dims and input buffers (see
+`execute_with_capture`). Requires `free_intermediates=false`; pass inputs as
+the same device arrays each run, or as host arrays copied into place.
 """
 function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(),
                  retain::Vector{Int}=Int[], free_intermediates::Bool=true, fuse::Bool=true,
-                 weight_dtype::Type=Float32)
+                 weight_dtype::Type=Float32, capture::Bool=false)
+    capture && free_intermediates && error("capture=true requires free_intermediates=false")
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -358,6 +369,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     steps = Base.Function[]
     processed = fill(false, length(graph.nodes))
     owned = fill(false, length(graph.nodes))  # buffers allocated by this graph's own steps
+    dynamic = false  # true if any shape depends on symbolic dims (sym_vals)
 
     for (node_id, node) in enumerate(graph.nodes)
         processed[node_id] && continue
@@ -409,6 +421,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             catch
                 nothing
             end
+            static === nothing && (dynamic = true)
 
             push!(steps, (res, dev, sym_vals, live) -> begin
                 in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, _, st) in input_specs] : static.in_sts
@@ -468,6 +481,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 catch
                     nothing
                 end
+                static === nothing && (dynamic = true)
 
                 push!(steps, (res, dev, sym_vals, live) -> begin
                     in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
@@ -489,5 +503,5 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
-    return CompiledGraph(graph, steps, results, Dict{Symbol, Any}(), consumer_count)
+    return CompiledGraph(graph, steps, results, Dict{Symbol, Any}(:capture => capture, :dynamic => dynamic), consumer_count)
 end

@@ -8,7 +8,7 @@
 #      K/V at position plen — reported per layer, so the first diverging layer is visible.
 #   C. The decode step's logits must equal prefill(prompt)'s last-position logits.
 #
-# Usage: julia --project=. debug_decode.jl [model_dir] [cpu|gpu] [f32|f16]
+# Usage: julia --project=. debug_decode.jl [model_dir] [cpu|gpu] [f32|f16] [capture]
 #   f16 stores matmul weights as Float16 (compile(...; weight_dtype=Float16))
 
 using Luminal
@@ -38,7 +38,8 @@ function main()
     model_dir = length(ARGS) >= 1 ? ARGS[1] : joinpath(@__DIR__, "tinyllama_chat")
     device = (length(ARGS) >= 2 && ARGS[2] == "cpu") ? CPUDevice() : get_device()
     wdtype = (length(ARGS) >= 3 && ARGS[3] == "f16") ? Float16 : Float32
-    println("Matmul weights: ", wdtype)
+    capture = "capture" in ARGS
+    println("Matmul weights: ", wdtype, "  HIP graph capture: ", capture)
     rope_base = 10000f0
     max_seq = 256
     println("Device: ", device)
@@ -82,7 +83,8 @@ function main()
     load_weights!(dg, dreg, weights_dict; device=device)
     retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
                   idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids)
-    ex = compile(dg; device=device, retain=retain, free_intermediates=false, weight_dtype=wdtype)
+    ex = compile(dg; device=device, retain=retain, free_intermediates=false, weight_dtype=wdtype,
+                 capture=capture)
     t = time()
     logits_dec = Array{Float32}(llama_decode_step!(ex, idg, cache, ids[end];
                                                    sym_vals=Dict(:pos => plen - 1), device=device))

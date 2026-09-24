@@ -145,8 +145,10 @@ function llama_generate(model,
         idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
         idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids
     )
+    # The decode graph is shape-static, so on AMD GPUs it is captured once as a
+    # HIP graph and replayed each token.
     exec_fn = compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
-                      weight_dtype=wdtype)
+                      weight_dtype=wdtype, capture=target_device isa Luminal.AMDDevice)
 
     for step in 0:(max_new_tokens - 2)
         pos = start_pos + step

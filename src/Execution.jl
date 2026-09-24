@@ -451,32 +451,50 @@ end
 execute_op!(out, op::Contiguous, a) = copyto!(out, a)
 execute_op!(out, op::MatMul, a, b) = batch_matmul!(out, a, b)
 
-function execute_op!(out, op::SumReduce, a)
-    # out has dropped dims.
-    # sum! logic: sum!(dest, src) -> dest dims must include the ones being summed over as size 1?
-    # Base.sum! docs: "sums elements of A over dimensions... to matching dimensions of R"
-    # If op.dim was dropped in `out`, we need to reshape `out` to include it as size 1.
-    
-    # Calculate expected R shape for sum!
-    # It must equal size(a) but with size 1 at op.dim.
-    r_shape = [size(out)...]
-    # Insert 1 at op.dim (if it was dropped)
-    # This depends on how `out` was allocated.
-    # If `out` is truly reduced rank (N-1), we need a view.
-    # Use Float32 for reduction to avoid FP16 MethodErrors on older GPUs
-    res = reduce(+, Float32.(a), dims=op.dim)
-    copyto!(out, res)
+# Reduce `a` over dimension `dim` into `out` (which has that dim dropped or 1).
+# GPU: one workgroup per output element, strided accumulation, tree reduction in
+# local memory, written straight into `out` -- no temporaries, so it is safe to
+# record into a captured HIP graph. Elements are addressed linearly as
+# a[i + pre*(k-1) + pre*r*(j-1)] for output (i, j) and reduced index k.
+@kernel function _reduce_dim_kernel!(out, @Const(a), pre, r, op, init)
+    g = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    i = (g - 1) % pre + 1
+    j = (g - 1) ÷ pre + 1
+    base = i + pre * r * (j - 1)
+    acc = init
+    k = lid
+    while k <= r
+        @inbounds acc = op(acc, Float32(a[base + pre * (k - 1)]))
+        k += G
+    end
+    s = @localmem Float32 (256,)
+    @inbounds s[lid] = acc
+    @synchronize
+    stride = G ÷ 2
+    while stride > 0
+        lid <= stride && (@inbounds s[lid] = op(s[lid], s[lid + stride]))
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds out[g] = s[1])
+end
+
+function _reduce_dim!(out, a, dim, op, init)
+    if out isa AnyGPUArray
+        pre = prod(size(a)[1:dim-1]; init=1)
+        r = size(a, dim)
+        G = r >= 256 ? 256 : max(32, nextpow(2, r))
+        _reduce_dim_kernel!(KernelAbstractions.get_backend(out), G)(
+            out, a, pre, r, op, init; ndrange = length(out) * G)
+    else
+        rsz = ntuple(d -> d == dim ? 1 : size(a, d), ndims(a))
+        op === (+) ? sum!(Base.reshape(out, rsz), a) : maximum!(Base.reshape(out, rsz), a)
+    end
     return out
 end
 
-function execute_op!(out, op::MaxReduce, a)
-    # Similar logic for maximum!
-    r_shape = [size(out)...]
-    # Use Float32 for reduction to avoid FP16 MethodErrors on older GPUs
-    res = reduce(max, Float32.(a), dims=op.dim)
-    copyto!(out, res)
-    return out
-end
+execute_op!(out, op::SumReduce, a) = _reduce_dim!(out, a, op.dim, +, 0f0)
+execute_op!(out, op::MaxReduce, a) = _reduce_dim!(out, a, op.dim, max, -Inf32)
 
 execute_op!(out, op::Slice, a) = execute_slice!(out, a, op.ranges)
 execute_op!(out, op::Pad, a) = execute_pad!(out, a, op.padding)
@@ -750,7 +768,6 @@ function execute_op!(out, op::Function, inputs...)
             backend = KernelAbstractions.get_backend(out)
             kernel! = _gather_kernel(backend)
             kernel!(out, inputs[1], inputs[2], ndrange=length(out))
-            KernelAbstractions.synchronize(backend)
         else
             indices = Int.(inputs[2]) .+ 1
             copyto!(out, inputs[1][indices, :])

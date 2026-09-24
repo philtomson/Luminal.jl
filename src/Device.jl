@@ -149,5 +149,58 @@ function execute_with_capture(::CUDADevice, f, cache::Dict)
 end
  
 execute_with_capture(::AbstractDevice, f, cache) = f()
+
+# HIP graph capture and replay. The caller opts in by putting a `:key` in
+# `cache` that identifies everything a replay would bake in (symbolic dim
+# values, input buffer identities). The first run with a key executes
+# normally (warm-up: buffers allocated, kernels compiled); the next run with
+# the same key is captured into a HIP graph; later runs with that key replay
+# the graph with a single launch instead of issuing every kernel from Julia.
+mutable struct HIPGraphReplay
+    graph::AMDGPU.HIP.hipGraph_t
+    exec::AMDGPU.HIP.hipGraphExec_t
+end
+
+function _capture_hip_graph(f)
+    HIP = AMDGPU.HIP
+    s = AMDGPU.stream().stream
+    HIP.hipStreamBeginCapture(s, HIP.hipStreamCaptureModeThreadLocal)
+    graph = Ref{HIP.hipGraph_t}()
+    try
+        f()
+    catch
+        try HIP.hipStreamEndCapture(s, graph) catch end
+        rethrow()
+    end
+    HIP.hipStreamEndCapture(s, graph)
+    exec = Ref{HIP.hipGraphExec_t}()
+    HIP.hipGraphInstantiateWithFlags(exec, graph[], 0)
+    r = HIPGraphReplay(graph[], exec[])
+    finalizer(r) do r
+        HIP.hipGraphExecDestroy(r.exec)
+        HIP.hipGraphDestroy(r.graph)
+    end
+    return r
+end
+
+_launch_hip_graph(r::HIPGraphReplay) = AMDGPU.HIP.hipGraphLaunch(r.exec, AMDGPU.stream().stream)
+
+function execute_with_capture(::AMDDevice, f, cache::Dict)
+    key = get(cache, :key, nothing)
+    key === nothing && return f()
+    g = get(cache, :graph, nothing)
+    if g !== nothing && isequal(cache[:graph_key], key)
+        _launch_hip_graph(g)
+    elseif isequal(get(cache, :warm_key, nothing), key)
+        g = _capture_hip_graph(f)
+        cache[:graph] = g
+        cache[:graph_key] = key
+        _launch_hip_graph(g)   # capturing records the work without running it
+    else
+        cache[:warm_key] = key
+        f()
+    end
+    return nothing
+end
  
 end # module Device
