@@ -119,6 +119,66 @@ function _release!(res, id, owned)
     end
 end
 
+# Make res[node_id] a buffer of size `sz` on `dev`. In reuse mode on GPU, buffers
+# sized by a dynamic dim (e.g. decode context length) change size every run and
+# GPU allocation is slow, so they are served as a reshaped prefix of a backing
+# buffer that only regrows (with 50% headroom).
+function _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates)
+    isassigned(res, node_id) && res[node_id] !== nothing && size(res[node_id]) == sz && return
+    if free_intermediates || !(dev isa Luminal.AbstractGPUDevice)
+        isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
+        res[node_id] = Luminal.zero_tensor(dev, Float32, sz...)
+    else
+        n = prod(sz)
+        if backing[] === nothing || length(backing[]) < n
+            isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
+            cap = backing[] === nothing ? n : cld(3n, 2)
+            backing[] isa AnyGPUArray && GPUArrays.unsafe_free!(backing[])
+            backing[] = Luminal.zero_tensor(dev, Float32, cap)
+        end
+        res[node_id] = Base.reshape(view(backing[], 1:n), sz)
+    end
+end
+
+# True if a consumer reads node `id` through `st` exactly as produced (no
+# permute, slice, pad or broadcast), so `id` can be fused into that consumer.
+function _is_trivial_view(st::ShapeTracker, out::ShapeTracker)
+    n = length(st.dims)
+    st.indexes == 1:n || return false
+    any(st.fake) && return false
+    all(p -> isequal(p[1], 0) && isequal(p[2], 0), st.padding) || return false
+    for i in 1:n
+        lo, hi = st.mask[i]
+        (isequal(lo, 0) && (isequal(hi, typemax(Int)) || isequal(hi, st.dims[i]))) || return false
+    end
+    return isequal(Luminal.DimType[st.dims...], realized_dims(out))
+end
+
+# Fused scalar kernels, keyed by expression: identical groups (e.g. the same
+# RMSNorm in every layer) share one function and hence one GPU compilation.
+const _FUSED_KERNELS = Dict{String, Any}()
+
+function _fused_kernel(node_expr, n_args)
+    key = string(n_args, ":", node_expr)
+    get!(_FUSED_KERNELS, key) do
+        name = Symbol("global_fused_", length(_FUSED_KERNELS) + 1)
+        args = [Expr(:(::), Symbol("in", i), :Real) for i in 1:n_args]
+        Core.eval(Luminal, :(function $name($(args...)); return Float32($node_expr); end))
+    end
+end
+
+# Movement ops that don't reorder data can return a reshaped alias of a
+# contiguous input instead of copying it: any Reshape, an Expand that doesn't
+# change the element count, and a Permute that only moves size-1 dims.
+function _alias_view(op, arg, sz)
+    (op isa Luminal.Reshape || op isa Luminal.Permute || op isa Luminal.Expand) || return nothing
+    (arg isa DenseArray && length(arg) == prod(sz)) || return nothing
+    if op isa Luminal.Permute
+        issorted([d for d in op.dims if size(arg, d) != 1]) || return nothing
+    end
+    return Base.reshape(arg, sz)
+end
+
 # --- Fusion Helpers ---
 
 function is_elementwise(op)
@@ -175,6 +235,7 @@ end
 function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, current_st)
     node = graph.nodes[node_id]
     op = node.op
+    op isa Luminal.Constant && return Float32(op.value)  # inline as a literal
 
     # If this node is NOT a fusible intermediate, it's a leaf for THIS fusion group
     if !(node_id in fusible_intermediates)
@@ -219,7 +280,7 @@ end
 # --- Main Compile Function ---
 
 """
-    compile(graph; device=get_device(), retain=Int[], free_intermediates=true)
+    compile(graph; device=get_device(), retain=Int[], free_intermediates=true, fuse=true)
 
 Build an executable `CompiledGraph`. With `free_intermediates=true` each
 intermediate buffer is released as soon as its last consumer has run (lowest
@@ -227,9 +288,10 @@ peak memory, but every run reallocates). With `false` buffers persist across
 runs and are reused, reallocated only when a symbolic dimension changes their
 size, which suits graphs executed many times such as per-token decode.
 Retained outputs are overwritten by the next run in either mode.
+`fuse=true` merges chains of elementwise ops into single kernels.
 """
 function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(),
-                 retain::Vector{Int}=Int[], free_intermediates::Bool=true)
+                 retain::Vector{Int}=Int[], free_intermediates::Bool=true, fuse::Bool=true)
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -245,28 +307,21 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     compile_device = device 
     fusible_intermediates = Set{Int}()
     
-    # Disable dynamic fusion generation on GPU backends since Julia 1.12 World Age
-    # actively blocks runtime JIT caching of dynamically created AST kernels inside modules.
-    # Disable dynamic fusion for now to avoid symbolic shape issues in evaluate_shapes
-    if false && !(compile_device isa Luminal.AbstractGPUDevice)
-        for (node_id, node) in enumerate(graph.nodes)
-            if is_elementwise(node.op) && consumer_count[node_id] == 1
-                 # Find consumer
-                 is_consumed_by_ew = false
-                 for other_node in graph.nodes
-                     for (in_id, _, _) in other_node.inputs
-                         if in_id == node_id && is_elementwise(other_node.op)
-                             is_consumed_by_ew = true
-                             break
-                         end
-                     end
-                     is_consumed_by_ew && break
-                 end
-                 if is_consumed_by_ew
-                     push!(fusible_intermediates, node_id)
-                 end
-            end
-        end
+    # An elementwise node is fused into its consumer when that is its only use,
+    # the consumer is elementwise too, and the consumer reads it unchanged.
+    consumers = [Tuple{Int, ShapeTracker}[] for _ in graph.nodes]
+    for (cid, node) in enumerate(graph.nodes), (id, _, st) in node.inputs
+        push!(consumers[id], (cid, st))
+    end
+    for (node_id, node) in enumerate(graph.nodes)
+        fuse || break
+        (is_elementwise(node.op) && !(node.op isa Luminal.Constant)) || continue
+        consumer_count[node_id] == 1 && length(consumers[node_id]) == 1 || continue
+        haskey(graph.tensors, (node_id, 1)) && continue
+        cid, st = consumers[node_id][1]
+        c_op = graph.nodes[cid].op
+        (is_elementwise(c_op) && !(c_op isa Luminal.Constant)) || continue
+        _is_trivial_view(st, graph.shapes[node_id]) && push!(fusible_intermediates, node_id)
     end
 
     # 2. Setup Results array (weights are pre-populated)
@@ -320,25 +375,44 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             is_persistent = haskey(graph.tensors, (node_id, 1))
             dtype = (compile_device isa Luminal.AbstractGPUDevice) ? Float32 : Float32
             owned[node_id] = !is_persistent
+            backing = Ref{Any}(nothing)  # reuse mode on GPU: flat buffer with spare capacity
+            aliased = Ref(false)         # res[node_id] currently aliases an input's memory
+
+            # Shapes free of symbolic dims are evaluated once here instead of every run.
+            static = try
+                (in_sts = [evaluate_shapes(st, Dict{Symbol,Int}()) for (_, _, st) in input_specs],
+                 dims = [eval_dim(d) for d in realized_dims(node_shape)],
+                 op = evaluate_op_shapes(op, Dict{Symbol,Int}()))
+            catch
+                nothing
+            end
 
             push!(steps, (res, dev, sym_vals, live) -> begin
-                # 1. Allocate if needed
+                in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, _, st) in input_specs] : static.in_sts
+                run_op = static === nothing ? evaluate_op_shapes(op, sym_vals) : static.op
+
+                # 1. Realize input views
+                step_args = [realize_view(res[id], in_sts[k]) for (k, (id, _, _)) in enumerate(input_specs)]
+
+                # 2. Alias or allocate the output
+                alias = nothing
                 if !is_persistent
-                    dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
+                    dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
                     sz = Tuple(dims_int)
-                    if !isassigned(res, node_id) || res[node_id] === nothing || size(res[node_id]) != sz
-                        isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
-                        res[node_id] = Luminal.zero_tensor(dev, dtype, dims_int...)
+                    alias = length(step_args) == 1 ? _alias_view(op, step_args[1], sz) : nothing
+                    if alias !== nothing
+                        res[node_id] = alias
+                        aliased[] = true
+                    elseif aliased[]
+                        # Never write through a stale alias into another node's buffer
+                        res[node_id] = nothing
+                        aliased[] = false
                     end
+                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates)
                 end
 
-                # 2. Evaluate shapes and arguments
-                # Operations with sizes/dimensions need updating inside
-                # For now, we evaluate shapes for the realize_view
-                step_args = [realize_view(res[id], evaluate_shapes(st, sym_vals)) for (id, _, st) in input_specs]
-                
                 # 3. Execute
-                execute_op!(res[node_id], evaluate_op_shapes(op, sym_vals), step_args...)
+                alias === nothing && execute_op!(res[node_id], run_op, step_args...)
 
                 # 4. Free dead inputs
                 for (id, _, _) in input_specs
@@ -351,110 +425,35 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             processed[node_id] = true
         else
             if !(node_id in fusible_intermediates)
-                # Terminal of a fusion group
+                # Terminal of a fusion group: one broadcast kernel for the whole group
                 group_inputs = [] # (id, st, sym)
                 sym_cache = Dict{Any, Any}()
-                
-                input_syms = []
-                for (in_id, _, in_st) in node.inputs
-                    push!(input_syms, build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st))
-                end
-                sym_expr = op_to_sym(op, input_syms)
+                input_syms = [build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st)
+                              for (in_id, _, in_st) in node.inputs]
+                node_expr = fix_gpu_ast!(toexpr(op_to_sym(op, input_syms)))
+                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", _fused_kernel(node_expr, length(group_inputs)))
 
-                # Instead of mapping to Julia AST, we build a Reverse Polish Notation (RPN) instruction list
-                # Opcodes: -1=Input, -2=Constant, >=0=Operator (from list below)
-                # Operators: 0=Add, 1=Mul, 2=Mod, 3=Log2, 4=Exp2, 5=Sin, 6=Cos, 7=Sqrt, 8=Recip, 9=ReLU, 10=Max, 11=Less
-                
-                # Assign simple opcodes for Luminal primitives
-                function op_to_code(op)
-                    if op isa Luminal.Add return 0
-                    elseif op isa Luminal.Mul return 1
-                    elseif op isa Luminal.Mod return 2
-                    elseif op isa Luminal.Log2 return 3
-                    elseif op isa Luminal.Exp2 return 4
-                    elseif op isa Luminal.Sin return 5
-                    elseif op isa Luminal.Cos return 6
-                    elseif op isa Luminal.Sqrt return 7
-                    elseif op isa Luminal.Recip return 8
-                    elseif op isa Luminal.ReLU return 9
-                    elseif op isa Luminal.Max return 10
-                    elseif op isa Luminal.LessThan return 11
-                    else return -3 # Unknown Error
-                    end
-                end
-                
-                # Walk the tree and build the RPN
-                # Nodes are represented as nested tuples: (op, children...) or (input_idx,) or (constant_val,)
-                rpn_nodes = Int32[]
-                rpn_consts = Float32[]
-                
-                function build_rpn!(expr_sym)
-                    if expr_sym isa Sym
-                        # Find the input index
-                        idx = findfirst(x -> x[3] === expr_sym, group_inputs)
-                        push!(rpn_nodes, -1)
-                        push!(rpn_nodes, Int32(idx))
-                    elseif Base.isexpr(expr_sym, :call)
-                        # We encoded ops back to Julia expressions, need to parse them backward
-                        # Alternatively, we just use the original op tree directly!
-                        error("Cannot parse raw Julia AST back to RPN, must build from Luminal graph")
-                    elseif typeof(expr_sym) <: Real
-                        push!(rpn_nodes, -2)
-                        push!(rpn_consts, Float32(expr_sym))
-                        push!(rpn_nodes, Int32(length(rpn_consts)))
-                    else
-                         error("Unknown expression node in fusion: ", expr_sym)
-                    end
+                node_shape = graph.shapes[node_id]
+                target_rank = length(realized_dims(node_shape))
+                align_rank(val, rank) = ndims(val) >= rank ? val :
+                    Base.reshape(val, size(val)..., ntuple(_ -> 1, rank - ndims(val))...)
+                owned[node_id] = true
+                backing = Ref{Any}(nothing)
+                static = try
+                    (in_sts = [evaluate_shapes(st, Dict{Symbol,Int}()) for (_, st, _) in group_inputs],
+                     dims = [eval_dim(d) for d in realized_dims(node_shape)])
+                catch
+                    nothing
                 end
 
-                # To avoid the AST string mapping hell, we will write a tiny recursive walker over the *actual* Luminal graph instead of the Symbolics.jl tree to generate the RPN natively.
-                # However, this breaks `optimize()` simplifications which operate on Symbolics.jl Math AST, so we will use an alternative fallback.
-                
-                # Since world-age crashes are exclusive to Julia functions generated inside the dynamic `run_graph`, we can completely side-step the `InvalidIRError` by keeping `execute_op!` but running it purely natively on the CPU `Array` loop by using `allowscalar()` for scalar-heavy ops if on CUDA, OR we can stick to using standard Broadcast and `invokelatest` but *revert the fusion passes* on CUDADevices if we detect them.
-                
-                # But Wait! Base `broadcast!` with standard primitive Julia functions works perfectly fine. The `InvalidIRError` occurs *only* when `broadcast!` receives an *anonymous closure* generated by `RuntimeGeneratedFunctions` or `@eval`.
-                
-                # To bypass all this string interpolation and RPN nonsense, let's just generate the closures with standard `eval` like before, BUT execute the graph *via global named functions* evaluated at compile time!
-                
-                sym_args = [s for (_, _, s) in group_inputs]
-                arg_names = [s.name for s in sym_args]
-                
-                node_expr = fix_gpu_ast!(toexpr(sym_expr))
-                
-                kernel_name = Symbol("global_fused_$node_id")
-                
-                args_defs = [Expr(:(::), Symbol(name), :(Real)) for name in arg_names]
-                
-                kernel_ast = quote
-                    function $kernel_name($(args_defs...))
-                        return Float32($node_expr)
-                    end
-                end
-                
-                
-                Core.eval(Luminal, kernel_ast)
-                
-                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", getfield(Luminal, kernel_name))
-                target_rank = length(realized_dims(graph.shapes[node_id]))
-                function align_rank(val, rank)
-                    if ndims(val) >= rank return val end
-                    return Base.reshape(val, size(val)..., ones(Int, rank - ndims(val))...)
-                end
-                
-                # Wait, fusion requires static target_rank and align_rank. We can fallback to eval if rank is constant. 
-                # Since fusion is disabled on CUDA this branch is mostly CPU only.
-                # Skip evaluating shapes dynamically for CPU fusion to save time if we don't need it.
                 push!(steps, (res, dev, sym_vals, live) -> begin
-                    input_steps = [align_rank(realize_view(res[id], evaluate_shapes(st, sym_vals)), target_rank) for (id, st, _) in group_inputs]
-                    
-                    if !isassigned(res, node_id) || res[node_id] === nothing
-                        dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(graph.shapes[node_id]))
-                        res[node_id] = zeros(Float32, dims_int...)
-                    end
-                    target_buf = res[node_id]
-                    
-                    Base.invokelatest(execute_op!, target_buf, fused_op, input_steps...)
-                    
+                    in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
+                    args = [align_rank(realize_view(res[id], in_sts[k]), target_rank) for (k, (id, _, _)) in enumerate(group_inputs)]
+                    dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
+                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates)
+
+                    Base.invokelatest(execute_op!, res[node_id], fused_op, args...)
+
                     for (id, _, _) in group_inputs
                         live[id] -= 1
                         if free_intermediates && live[id] == 0 && !haskey(graph.tensors, (id, 1))

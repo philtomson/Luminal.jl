@@ -63,6 +63,24 @@ function _ensure_contiguous(x)
     return x
 end
 
+# C[:, :, i] = A[:, :, i] * B[:, :, i] as one strided-batched BLAS call on GPU.
+_batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}) where {T<:Union{Float32,Float64}} =
+    AMDGPU.rocBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
+_batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}) where {T<:Union{Float32,Float64}} =
+    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
+_batched_gemm!(C, A, B) = nothing
+
+# (M, K) * (K, N): a single-column right-hand side (e.g. one decode token) runs as
+# GEMV, which is ~1.5-2x faster than an n=1 GEMM for large weight matrices.
+function _matmul2d!(C, A, B)
+    if size(B, 2) == 1 && B isa DenseArray && C isa DenseArray
+        mul!(vec(C), A, vec(B))
+    else
+        mul!(C, A, B)
+    end
+    return C
+end
+
 function batch_matmul!(C, A, B)
     A = _ensure_contiguous(A)
     B = _ensure_contiguous(B)
@@ -70,8 +88,7 @@ function batch_matmul!(C, A, B)
     
     # 2D * 2D
     if ndims(A) == 2 && ndims(B) == 2
-        mul!(C, A, B)
-        return C
+        return _matmul2d!(C, A, B)
     end
     
     # Linear: 2D * 3D (Out, In) * (In, S, B) -> (Out, S, B)
@@ -82,7 +99,7 @@ function batch_matmul!(C, A, B)
         @assert in_dim == in_dim2 "Inner dimensions must match: $in_dim vs $in_dim2"
         
         # mul! works on reshaped views
-        mul!(Base.reshape(C, out_dim, s * b), A, Base.reshape(B, in_dim, s * b))
+        _matmul2d!(Base.reshape(C, out_dim, s * b), A, Base.reshape(B, in_dim, s * b))
         return C
     end
 
@@ -110,6 +127,12 @@ function batch_matmul!(C, A, B)
     # Note: In Julia column-major, (S, D) should be the fastest dimensions for efficient view matmul.
     # So (S, D, H, B) or (D, S, H, B) are better.
     if ndims(A) == 4 && ndims(B) == 4
+        # One strided-batched GEMM over all (head, batch) pairs when layouts allow
+        if size(A)[3:4] == size(B)[3:4] && A isa DenseArray && B isa DenseArray && C isa DenseArray
+            nb = size(A, 3) * size(A, 4)
+            r3(X) = Base.reshape(X, size(X, 1), size(X, 2), nb)
+            _batched_gemm!(r3(C), r3(A), r3(B)) === nothing || return C
+        end
         # Loop over the last two dimensions
         B1, B2 = size(A, 3), size(A, 4)
         for i in 1:B1, j in 1:B2

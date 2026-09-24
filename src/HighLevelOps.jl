@@ -330,14 +330,10 @@ end
 # arange and gather
 # -----------------
 
+# [0, 1, ..., to-1] as a single ARange node. (Formerly cumsum(ones) - 1, which
+# costs several ops and a scalar-indexed CumSum on AMD GPUs.)
 function arange(graph::Graph, to::DimType)
-    if to == 1
-        return expand(constant(graph, 0.0f0), 1, 1)
-    else
-        one = constant(graph, 1.0f0)
-        expanded = expand(one, 1, to)
-        return cumsum_last_dim(expanded) - 1.0f0
-    end
+    return add_op!(graph, Function("ARange"), Tuple{Int, Int, ShapeTracker}[], ShapeTracker([to]))
 end
 
 function cumsum_last_dim(a::GraphTensor)

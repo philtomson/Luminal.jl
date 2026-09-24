@@ -22,6 +22,7 @@ mutable struct Graph
     no_delete::Set{Int}
     to_retrieve::Set{Int}
     trainable::Set{Int}
+    cse::Dict{Any, Int}  # structural key -> node id, for common-subexpression elimination
 
     # Default constructor
     function Graph()
@@ -31,7 +32,8 @@ mutable struct Graph
             Dict{Char, Int}(), 
             Set{Int}(), 
             Set{Int}(),
-            Set{Int}())
+            Set{Int}(),
+            Dict{Any, Int}())
     end
 end
 
@@ -41,12 +43,31 @@ end
 Add a new operation node to the graph and return a GraphTensor representing it.
 """
 function add_op!(graph::Graph, op::Op, inputs::Vector{Tuple{Int, Int, ShapeTracker}}, output_shape::ShapeTracker)
+    # Common-subexpression elimination: ops are pure, so an op identical to an
+    # existing node (same op, same input views, same output shape) reuses it.
+    # This collapses e.g. RoPE tables that every layer rebuilds for the same
+    # positions. Input tensors are distinct by definition and never merged.
+    key = _cse_key(op, inputs, output_shape)
+    if key !== nothing
+        existing = get(graph.cse, key, 0)
+        existing != 0 && return GraphTensor(existing, output_shape, graph)
+    end
     node = Node(op, inputs)
     push!(graph.nodes, node)
     push!(graph.shapes, output_shape)
     node_id = length(graph.nodes)
+    key !== nothing && (graph.cse[key] = node_id)
     return GraphTensor(node_id, output_shape, graph)
 end
+
+function _cse_key(op::Op, inputs, output_shape::ShapeTracker)
+    op isa Function && op.name == "InputTensor" && return nothing
+    return (typeof(op), ntuple(i -> getfield(op, i), nfields(op)),
+            [(id, idx, _st_key(st)) for (id, idx, st) in inputs], _st_key(output_shape))
+end
+
+# Structural value of a ShapeTracker (vectors hash and compare by content).
+_st_key(st::ShapeTracker) = (st.dims, st.indexes, st.fake, st.mask, st.padding)
 
 """
     tensor(graph::Graph, shape::Vector{Int})
