@@ -629,9 +629,9 @@ uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
 version = "1.11.0"
 
 [[deps.Metatheory]]
-deps = ["AutoHashEquals", "DocStringExtensions", "Reexport", "TermInterface", "TimerOutputs"]
-git-tree-sha1 = "1479a9c0e3ea3e3c7044db33ac9826114777e834"
-repo-rev = "ale/3.0"
+deps = ["AutoHashEquals", "Reexport", "TermInterface", "TimerOutputs"]
+git-tree-sha1 = "2fcdf9c155e4e365d68f6729e66d1dbcc2c7d796"
+repo-rev = "b743e7597b26c9e4c1409ff389105264160ae12b"
 repo-url = "https://github.com/JuliaSymbolics/Metatheory.jl"
 uuid = "e9d8d322-4543-424a-9be4-0cc815abe26c"
 version = "3.0.0"
