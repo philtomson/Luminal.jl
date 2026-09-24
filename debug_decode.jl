@@ -8,7 +8,8 @@
 #      K/V at position plen — reported per layer, so the first diverging layer is visible.
 #   C. The decode step's logits must equal prefill(prompt)'s last-position logits.
 #
-# Usage: julia --project=. debug_decode.jl [model_dir] [cpu|gpu]
+# Usage: julia --project=. debug_decode.jl [model_dir] [cpu|gpu] [f32|f16]
+#   f16 stores matmul weights as Float16 (compile(...; weight_dtype=Float16))
 
 using Luminal
 using Luminal.NN
@@ -17,7 +18,7 @@ using Printf
 
 relerr(a, b) = maximum(abs.(a .- b)) / max(maximum(abs.(b)), 1f-6)
 
-function prefill(model, ids, weights_dict, device, rope_base)
+function prefill(model, ids, weights_dict, device, rope_base, wdtype)
     g = Graph(); reg = WeightRegistry()
     m = Luminal.Decoding._rebuild_model_like(model, g, reg; rope_base=rope_base)
     n = length(ids)
@@ -25,7 +26,7 @@ function prefill(model, ids, weights_dict, device, rope_base)
     out, kvs = m(inp, 0; return_kv=true)
     retain = vcat(out.id, [k.id for (k, _) in kvs], [v.id for (_, v) in kvs])
     load_weights!(g, reg, weights_dict; device=device)
-    ex = compile(g; device=device, retain=retain)
+    ex = compile(g; device=device, retain=retain, weight_dtype=wdtype)
     res = ex(Dict{Int,Any}(inp.id => Float32.(Base.reshape(ids, n, 1))); device=device)
     logits = Array{Float32}(res[out.id])
     ks = [Array{Float32}(res[k.id]) for (k, _) in kvs]
@@ -36,6 +37,8 @@ end
 function main()
     model_dir = length(ARGS) >= 1 ? ARGS[1] : joinpath(@__DIR__, "tinyllama_chat")
     device = (length(ARGS) >= 2 && ARGS[2] == "cpu") ? CPUDevice() : get_device()
+    wdtype = (length(ARGS) >= 3 && ARGS[3] == "f16") ? Float16 : Float32
+    println("Matmul weights: ", wdtype)
     rope_base = 10000f0
     max_seq = 256
     println("Device: ", device)
@@ -50,9 +53,9 @@ function main()
     weights_dict = load_weights_to_dict(model_dir; device=device)
 
     t = time()
-    logits_full, k_full, v_full = prefill(model, ids, weights_dict, device, rope_base)
+    logits_full, k_full, v_full = prefill(model, ids, weights_dict, device, rope_base, wdtype)
     @printf("full prefill: %.1fs\n", time() - t)
-    _, k_short, v_short = prefill(model, ids[1:end-1], weights_dict, device, rope_base)
+    _, k_short, v_short = prefill(model, ids[1:end-1], weights_dict, device, rope_base, wdtype)
     GC.gc(); Luminal.reclaim!(device)
 
     println("\n== A. causal prefix consistency (prefill[1:end-1] vs prefill[1:plen-1]) ==")
@@ -79,7 +82,7 @@ function main()
     load_weights!(dg, dreg, weights_dict; device=device)
     retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
                   idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids)
-    ex = compile(dg; device=device, retain=retain, free_intermediates=false)
+    ex = compile(dg; device=device, retain=retain, free_intermediates=false, weight_dtype=wdtype)
     t = time()
     logits_dec = Array{Float32}(llama_decode_step!(ex, idg, cache, ids[end];
                                                    sym_vals=Dict(:pos => plen - 1), device=device))

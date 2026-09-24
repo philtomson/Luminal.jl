@@ -9,7 +9,7 @@ using GPUArrays
 using KernelAbstractions
 
 
-export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp
+export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight
 
 # Helper for batch matrix multiplication
 function batch_matmul(A, B)
@@ -63,6 +63,79 @@ function _ensure_contiguous(x)
     return x
 end
 
+# --- Float16 matmul weights ---------------------------------------------------
+# A matmul weight stored as Float16, transposed to (In, Out) so that each output
+# row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps
+# the logical (Out, In) size of the Float32 weight it replaces; activations and
+# accumulation stay Float32. Decode is bound by weight bandwidth, so halving the
+# bytes read is roughly a 2x speedup on the large projections.
+struct HalfWeight{A, V} <: AbstractMatrix{Float16}
+    t::A   # (In, Out) Float16
+    v::V   # (In/8, Out) NTuple{8, Float16} view of `t`
+end
+function HalfWeight(W::AbstractMatrix)
+    t = similar(W, Float16, size(W, 2), size(W, 1))
+    t .= permutedims(W, (2, 1))
+    v = Base.reshape(reinterpret(NTuple{8, Float16}, vec(t)), size(t, 1) ÷ 8, size(t, 2))
+    return HalfWeight(t, v)
+end
+Base.size(w::HalfWeight) = (size(w.t, 2), size(w.t, 1))
+Base.getindex(w::HalfWeight, i::Int, j::Int) = w.t[j, i]
+
+# Y[:, c] = W * X[:, c]. One workgroup per output row; the row stays in cache
+# while the workgroup loops over the columns of X, so weights are read once.
+@kernel function _half_matmul_kernel!(Y, @Const(Wv), @Const(Xv), K8, N)
+    row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256,)
+    for c in 1:N
+        acc = 0f0
+        k = lid
+        while k <= K8
+            @inbounds w = Wv[k, row]
+            @inbounds x = Xv[k, c]
+            acc += Float32(w[1]) * x[1] + Float32(w[2]) * x[2] + Float32(w[3]) * x[3] + Float32(w[4]) * x[4] +
+                   Float32(w[5]) * x[5] + Float32(w[6]) * x[6] + Float32(w[7]) * x[7] + Float32(w[8]) * x[8]
+            k += G
+        end
+        @inbounds s[lid] = acc
+        @synchronize
+        stride = G ÷ 2
+        while stride > 0
+            lid <= stride && (@inbounds s[lid] += s[lid + stride])
+            @synchronize
+            stride ÷= 2
+        end
+        lid == 1 && (@inbounds Y[row, c] = s[1])
+        @synchronize
+    end
+end
+
+# C (Out, N) = W (Out, In) * B (In, N), with any trailing dims of B/C flattened into N.
+function _half_matmul!(C, W::HalfWeight, B)
+    K, M = size(W.t)
+    N = length(B) ÷ K
+    Bc = B isa DenseArray ? B : copy(B)
+    Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
+    _half_matmul_kernel!(KernelAbstractions.get_backend(C), 128)(
+        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N; ndrange = M * 128)
+    return C
+end
+
+# Convert each Float32 weight at most once, so graphs sharing weights (e.g.
+# prefill and decode) share one Float16 copy. Keyed by identity without holding
+# the source array; its entry is dropped when the source is garbage collected.
+const _HALF_WEIGHTS = Dict{UInt, Any}()
+const _HALF_WEIGHTS_LOCK = ReentrantLock()
+function half_weight(W)
+    key = objectid(W)
+    lock(_HALF_WEIGHTS_LOCK) do
+        get!(_HALF_WEIGHTS, key) do
+            finalizer(_ -> @async(lock(() -> delete!(_HALF_WEIGHTS, key), _HALF_WEIGHTS_LOCK)), W)
+            HalfWeight(W)
+        end
+    end
+end
+
 # C[:, :, i] = A[:, :, i] * B[:, :, i] as one strided-batched BLAS call on GPU.
 _batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}) where {T<:Union{Float32,Float64}} =
     AMDGPU.rocBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
@@ -82,6 +155,7 @@ function _matmul2d!(C, A, B)
 end
 
 function batch_matmul!(C, A, B)
+    A isa HalfWeight && return _half_matmul!(C, A, B)
     A = _ensure_contiguous(A)
     B = _ensure_contiguous(B)
     # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
@@ -145,6 +219,7 @@ function batch_matmul!(C, A, B)
 end
 
 function realize_view(data, st::ShapeTracker)
+    data isa HalfWeight && return data  # only ever consumed whole, as a matmul weight
     # If buffer already matches logical size, it's likely already realized (common in interpreter)
     r_dims = realized_dims(st)
     if length(data) == prod(Int.(Luminal.eval_dim.(r_dims))) && length(data) > 1

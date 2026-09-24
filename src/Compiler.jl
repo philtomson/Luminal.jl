@@ -154,6 +154,21 @@ function _is_trivial_view(st::ShapeTracker, out::ShapeTracker)
     return isequal(Luminal.DimType[st.dims...], realized_dims(out))
 end
 
+# A persistent tensor that can be stored as a HalfWeight: a 2D Float32 GPU array
+# whose every use is as the left operand of a MatMul, read unchanged.
+function _is_matmul_weight(graph, node_id, data, consumers, retain)
+    (data isa AnyGPUArray && data isa DenseArray && eltype(data) == Float32 && ndims(data) == 2) || return false
+    size(data, 2) % 8 == 0 || return false
+    node_id in retain && return false
+    isempty(consumers[node_id]) && return false
+    for (cid, st) in consumers[node_id]
+        c = graph.nodes[cid]
+        (c.op isa Luminal.MatMul && c.inputs[1][1] == node_id && c.inputs[2][1] != node_id) || return false
+        _is_trivial_view(st, graph.shapes[node_id]) || return false
+    end
+    return true
+end
+
 # Fused scalar kernels, keyed by expression: identical groups (e.g. the same
 # RMSNorm in every layer) share one function and hence one GPU compilation.
 const _FUSED_KERNELS = Dict{String, Any}()
@@ -280,7 +295,8 @@ end
 # --- Main Compile Function ---
 
 """
-    compile(graph; device=get_device(), retain=Int[], free_intermediates=true, fuse=true)
+    compile(graph; device=get_device(), retain=Int[], free_intermediates=true, fuse=true,
+            weight_dtype=Float32)
 
 Build an executable `CompiledGraph`. With `free_intermediates=true` each
 intermediate buffer is released as soon as its last consumer has run (lowest
@@ -289,9 +305,12 @@ runs and are reused, reallocated only when a symbolic dimension changes their
 size, which suits graphs executed many times such as per-token decode.
 Retained outputs are overwritten by the next run in either mode.
 `fuse=true` merges chains of elementwise ops into single kernels.
+`weight_dtype=Float16` stores GPU weights that are only ever used as the left
+operand of matmuls in Float16 (see `HalfWeight`); compute stays Float32.
 """
 function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(),
-                 retain::Vector{Int}=Int[], free_intermediates::Bool=true, fuse::Bool=true)
+                 retain::Vector{Int}=Int[], free_intermediates::Bool=true, fuse::Bool=true,
+                 weight_dtype::Type=Float32)
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -328,7 +347,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     results = Vector{Any}(undef, length(graph.nodes))
     for (node_id, node) in enumerate(graph.nodes)
         if haskey(graph.tensors, (node_id, 1))
-            results[node_id] = graph.tensors[(node_id, 1)]
+            data = graph.tensors[(node_id, 1)]
+            if weight_dtype === Float16 && _is_matmul_weight(graph, node_id, data, consumers, retain)
+                data = Luminal.half_weight(data)
+            end
+            results[node_id] = data
         end
     end
 

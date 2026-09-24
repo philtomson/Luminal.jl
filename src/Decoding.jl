@@ -81,7 +81,9 @@ function llama_generate(model,
     
     # We must explicitly retain nodes we want to retrieve 
     retain_pfx = collect(pfx_graph.to_retrieve)
-    pfx_exec = compile(pfx_graph; device=target_device, retain=retain_pfx)
+    # On GPU, matmul weights are stored as Float16 (compute stays Float32)
+    wdtype = target_device isa Luminal.AbstractGPUDevice ? Float16 : Float32
+    pfx_exec = compile(pfx_graph; device=target_device, retain=retain_pfx, weight_dtype=wdtype)
 
     pfx_inputs = Dict{Int,Any}(pfx_input.id => Float32.(Base.reshape(prompt_ids, plen, 1)))
     pfx_results = pfx_exec(pfx_inputs; device=target_device)
@@ -143,7 +145,8 @@ function llama_generate(model,
         idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
         idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids
     )
-    exec_fn = compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false)
+    exec_fn = compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
+                      weight_dtype=wdtype)
 
     for step in 0:(max_new_tokens - 2)
         pos = start_pos + step
