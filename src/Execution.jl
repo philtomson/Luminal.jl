@@ -56,7 +56,16 @@ function batch_matmul(A, B)
     error("Batch matmul not implemented for $(ndims(A))D and $(ndims(B))D (Shapes: $(size(A)) and $(size(B)))")
 end
 
+function _ensure_contiguous(x)
+    if typeof(x) <: PermutedDimsArray && parent(x) isa AnyGPUArray
+        return copy(x)
+    end
+    return x
+end
+
 function batch_matmul!(C, A, B)
+    A = _ensure_contiguous(A)
+    B = _ensure_contiguous(B)
     # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
     
     # 2D * 2D
@@ -322,6 +331,8 @@ execute_op!(out, op::Sin, a) = broadcast!(sin, out, a)
 execute_op!(out, op::Cos, a) = broadcast!(cos, out, a)
 execute_op!(out, op::Sqrt, a) = broadcast!(sqrt, out, a)
 execute_op!(out, op::Recip, a) = broadcast!(x->1.0f0/x, out, a)
+execute_op!(out, op::ReLU, a) = broadcast!(x->max(x, zero(x)), out, a)
+execute_op!(out, op::Max, a, b) = broadcast!(max, out, _align_broadcast(a, out), _align_broadcast(b, out))
 
 function execute_op!(out, op::Reshape, a)
     # copyto! allows different shapes if length matches? 
@@ -647,7 +658,11 @@ function execute_op!(out, op::Function, inputs...)
             copyto!(out, inputs[1][indices, :])
         end
     elseif op.name == "CumSum"
-        cumsum!(out, inputs[1], dims=ndims(inputs[1]))
+        if inputs[1] isa AMDGPU.ROCArray
+            AMDGPU.@allowscalar cumsum!(out, inputs[1], dims=ndims(inputs[1]))
+        else
+            cumsum!(out, inputs[1], dims=ndims(inputs[1]))
+        end
     else
         error("Function op with name $(op.name) not implemented.")
     end

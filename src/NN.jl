@@ -556,23 +556,25 @@ end
 """
     LlamaKVCacheState
 
-Host-side storage for past K/V tensors for one decode session.
-- `self_cache[i]` = `(K, V)` arrays for layer i, shape (batch, n_kv_heads, max_seq, head_dim)
+Device-resident storage for past K/V tensors for one decode session.
+- `self_cache[i]` = `(K, V)` arrays for layer i, shape (head_dim, max_seq, n_kv_heads, batch),
+  allocated once on the decode device and updated in place one slot per step
 - `step_pos`: current 0-indexed decode position
 """
-mutable struct LlamaKVCacheState
+mutable struct LlamaKVCacheState{A<:AbstractArray{Float32,4}}
     step_pos::Int
     max_seq::Int
-    self_cache::Vector{Tuple{Array{Float16,4}, Array{Float16,4}}}
+    self_cache::Vector{Tuple{A, A}}
 end
 
 """
-    LlamaKVCacheState(n_layers, n_kv_heads, head_dim; batch=1, max_seq=2048)
+    LlamaKVCacheState(n_layers, n_kv_heads, head_dim; batch=1, max_seq=2048, device=CPUDevice())
 """
 function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
-                            batch::Int=1, max_seq::Int=2048)
-    self = [(zeros(Float16, head_dim, max_seq, n_kv_heads, batch),
-             zeros(Float16, head_dim, max_seq, n_kv_heads, batch))
+                            batch::Int=1, max_seq::Int=2048,
+                            device::Luminal.AbstractDevice=Luminal.CPUDevice())
+    self = [(Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch),
+             Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch))
             for _ in 1:n_layers]
     return LlamaKVCacheState(0, max_seq, self)
 end
@@ -585,7 +587,8 @@ Single-token cached self-attention for Llama decoder-only models.
 - `x` : (batch, 1, hidden)
 - `step_pos` : current 0-indexed decode position
 - `past_k`, `past_v` : (batch, n_kv_heads, max_seq, head_dim)
-Returns `(output, new_k, new_v)`.
+Returns `(output, k_new, v_new)`, where `k_new`/`v_new` are this token's
+(D, 1, KV_H, B) K/V slot, to be written into the cache at `step_pos`.
 """
 function llama_self_attn_cached(sa::SelfAttention,
                                  x::Luminal.GraphTensor,
@@ -610,21 +613,11 @@ function llama_self_attn_cached(sa::SelfAttention,
     q     = apply_rotary_embeddings(q,     step_pos_tensor; base=rope_base)
     k_new = apply_rotary_embeddings(k_new, step_pos_tensor; base=rope_base)
 
-    max_seq = Luminal.realized_dims(past_k.shape)[2]
-
-    function _kv_scatter_llama(past, slot)
-        return Luminal.concat_along(
-                   Luminal.concat_along(
-                       Luminal.slice_along(past, 2, 0, step_pos), slot, 2),
-                   Luminal.slice_along(past, 2, step_pos + 1, max_seq), 2)
-    end
-
-    new_k = _kv_scatter_llama(past_k, k_new)
-    new_v = _kv_scatter_llama(past_v, v_new)
-
-    # Attend over [0 : step_pos + 1]
-    k_ctx   = Luminal.slice_along(new_k, 2, 0, step_pos + 1)   # (D, ctx, KV_H, B)
-    v_ctx   = Luminal.slice_along(new_v, 2, 0, step_pos + 1)   # (D, ctx, KV_H, B)
+    # Attend over [0 : step_pos + 1]: the cached prefix plus the current token.
+    # The cache itself is not rebuilt here; the caller writes k_new/v_new into
+    # slot step_pos of the device-resident cache after the step.
+    k_ctx = Luminal.concat_along(Luminal.slice_along(past_k, 2, 0, step_pos), k_new, 2)  # (D, ctx, KV_H, B)
+    v_ctx = Luminal.concat_along(Luminal.slice_along(past_v, 2, 0, step_pos), v_new, 2)  # (D, ctx, KV_H, B)
 
     # GQA: repeat KV heads to match Q heads
     if sa.n_kv_heads < sa.n_heads
@@ -645,7 +638,7 @@ function llama_self_attn_cached(sa::SelfAttention,
     # Back to (Hidden, 1, Batch)
     out      = Luminal.reshape(Luminal.permute(out, [2, 3, 1, 4]), [hidden, 1, batch])
 
-    return sa.o_proj(out), new_k, new_v
+    return sa.o_proj(out), k_new, v_new
 end
 
 
@@ -660,8 +653,8 @@ struct LlamaDecodeGraph
     self_k_ids::Vector{Int}
     self_v_ids::Vector{Int}
     logits_id::Int
-    new_self_k_ids::Vector{Int}
-    new_self_v_ids::Vector{Int}
+    new_self_k_ids::Vector{Int}   # this step's K slot per layer, (D, 1, KV_H, B)
+    new_self_v_ids::Vector{Int}   # this step's V slot per layer, (D, 1, KV_H, B)
     step_pos::Luminal.DimType
 end
 
@@ -753,19 +746,21 @@ function llama_decode_step!(exec_fn,
     inputs[idg.token_input_id] = Float32[token_id;;]  # (1,1)
     inputs[idg.pos_input_id] = Float32[cache.step_pos] # (1,)
 
+    # The cache arrays already live on `device`; the compiled graph aliases them.
     for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
-        inputs[k_id] = Luminal.to_device(Dict(k_id => cache.self_cache[i][1]), device)[k_id]
-        inputs[v_id] = Luminal.to_device(Dict(v_id => cache.self_cache[i][2]), device)[v_id]
+        inputs[k_id] = cache.self_cache[i][1]
+        inputs[v_id] = cache.self_cache[i][2]
     end
 
     results = exec_fn(inputs; sym_vals=sym_vals, device=device)
     logits  = results[idg.logits_id]
 
-    # Update cache
+    # Write this step's K/V into slot step_pos of the cache, in place on device.
+    slot = cache.step_pos + 1
     for (i, (nk_id, nv_id)) in enumerate(zip(idg.new_self_k_ids, idg.new_self_v_ids))
-        cache.self_cache[i] = (
-            Array{Float16,4}(results[nk_id]),
-            Array{Float16,4}(results[nv_id]))
+        k_cache, v_cache = cache.self_cache[i]
+        view(k_cache, :, slot:slot, :, :) .= results[nk_id]
+        view(v_cache, :, slot:slot, :, :) .= results[nv_id]
     end
 
     cache.step_pos += 1

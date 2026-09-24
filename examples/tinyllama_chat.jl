@@ -15,10 +15,16 @@ using Luminal.NN
 using Printf
 
 function main()
-    model_dir    = length(ARGS) >= 1 ? ARGS[1] : "/devel/phil/Llama-3.2"
+    model_dir    = length(ARGS) >= 1 ? ARGS[1] : "/home/phil/devel/Luminal.jl/tinyllama_chat"
     prompt       = length(ARGS) >= 2 ? ARGS[2] : "Once upon a time"
     max_tokens   = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 100
     rope_base    = length(ARGS) >= 4 ? parse(Float32, ARGS[4]) : 10000.0f0
+    chat_mode    = "--chat" in ARGS
+
+    # Apply chat template if requested
+    if chat_mode
+        prompt = "<|user|>\n$prompt</s>\n<|assistant|>\n"
+    end
 
     println("=========================================")
     println("   Luminal.jl - TinyLlama Text Generation")

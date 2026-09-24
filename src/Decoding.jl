@@ -113,7 +113,7 @@ function llama_generate(model,
     first_attn = model.layers[1].attention
     cache = LlamaKVCacheState(
         length(model.layers), first_attn.n_kv_heads, first_attn.head_dim;
-        batch=1, max_seq=max_seq)
+        batch=1, max_seq=max_seq, device=target_device)
 
     # Step 0 = position immediately after the prefill sequence
     # (step_pos semantics: position in the *cache* of the current token)
@@ -124,12 +124,9 @@ function llama_generate(model,
     for (i, (k, v)) in enumerate(pfx_kvs)
         # Prefill K/V shape: (head_dim, plen, kv_heads, batch)
         # Cache slot shape: (head_dim, max_seq, kv_heads, batch)
-        k_val = Array{Float16}(pfx_results[k.id])
-        v_val = Array{Float16}(pfx_results[v.id])
-        
-        # In-place update of the cache slices
-        cache.self_cache[i][1][:, 1:plen, :, :] = k_val
-        cache.self_cache[i][2][:, 1:plen, :, :] = v_val
+        # Both live on target_device: in-place device-side copy into the cache.
+        view(cache.self_cache[i][1], :, 1:plen, :, :) .= pfx_results[k.id]
+        view(cache.self_cache[i][2], :, 1:plen, :, :) .= pfx_results[v.id]
     end
 
     @info "Compiling position-agnostic decode graph..."
@@ -146,7 +143,7 @@ function llama_generate(model,
         idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
         idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids
     )
-    exec_fn = compile(dg; device=target_device, retain=retain_nodes)
+    exec_fn = compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false)
 
     for step in 0:(max_new_tokens - 2)
         pos = start_pos + step

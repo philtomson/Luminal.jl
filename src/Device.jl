@@ -2,10 +2,11 @@ module Device
  
 using CUDA
 using AMDGPU
-using Vulkan
+# using Vulkan # Deferring to avoid InitError if libvulkan.so.1 is missing
+
 using GPUArrays
  
-export AbstractDevice, CPUDevice, AbstractGPUDevice, CUDADevice, AMDDevice, VulkanDevice, 
+export AbstractDevice, CPUDevice, AbstractGPUDevice, CUDADevice, AMDDevice, 
        get_device, to_device, from_device, execute_with_capture,
        reclaim!, available_memory, zero_tensor
  
@@ -18,16 +19,16 @@ abstract type AbstractGPUDevice <: AbstractDevice end
 struct CUDADevice <: AbstractGPUDevice end
 struct AMDDevice <: AbstractGPUDevice end
  
-struct VulkanDevice <: AbstractDevice 
-    name::String
-end
+# struct VulkanDevice <: AbstractDevice 
+#     name::String
+# end
  
 # Default constructor for empty name
-VulkanDevice() = VulkanDevice("Unknown GPU")
- 
-function Base.show(io::IO, dev::VulkanDevice)
-    print(io, "VulkanDevice(\"", dev.name, "\")")
-end
+# VulkanDevice() = VulkanDevice("Unknown GPU")
+#  
+# function Base.show(io::IO, dev::VulkanDevice)
+#     print(io, "VulkanDevice(\"", dev.name, "\")")
+# end
  
 """
     get_device()
@@ -57,25 +58,14 @@ function get_device()
     end
  
     # Try Vulkan if others fail or are unavailable
-    try
-        v_inst = Vulkan.Instance([], [])
-        v_pdevs = Vulkan.enumerate_physical_devices(v_inst)
-        # Handle Result type from Vulkan.jl
-        actual_pdevs = v_pdevs isa Vector ? v_pdevs : Vulkan.unwrap(v_pdevs)
-        
-        if !isempty(actual_pdevs)
-            for pdev in actual_pdevs
-                props = Vulkan.get_physical_device_properties(pdev)
-                # Use numerical values if constants are giving trouble, or try to access them via Vulkan
-                is_gpu = Int(props.device_type) == 1 || Int(props.device_type) == 2
-                if is_gpu
-                    return VulkanDevice(props.device_name)
-                end
-            end
-        end
-    catch e
-        @debug "Vulkan detection failed: $e"
-    end
+    # Disabled for now to avoid InitError in environments without libvulkan
+    # try
+    #     v_inst = Vulkan.Instance([], [])
+    #     v_pdevs = Vulkan.enumerate_physical_devices(v_inst)
+    #     # ...
+    # catch e
+    #     @debug "Vulkan detection failed: $e"
+    # end
     
     return CPUDevice()
 end
@@ -104,7 +94,7 @@ to_device(data::AbstractArray, ::AMDDevice) = AMDGPU.ROCArray(data)
  
 # Explicitly handle CPUDevice and VulkanDevice to avoid ambiguity with generic fallback
 to_device(data::AbstractArray, ::CPUDevice) = data
-to_device(data::AbstractArray, ::VulkanDevice) = data
+# to_device(data::AbstractArray, ::VulkanDevice) = data
  
 # Number placement (mostly for scalars in graphs)
 to_device(data::Number, ::CUDADevice) = CUDA.CuArray(fill(Float32(data)))
@@ -144,7 +134,7 @@ Allocate a zero-filled tensor of specified type and dimensions on `device`.
 zero_tensor(::CPUDevice, dtype, dims...) = zeros(dtype, dims...)
 zero_tensor(::CUDADevice, dtype, dims...) = CUDA.fill(dtype(0), dims...)
 zero_tensor(::AMDDevice, dtype, dims...) = AMDGPU.fill(dtype(0), dims...)
-zero_tensor(::VulkanDevice, dtype, dims...) = zeros(dtype, dims...)
+# zero_tensor(::VulkanDevice, dtype, dims...) = zeros(dtype, dims...)
  
 """
     execute_with_capture(device, f, cache)

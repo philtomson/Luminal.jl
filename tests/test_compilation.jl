@@ -25,7 +25,7 @@ using CUDA
     # Execute (device determines whether we use captured graph or not, 
     # but the BUFFERS are determined at compile time by get_device())
     device = Luminal.get_device()
-    res_buf = exec_fn(inputs, device)[c.id]
+    res_buf = exec_fn(inputs; device=device)[c.id]
     
     # Always convert to Array for comparison to avoid GPU-CPU broadcast issues
     @test Array(res_buf) ≈ (a_val + b_val)
@@ -57,7 +57,7 @@ using CUDA
         bias.id => b_val
     )
     
-    res2_buf = exec_fn2(inputs2, device)[z.id]
+    res2_buf = exec_fn2(inputs2; device=device)[z.id]
     expected = max.((x_val .* w_val) .+ b_val, 0.0f0)
     
     @test Array(res2_buf) ≈ expected

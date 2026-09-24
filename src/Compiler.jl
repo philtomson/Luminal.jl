@@ -84,22 +84,14 @@ end
 
 function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Symbol, Int}(), device::Luminal.AbstractDevice = Luminal.get_device())
     for (k, v) in inputs
-        if !isassigned(cg.results, k) || cg.results[k] === nothing
-             # Allocate if not assigned
+        if Luminal.to_device(v, device) === v
+             # Already resident on the target device: alias it rather than copy.
+             cg.results[k] = v
+        elseif !isassigned(cg.results, k) || cg.results[k] === nothing || length(cg.results[k]) != length(v)
              cg.results[k] = Luminal.to_device(v, device)
         else
-             # Need to copy to existing or replace if size mismatch
-             if length(cg.results[k]) != length(v)
-                 cg.results[k] = Luminal.to_device(v, device)
-             else
-                 # If v is already on device, or we can copy
-                 if v isa CUDA.CuArray && cg.results[k] isa CUDA.CuArray
-                     copyto!(cg.results[k], v)
-                 else
-                     # CPU to GPU copy
-                     copyto!(cg.results[k], v)
-                 end
-             end
+             # Host -> device copy into the existing buffer
+             copyto!(cg.results[k], v)
         end
     end
     
@@ -115,6 +107,16 @@ function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Sy
     
     execute_with_capture(device, run_graph, cg.cache)
     return cg.results
+end
+
+# Drop a dead intermediate. Buffers the graph allocated itself (`owned`) are
+# returned to the GPU pool right away instead of waiting for a GC finalizer.
+function _release!(res, id, owned)
+    buf = res[id]
+    res[id] = nothing
+    if owned[id] && buf isa AnyGPUArray
+        GPUArrays.unsafe_free!(buf)
+    end
 end
 
 # --- Fusion Helpers ---
@@ -216,7 +218,18 @@ end
 
 # --- Main Compile Function ---
 
-function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(), retain::Vector{Int}=Int[])
+"""
+    compile(graph; device=get_device(), retain=Int[], free_intermediates=true)
+
+Build an executable `CompiledGraph`. With `free_intermediates=true` each
+intermediate buffer is released as soon as its last consumer has run (lowest
+peak memory, but every run reallocates). With `false` buffers persist across
+runs and are reused, reallocated only when a symbolic dimension changes their
+size, which suits graphs executed many times such as per-token decode.
+Retained outputs are overwritten by the next run in either mode.
+"""
+function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(),
+                 retain::Vector{Int}=Int[], free_intermediates::Bool=true)
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -234,7 +247,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     
     # Disable dynamic fusion generation on GPU backends since Julia 1.12 World Age
     # actively blocks runtime JIT caching of dynamically created AST kernels inside modules.
-    if !(compile_device isa Luminal.AbstractGPUDevice)
+    # Disable dynamic fusion for now to avoid symbolic shape issues in evaluate_shapes
+    if false && !(compile_device isa Luminal.AbstractGPUDevice)
         for (node_id, node) in enumerate(graph.nodes)
             if is_elementwise(node.op) && consumer_count[node_id] == 1
                  # Find consumer
@@ -265,6 +279,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
 
     steps = Base.Function[]
     processed = fill(false, length(graph.nodes))
+    owned = fill(false, length(graph.nodes))  # buffers allocated by this graph's own steps
 
     for (node_id, node) in enumerate(graph.nodes)
         processed[node_id] && continue
@@ -282,8 +297,12 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 node_shape = graph.shapes[node_id]
                 dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
                 n = dims_int[1]
-                res[node_id] = to_device(Float32.(collect(0:n-1)), dev)
+                if !isassigned(res, node_id) || res[node_id] === nothing || length(res[node_id]) != n
+                    isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
+                    res[node_id] = to_device(Float32.(collect(0:n-1)), dev)
+                end
             end)
+            owned[node_id] = true
             processed[node_id] = true
             continue
         elseif op isa Luminal.Function && op.name == "InputTensor"
@@ -291,11 +310,16 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             continue
         end
 
-        if !is_elementwise(op) || (compile_device isa Luminal.AbstractGPUDevice && !(node_id in fusible_intermediates))
+        # Only nodes inside a fusion group (an intermediate, or a terminal with a fused
+        # input) take the generated-kernel path; everything else runs op-by-op.
+        in_fusion_group = node_id in fusible_intermediates ||
+                          any(id in fusible_intermediates for (id, _, _) in node.inputs)
+        if !is_elementwise(op) || !in_fusion_group
             input_specs = node.inputs
             node_shape = graph.shapes[node_id]
             is_persistent = haskey(graph.tensors, (node_id, 1))
             dtype = (compile_device isa Luminal.AbstractGPUDevice) ? Float32 : Float32
+            owned[node_id] = !is_persistent
 
             push!(steps, (res, dev, sym_vals, live) -> begin
                 # 1. Allocate if needed
@@ -303,6 +327,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
                     sz = Tuple(dims_int)
                     if !isassigned(res, node_id) || res[node_id] === nothing || size(res[node_id]) != sz
+                        isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
                         res[node_id] = Luminal.zero_tensor(dev, dtype, dims_int...)
                     end
                 end
@@ -318,8 +343,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 # 4. Free dead inputs
                 for (id, _, _) in input_specs
                     live[id] -= 1
-                    if live[id] == 0 && !haskey(graph.tensors, (id, 1))
-                        res[id] = nothing
+                    if free_intermediates && live[id] == 0 && !haskey(graph.tensors, (id, 1))
+                        _release!(res, id, owned)
                     end
                 end
             end)
@@ -416,7 +441,6 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     return Base.reshape(val, size(val)..., ones(Int, rank - ndims(val))...)
                 end
                 
-                input_node_shapes = [evaluate_shapes(st, Dict{Symbol,Int}()) for (_, st, _) in group_inputs]
                 # Wait, fusion requires static target_rank and align_rank. We can fallback to eval if rank is constant. 
                 # Since fusion is disabled on CUDA this branch is mostly CPU only.
                 # Skip evaluating shapes dynamically for CPU fusion to save time if we don't need it.
@@ -433,8 +457,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     
                     for (id, _, _) in group_inputs
                         live[id] -= 1
-                        if live[id] == 0 && !haskey(graph.tensors, (id, 1))
-                            res[id] = nothing
+                        if free_intermediates && live[id] == 0 && !haskey(graph.tensors, (id, 1))
+                            _release!(res, id, owned)
                         end
                     end
                 end)

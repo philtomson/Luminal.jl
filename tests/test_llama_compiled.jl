@@ -39,7 +39,7 @@ function execute_compiled_with_random_inputs(graph::Graph, output_id::Int, input
     end
     
     # exec_fn returns Vector{Any} indexed by NodeID
-    all_results = exec_fn(inputs, device)
+    all_results = exec_fn(inputs; device=device)
     res = all_results[output_id]
     
     return from_device(res)
@@ -51,14 +51,15 @@ end
         dim = 128
         ln = NN.RMSNorm(dim, graph; epsilon=1e-5)
         
-        input_data = randn(Float32, 2, dim)
-        x = tensor(graph, [2, dim])
+        # Layout: (Hidden, Seq)
+        input_data = randn(Float32, dim, 2)
+        x = tensor(graph, [dim, 2])
         out = ln(x)
         
         result = execute_compiled_with_random_inputs(graph, out.id, Dict(x.id => input_data))
         
         @test all(!isnan, result)
-        @test size(result) == (2, dim)
+        @test size(result) == (dim, 2)
     end
 
     @testset "Mlp" begin
@@ -67,25 +68,25 @@ end
         inter = 256
         mlp = NN.Mlp(hidden, inter, graph)
         
-        x = tensor(graph, [2, hidden])
+        x = tensor(graph, [hidden, 2])  # (Hidden, Seq)
         out = mlp(x)
         
         result = execute_compiled_with_random_inputs(graph, out.id)
         
-        @test size(result) == (2, hidden)
+        @test size(result) == (hidden, 2)
         @test all(!isnan, result)
     end
 
     @testset "RoPE" begin
         graph = Graph()
         batch, n_heads, seq, head_dim = 1, 4, 10, 32
-        x = tensor(graph, [batch, n_heads, seq, head_dim])
+        x = tensor(graph, [head_dim, seq, n_heads, batch])  # (D, S, H, B)
         
         out = NN.apply_rotary_embeddings(x, 0)
         
         result = execute_compiled_with_random_inputs(graph, out.id)
         
-        @test size(result) == (1, 4, 10, 32)
+        @test size(result) == (head_dim, seq, n_heads, batch)
         @test all(!isnan, result)
     end
 
@@ -95,12 +96,12 @@ end
         n_heads = 4
         sa = NN.SelfAttention(hidden, n_heads, n_heads, graph)
         
-        x = tensor(graph, [1, 8, hidden])
+        x = tensor(graph, [hidden, 8, 1])  # (Hidden, Seq, Batch)
         out = sa(x, 0)
         
         result = execute_compiled_with_random_inputs(graph, out.id)
         
-        @test size(result) == (1, 8, hidden)
+        @test size(result) == (hidden, 8, 1)
         @test all(!isnan, result)
     end
     
@@ -115,12 +116,13 @@ end
                          n_kv_heads=4, 
                          intermediate=128)
                          
-        x = tensor(graph, [1, 8])
+        x = tensor(graph, [8, 1])  # token ids, (Seq, Batch)
         out = llama(x, 0)
         
-        result = execute_compiled_with_random_inputs(graph, out.id)
+        ids = Float32.(rand(0:999, 8, 1))
+        result = execute_compiled_with_random_inputs(graph, out.id, Dict(x.id => ids))
         
-        @test size(result) == (1, 8, 1000)
+        @test size(result) == (1000, 8, 1)  # (Vocab, Seq, Batch)
         @test all(!isnan, result)
     end
 end

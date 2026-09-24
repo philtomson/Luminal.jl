@@ -194,8 +194,8 @@ function _sym_min(a, b)
     elseif b isa Int && b == typemax(Int) return a
     elseif a isa Int && a == typemax(Int) return b
     else
-        # Simplification: we don't strictly support min for symbolic yet, assume unbound limit
-        return a
+        # Keep the bound symbolic; eval_dim folds it once the symbols are known.
+        return min(a, b)
     end
 end
 
