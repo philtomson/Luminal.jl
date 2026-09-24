@@ -450,6 +450,7 @@ end
 
 execute_op!(out, op::Contiguous, a) = copyto!(out, a)
 execute_op!(out, op::MatMul, a, b) = batch_matmul!(out, a, b)
+execute_op!(out, op::MatMulF16, a, b) = batch_matmul!(out, a, b)  # `a` is a HalfWeight once compiled
 
 # Reduce `a` over dimension `dim` into `out` (which has that dim dropped or 1).
 # GPU: one workgroup per output element, strided accumulation, tree reduction in

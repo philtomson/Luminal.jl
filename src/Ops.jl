@@ -84,6 +84,9 @@ end
 
 # Special Ops
 struct MatMul <: Op end
+# Same product as MatMul, with the (weight) left operand stored as Float16 on GPU.
+# A precision choice the rewrite layer can select per matmul; compute stays Float32.
+struct MatMulF16 <: Op end
 struct Constant <: Op
     value::Any # Corresponds to ConstantValue in Rust
 end

@@ -12,7 +12,7 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, Function, Slice, Pad, FlashAttentionOp, Unfold
+export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, Function, Slice, Pad, FlashAttentionOp, Unfold
 
 
 include("Graph.jl")
@@ -56,6 +56,9 @@ include("MetatheoryBridge.jl")
 include("MetatheoryCost.jl")
 include("MetatheoryRules.jl")
 include("MetatheoryOptimizer.jl")
+
+# Graph-level rewrite layer on Metatheory e-graphs (prototype, opt-in)
+include("EGraphRewrite.jl")
 
 # Tokenizers
 include("LlamaTokenizer.jl")

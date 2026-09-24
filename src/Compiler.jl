@@ -160,16 +160,18 @@ function _is_trivial_view(st::ShapeTracker, out::ShapeTracker)
     return isequal(Luminal.DimType[st.dims...], realized_dims(out))
 end
 
-# A persistent tensor that can be stored as a HalfWeight: a 2D Float32 GPU array
-# whose every use is as the left operand of a MatMul, read unchanged.
-function _is_matmul_weight(graph, node_id, data, consumers, retain)
+# A persistent tensor to store as a HalfWeight: a 2D Float32 GPU array whose every
+# use is as the left operand of a matmul, read unchanged -- all MatMulF16, or all
+# MatMul/MatMulF16 when weight_dtype=Float16.
+function _is_matmul_weight(graph, node_id, data, consumers, retain, weight_dtype)
     (data isa AnyGPUArray && data isa DenseArray && eltype(data) == Float32 && ndims(data) == 2) || return false
     size(data, 2) % 8 == 0 || return false
     node_id in retain && return false
     isempty(consumers[node_id]) && return false
     for (cid, st) in consumers[node_id]
         c = graph.nodes[cid]
-        (c.op isa Luminal.MatMul && c.inputs[1][1] == node_id && c.inputs[2][1] != node_id) || return false
+        c.op isa Luminal.MatMulF16 || (weight_dtype === Float16 && c.op isa Luminal.MatMul) || return false
+        (c.inputs[1][1] == node_id && c.inputs[2][1] != node_id) || return false
         _is_trivial_view(st, graph.shapes[node_id]) || return false
     end
     return true
@@ -359,7 +361,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     for (node_id, node) in enumerate(graph.nodes)
         if haskey(graph.tensors, (node_id, 1))
             data = graph.tensors[(node_id, 1)]
-            if weight_dtype === Float16 && _is_matmul_weight(graph, node_id, data, consumers, retain)
+            if _is_matmul_weight(graph, node_id, data, consumers, retain, weight_dtype)
                 data = Luminal.half_weight(data)
             end
             results[node_id] = data
