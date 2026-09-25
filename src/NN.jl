@@ -269,26 +269,17 @@ function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=1000
     # emb: (seq, half_dim)
     emb = Luminal.matmul(Luminal.expand(pos, 2, 1), Luminal.expand(inv_freqs, 1, 1))
     
-    # Align emb to (half_dim, seq) for broadcasting over (half_dim, seq, H, B)
+    # Tables (half_dim, seq); identical for q and k and across layers, so they are
+    # computed once per graph (common-subexpression elimination)
     emb_t = Luminal.permute(emb, [2, 1])
-    
-    # Split input into halves along first dimension (rotate half)
-    x0 = Luminal.slice_along(input, 1, 0, half_dim)
-    x1 = Luminal.slice_along(input, 1, half_dim, head_dim)
-    
-    # Expand emb_t to (half_dim, seq, n_heads, batch)
-    emb_expanded = Luminal.expand(Luminal.expand(emb_t, 3, n_heads), 4, batch)
-    
-    sin_emb = Luminal.sin(emb_expanded)
-    cos_emb = Luminal.cos(emb_expanded)
-    
-    # Standard Llama RoPE: 
-    # out_0 = x0 * cos - x1 * sin
-    # out_1 = x1 * cos + x0 * sin
-    x0_out = x0 * cos_emb - x1 * sin_emb
-    x1_out = x1 * cos_emb + x0 * sin_emb
-    
-    return Luminal.concat_along(x0_out, x1_out, 1)
+    cos_t = Luminal.cos(emb_t)
+    sin_t = Luminal.sin(emb_t)
+
+    # Standard Llama RoPE, rotate-half form, as one kernel (see Luminal.RotaryEmbed):
+    #   out_0 = x0 * cos - x1 * sin,  out_1 = x1 * cos + x0 * sin
+    return Luminal.add_op!(graph, Luminal.RotaryEmbed(),
+                           [(input.id, 0, input.shape), (cos_t.id, 0, cos_t.shape), (sin_t.id, 0, sin_t.shape)],
+                           Luminal.ShapeTracker(collect(dims)))
 end
 
 function repeat_kv(keys::Luminal.GraphTensor, groups::Int)

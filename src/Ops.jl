@@ -110,6 +110,13 @@ struct MatMulQ8 <: Op
 end
 MatMulQ8() = MatMulQ8(128)
 
+# Rotary position embedding ("rotate half") in one kernel. Inputs: x (D, S, H, B),
+# cos and sin tables (D/2, S). For i <= D/2:
+#   out[i] = x[i] * cos[i] - x[i + D/2] * sin[i],  out[i + D/2] = x[i + D/2] * cos[i] + x[i] * sin[i]
+# Equivalent to slicing the halves, four multiplies, and a concat (4 kernels + 2
+# copies on the decode path) -- one launch instead.
+struct RotaryEmbed <: Op end
+
 # op(A) * op(B), where op transposes the first two dims when its flag is set:
 # a matmul that reads a permuted operand through BLAS transpose flags instead of
 # materializing the Permute.

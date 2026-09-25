@@ -72,6 +72,27 @@ end
 Base.size(b::BroadcastView) = size(b.a)
 Base.length(b::BroadcastView) = length(b.a)
 
+# --- Rotary embedding ---------------------------------------------------------
+@kernel function _rotary_kernel!(out, @Const(x), @Const(c), @Const(s), half)
+    I = @index(Global, Cartesian)
+    i = I[1]; t = I[2]
+    @inbounds if i <= half
+        out[I] = x[I] * c[i, t] - x[i + half, t, I[3], I[4]] * s[i, t]
+    else
+        j = i - half
+        out[I] = x[I] * c[j, t] + x[j, t, I[3], I[4]] * s[j, t]
+    end
+end
+
+function execute_op!(out, op::RotaryEmbed, x, c, s)
+    x4 = ndims(x) == 4 ? x : Base.reshape(x, size(x)..., ntuple(_ -> 1, 4 - ndims(x))...)
+    o4 = ndims(out) == 4 ? out : Base.reshape(out, size(x4))
+    c2 = Base.reshape(c, size(c, 1), :)
+    s2 = Base.reshape(s, size(s, 1), :)
+    _rotary_kernel!(KernelAbstractions.get_backend(o4), 256)(o4, x4, c2, s2, size(x4, 1) ÷ 2; ndrange = size(o4))
+    return out
+end
+
 # --- Float16 matmul weights ---------------------------------------------------
 # A matmul weight stored as Float16, transposed to (In, Out) so that each output
 # row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps
