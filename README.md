@@ -88,16 +88,16 @@ Demonstrates the **Training API**: Forward pass, Loss computation, Autograd (`ba
 - **Shape Tracking**: Symbolic dimension tracking with broadcasting support
 
 #### Compilation & Optimization
-- **Ahead-of-Time Compilation**: `compile(graph)` creates optimized execution plans
-- **Operator Fusion**: Automatic fusion of element-wise operation chains
-  - `FusedMulAdd`: `a * b + c` → single kernel
-  - `FusedAddReLU`: `relu(a + b)` → single kernel
-- **Static Memory Allocation**: All buffers pre-allocated at compile time
-- **CUDA Graph Capture**: Supported, but currently disabled by default on NVIDIA GPUs to avoid memory pool conflicts during generation loops.
-- **Search-Based Compilation**: E-Graph based optimization via **Metatheory.jl**
-  - Pattern matching with custom unary and binary operators
-  - Structural rewrite rules with canonicalization
-  - Robust e-class equivalence verification
+- **Ahead-of-Time Compilation**: `compile(graph)` creates an execution plan with
+  elementwise fusion, buffer reuse and zero-copy aliasing of movement ops,
+  common-subexpression elimination, and compile-time constant folding
+- **Float16 weights**: `weight_dtype=Float16` stores matmul weights in Float16 (compute stays Float32)
+- **HIP Graph Capture** (AMD): `capture=true` records a shape-static step once and replays it with one launch
+- **Search-Based Compilation**: `compile(graph; search=:static | :measured)` runs an
+  e-graph rewrite layer (**Metatheory.jl**) that explores equivalent graphs
+  (expand elimination, scale motion, merged projections, per-matmul precision)
+  and picks one by a DAG cost model or by timing verified candidates on the
+  device. See [docs/egraph_rewrite_layer.md](docs/egraph_rewrite_layer.md)
 
 #### Hardware Support
 - **CPU**: Fully supported via Julia's native array operations
@@ -186,13 +186,13 @@ The Julia port leverages Julia's strengths:
 
 ### Compilation Strategy
 
-Unlike the Rust version's search-based approach, Julia uses **SymbolicUtils.jl** for graph optimization:
+Like the Rust version, graph-level optimization is search over equivalent graphs:
 
 1. **Graph Construction**: Operations build a `Graph` of `Node` objects
-2. **E-Graph Integration**: Graph → **Metatheory.jl** E-Graph
-3. **Rewrite Rules**: High-performance pattern matching and structural rewrites
-4. **Compilation**: `compile()` generates fused execution plan
-5. **Execution**: Device-specific kernels execute via multiple dispatch
+2. **Rewrite layer** (optional, `search=...`): Graph → **Metatheory.jl** e-graph → rewrite rules →
+   DAG extraction, by cost model or measured on the device → Graph
+3. **Compilation**: `compile()` builds the execution plan (fusion, buffer reuse, constant folding, capture)
+4. **Execution**: Device-specific kernels execute via multiple dispatch
 
 ### Directory Structure
 
@@ -204,8 +204,8 @@ Julia/
 │   ├── Graph.jl                # Graph data structures
 │   ├── ShapeTracker.jl         # Dimension tracking
 │   ├── HighLevelOps.jl         # High-level operator library
-│   ├── SymbolicIntegration.jl  # SymbolicUtils integration
-│   ├── Compiler.jl             # Graph compilation & fusion
+│   ├── Compiler.jl             # Execution plan: fusion, buffers, folding, capture
+│   ├── EGraphRewrite.jl        # E-graph rewrite layer and measured search
 │   ├── Execution.jl            # Interpreter & kernels
 │   ├── Device.jl               # Hardware abstraction
 │   ├── NN.jl                   # Neural network layers

@@ -42,22 +42,12 @@ export WeightRegistry, register_weight!, load_weights!, load_weights_hf!
 include("NN.jl")
 export NN
 
-# SymbolicUtils.jl Integration (graph <-> symbolic expression conversion)
-include("SymbolicIntegration.jl")
-
-
-# Compiler (optimization rules using SymbolicUtils.jl)
+# Compiler: turns a Graph into an executable plan (fusion, buffer reuse,
+# constant folding, HIP graph capture)
 include("Compiler.jl")
-export compile, optimize_symbolic
+export compile
 
-# Metatheory Integration
-include("MetatheoryOps.jl")
-include("MetatheoryBridge.jl")
-include("MetatheoryCost.jl")
-include("MetatheoryRules.jl")
-include("MetatheoryOptimizer.jl")
-
-# Graph-level rewrite layer on Metatheory e-graphs (prototype, opt-in)
+# Graph-level rewrite layer on Metatheory e-graphs; used by compile(...; search=...)
 include("EGraphRewrite.jl")
 
 # Tokenizers

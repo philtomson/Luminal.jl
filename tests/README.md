@@ -15,7 +15,7 @@ done
 Or run individual tests:
 
 ```bash
-julia --project=. tests/test_metatheory_v3.jl
+julia --project=. tests/test_egraph_rewrite.jl
 ```
 
 ## Test Inventory
@@ -26,32 +26,20 @@ julia --project=. tests/test_metatheory_v3.jl
 | `test_symbolic.jl` | Symbolic expression construction and evaluation |
 | `test_shape_tracker.jl` | ShapeTracker dimension operations |
 | `test.jl` | End-to-end graph build + execution (matmul) |
-| `test_lazy.jl` | Lazy graph evaluation — operations stay symbolic |
-
-### Algebraic Optimization (Rule-Based)
-| Test | Description |
-|------|-------------|
-| `test_algebraic_simplification.jl` | `(a * 1) + 0` simplifies to `a` |
-| `test_associativity.jl` | `(a + 2) + 3` simplifies to `a + 5` |
-| `test_commutativity.jl` | `(2 * a) * 3` simplifies to `6a` |
-| `test_symbolics_integration.jl` | Graph → SymbolicUtils conversion and simplification |
+| `test_lazy.jl` | Building a graph computes nothing until it is compiled and run |
+| `test_symbolic_slice.jl` | Slices with symbolic bounds (KV-cache update) on CPU and GPU |
 
 ### Compilation & Fusion
 | Test | Description |
 |------|-------------|
 | `test_compilation.jl` | End-to-end graph compilation to optimized execution plan |
 | `test_fusion.jl` | Fusion of element-wise operators into single kernels |
-| `test_optimizer.jl` | Graph-level canonicalization and simplification rules |
-| `test_new_rules.jl` | Verification of recently added optimization patterns |
+| `test_half_weights.jl` | Float16 matmul weights match Float32 |
 
-### Metatheory & E-Graphs (Search-Based)
+### E-Graph Rewrite Layer (Search-Based)
 | Test | Description |
 |------|-------------|
-| `test_metatheory_v3.jl` | Custom operator matching and rewriting via E-Graphs |
-| `test_metatheory_bridge.jl` | Integration layer between Luminal and Metatheory.jl |
-| `test_metatheory_optimizer.jl` | Automated search for optimal graph structures |
-| `test_metatheory_cost.jl` | Cost functions and extraction strategies for E-Graphs |
-| `test_metatheory_runtime.jl` | Integration tests for E-Graph optimized execution |
+| `test_egraph_rewrite.jl` | Graph ⇄ e-graph round trip, rewrite rules, merged projections with constant folding, and `compile(...; search=...)` |
 
 ### Hardware & Devices
 | Test | Description |

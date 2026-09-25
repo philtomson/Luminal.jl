@@ -8,7 +8,7 @@ using GPUArrays
  
 export AbstractDevice, CPUDevice, AbstractGPUDevice, CUDADevice, AMDDevice, 
        get_device, to_device, from_device, execute_with_capture,
-       reclaim!, available_memory, zero_tensor
+       reclaim!, available_memory, zero_tensor, synchronize_device
  
 abstract type AbstractDevice end
  
@@ -149,6 +149,15 @@ function execute_with_capture(::CUDADevice, f, cache::Dict)
 end
  
 execute_with_capture(::AbstractDevice, f, cache) = f()
+
+"""
+    synchronize_device(device)
+
+Block until work queued on `device` has finished (no-op on CPU).
+"""
+synchronize_device(::AbstractDevice) = nothing
+synchronize_device(::CUDADevice) = CUDA.synchronize()
+synchronize_device(::AMDDevice) = AMDGPU.synchronize()
 
 # HIP graph capture and replay. The caller opts in by putting a `:key` in
 # `cache` that identifies everything a replay would bake in (symbolic dim

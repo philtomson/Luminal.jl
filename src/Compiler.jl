@@ -1,19 +1,19 @@
 
-# Compiler.jl — Graph optimization using SymbolicUtils.jl rewrite rules
+# Compiler.jl — turns a Graph into an executable plan: one step per node, with
+# elementwise fusion, buffer reuse and aliasing, compile-time constant folding and
+# HIP graph capture. Graph-level rewrites live in EGraphRewrite.jl.
+#
+# SymbolicUtils builds the scalar expression of each fused elementwise kernel.
 
 using SymbolicUtils
-using SymbolicUtils: @rule, term, operation, arguments, Sym, BasicSymbolic, iscall
+using SymbolicUtils: term, Sym
 using SymbolicUtils.Code: toexpr
-using SymbolicUtils.Rewriters: Prewalk, Postwalk, Fixpoint, Chain, PassThrough
-using Luminal.SymbolicIntegration # For luminal_to_symbolic and luminal_relu
 # Import execution functions for compiled thunk
 using Luminal: execute_op, execute_op!, realize_view, to_device, realized_dims, eval_dim, execute_with_capture
 using CUDA
 using AMDGPU
 using GPUArrays
 using KernelAbstractions
-using RuntimeGeneratedFunctions
-RuntimeGeneratedFunctions.init(@__MODULE__)
 
 function fix_gpu_ast!(expr::Expr)
     if expr.head == :call
@@ -42,34 +42,6 @@ function fix_gpu_ast!(expr::Expr)
 end
 function fix_gpu_ast!(val)
     return val 
-end
-
-# --- Optimization Rules ---
-const RELU_RULE = @rule luminal_relu(~x) => term(max, ~x, 0.0f0; type=Real)
-const LOG_EXP_RULE = @rule log2(exp2(~x)) => ~x
-const EXP_LOG_RULE = @rule exp2(log2(~x)) => ~x
-const SQRT_SQRT_RULE = @rule (sqrt(~x))^2 => ~x
-const MAX_ID_RULE = @rule max(~x, ~x) => ~x
-const MIN_ID_RULE = @rule min(~x, ~x) => ~x
-const FUSED_MUL_ADD_RULE = @rule (~a * ~b) + ~c => luminal_fused_mul_add(~a, ~b, ~c)
-const FUSED_ADD_RELU_RULE = @rule luminal_relu(~a + ~b) => luminal_fused_add_relu(~a, ~b)
-const RECIP_CLEANUP = @rule luminal_recip(~x) => term(/, 1.0f0, ~x; type=Real)
-const LOOP_FUSION_RULE = @rule luminal_loop_in(luminal_loop_out(~x, ~loop, ~range, ~st), ~loop, ~range, ~st) => ~x
-
-const GENERAL_RULES = [
-    RELU_RULE, LOG_EXP_RULE, EXP_LOG_RULE, SQRT_SQRT_RULE, 
-    MAX_ID_RULE, MIN_ID_RULE, FUSED_MUL_ADD_RULE, FUSED_ADD_RELU_RULE, RECIP_CLEANUP, LOOP_FUSION_RULE
-]
-
-function optimize(expr)
-    general_rewriter = Postwalk(PassThrough(Chain(GENERAL_RULES)))
-    prev = nothing
-    result = expr
-    while !isequal(prev, result)
-        prev = result
-        result = general_rewriter(result)
-    end
-    return result
 end
 
 # --- Compiled Graph Structure ---
@@ -194,12 +166,28 @@ end
 # contiguous input instead of copying it: any Reshape, an Expand that doesn't
 # change the element count, and a Permute that only moves size-1 dims.
 function _alias_view(op, arg, sz)
+    op isa Luminal.Slice && return _alias_slice(op, arg, sz)
     (op isa Luminal.Reshape || op isa Luminal.Permute || op isa Luminal.Expand) || return nothing
     (arg isa DenseArray && length(arg) == prod(sz)) || return nothing
     if op isa Luminal.Permute
         issorted([d for d in op.dims if size(arg, d) != 1]) || return nothing
     end
     return Base.reshape(arg, sz)
+end
+
+# A slice is a contiguous block of a column-major array when every dim after the
+# first one it cuts has extent 1 -- e.g. a row range of a (rows, 1, 1) matmul
+# output. Then it is a reshaped range of the input's memory.
+function _alias_slice(op, arg, sz)
+    (arg isa DenseArray && prod(sz) > 0) || return nothing   # empty slices take the copy path
+    n = ndims(arg)
+    length(sz) == n || return nothing
+    k = findfirst(i -> sz[i] != size(arg, i), 1:n)
+    k === nothing && return Base.reshape(arg, sz)
+    all(sz[i] == 1 for i in k+1:n) || return nothing
+    start = ntuple(i -> i <= length(op.ranges) ? max(0, Int(op.ranges[i][1])) + 1 : 1, n)
+    off = LinearIndices(arg)[CartesianIndex(start)] - 1
+    return Base.reshape(view(vec(arg), off+1:off+prod(sz)), sz)
 end
 
 # --- Fusion Helpers ---
@@ -304,7 +292,8 @@ end
 
 """
     compile(graph; device=get_device(), retain=Int[], free_intermediates=true, fuse=true,
-            weight_dtype=Float32, capture=false)
+            weight_dtype=Float32, capture=false, fold=true,
+            search=:none, precision=false, search_inputs=nothing, search_cache=...)
 
 Build an executable `CompiledGraph`. With `free_intermediates=true` each
 intermediate buffer is released as soon as its last consumer has run (lowest
@@ -313,8 +302,14 @@ runs and are reused, reallocated only when a symbolic dimension changes their
 size, which suits graphs executed many times such as per-token decode.
 Retained outputs are overwritten by the next run in either mode.
 `fuse=true` merges chains of elementwise ops into single kernels.
-`weight_dtype=Float16` stores GPU weights that are only ever used as the left
+`fold=true` computes nodes that depend only on persistent tensors (weights) once,
+at compile time. `weight_dtype=Float16` stores GPU weights that are only ever used as the left
 operand of matmuls in Float16 (see `HalfWeight`); compute stays Float32.
+`search=:static` or `:measured` first runs the e-graph rewrite layer
+(`EGraphRewrite`) and compiles the graph it picks: by the static cost model, or
+by timing verified candidates (cached in `search_cache`). `precision=true` lets
+it choose Float16 weights per matmul. `retain` must list the outputs; the result
+maps the original input/output node ids. `:measured` needs static shapes.
 `capture=true` (AMD GPUs) records a run into a HIP graph and replays it on
 later runs with the same symbolic dims and input buffers (see
 `execute_with_capture`). Requires `free_intermediates=false`; pass inputs as
@@ -322,8 +317,16 @@ the same device arrays each run, or as host arrays copied into place.
 """
 function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(),
                  retain::Vector{Int}=Int[], free_intermediates::Bool=true, fuse::Bool=true,
-                 weight_dtype::Type=Float32, capture::Bool=false)
+                 weight_dtype::Type=Float32, capture::Bool=false, fold::Bool=true,
+                 search::Symbol=:none, precision::Bool=false, search_inputs=nothing,
+                 search_cache::Union{Nothing,String}=joinpath(homedir(), ".cache", "Luminal.jl", "search"))
     capture && free_intermediates && error("capture=true requires free_intermediates=false")
+    if search !== :none
+        return Luminal.EGraphRewrite.compile_searched(graph; search=search, precision=precision,
+            search_inputs=search_inputs, search_cache=search_cache, device=device, retain=retain,
+            free_intermediates=free_intermediates, fuse=fuse, weight_dtype=weight_dtype,
+            capture=capture, fold=fold)
+    end
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -335,29 +338,15 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         consumer_count[id] += 1
     end
 
-    # 1. Identify Fusible Intermediates
-    compile_device = device 
-    fusible_intermediates = Set{Int}()
-    
-    # An elementwise node is fused into its consumer when that is its only use,
-    # the consumer is elementwise too, and the consumer reads it unchanged.
+    compile_device = device
     consumers = [Tuple{Int, ShapeTracker}[] for _ in graph.nodes]
     for (cid, node) in enumerate(graph.nodes), (id, _, st) in node.inputs
         push!(consumers[id], (cid, st))
     end
-    for (node_id, node) in enumerate(graph.nodes)
-        fuse || break
-        (is_elementwise(node.op) && !(node.op isa Luminal.Constant)) || continue
-        consumer_count[node_id] == 1 && length(consumers[node_id]) == 1 || continue
-        haskey(graph.tensors, (node_id, 1)) && continue
-        cid, st = consumers[node_id][1]
-        c_op = graph.nodes[cid].op
-        (is_elementwise(c_op) && !(c_op isa Luminal.Constant)) || continue
-        _is_trivial_view(st, graph.shapes[node_id]) && push!(fusible_intermediates, node_id)
-    end
 
-    # 2. Setup Results array (weights are pre-populated)
+    # 1. Results array: persistent tensors (weights) are pre-populated
     results = Vector{Any}(undef, length(graph.nodes))
+    persistent = falses(length(graph.nodes))
     for (node_id, node) in enumerate(graph.nodes)
         if haskey(graph.tensors, (node_id, 1))
             data = graph.tensors[(node_id, 1)]
@@ -365,11 +354,57 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 data = Luminal.half_weight(data)
             end
             results[node_id] = data
+            persistent[node_id] = true
         end
     end
 
+    # 2. Constant folding: a node whose inputs are all persistent (weights, or nodes
+    # folded here) and whose shapes are static is computed once, now, and becomes
+    # persistent itself -- e.g. weights concatenated by a rewrite.
+    folded = falses(length(graph.nodes))
+    for (node_id, node) in enumerate(graph.nodes)
+        fold || break
+        (persistent[node_id] || isempty(node.inputs)) && continue
+        all(persistent[id] for (id, _, _) in node.inputs) || continue
+        val = try
+            none = Dict{Symbol,Int}()
+            dims = [eval_dim(d) for d in realized_dims(graph.shapes[node_id])]
+            args = [realize_view(results[id], evaluate_shapes(st, none)) for (id, _, st) in node.inputs]
+            out = Luminal.zero_tensor(compile_device, Float32, dims...)
+            execute_op!(out, evaluate_op_shapes(node.op, none), args...)
+            out
+        catch
+            nothing   # e.g. symbolic shapes: leave it to run time
+        end
+        val === nothing && continue
+        results[node_id] = val
+        persistent[node_id] = folded[node_id] = true
+    end
+    for node_id in findall(folded)
+        if !(node_id in retain) && all(folded[c] for (c, _) in consumers[node_id])
+            results[node_id] = nothing          # only fed other folded nodes
+        elseif _is_matmul_weight(graph, node_id, results[node_id], consumers, retain, weight_dtype)
+            results[node_id] = Luminal.half_weight(results[node_id])
+        end
+    end
+
+    # 3. Identify fusible intermediates. An elementwise node is fused into its
+    # consumer when that is its only use, the consumer is elementwise too, and the
+    # consumer reads it unchanged.
+    fusible_intermediates = Set{Int}()
+    for (node_id, node) in enumerate(graph.nodes)
+        fuse || break
+        (is_elementwise(node.op) && !(node.op isa Luminal.Constant)) || continue
+        consumer_count[node_id] == 1 && length(consumers[node_id]) == 1 || continue
+        persistent[node_id] && continue
+        cid, st = consumers[node_id][1]
+        c_op = graph.nodes[cid].op
+        (is_elementwise(c_op) && !(c_op isa Luminal.Constant)) || continue
+        _is_trivial_view(st, graph.shapes[node_id]) && push!(fusible_intermediates, node_id)
+    end
+
     steps = Base.Function[]
-    processed = fill(false, length(graph.nodes))
+    processed = copy(folded)   # folded nodes need no step
     owned = fill(false, length(graph.nodes))  # buffers allocated by this graph's own steps
     dynamic = false  # true if any shape depends on symbolic dims (sym_vals)
 
@@ -437,7 +472,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 if !is_persistent
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
                     sz = Tuple(dims_int)
-                    alias = length(step_args) == 1 ? _alias_view(op, step_args[1], sz) : nothing
+                    alias = length(step_args) == 1 ? _alias_view(run_op, step_args[1], sz) : nothing
                     if alias !== nothing
                         res[node_id] = alias
                         aliased[] = true
@@ -455,7 +490,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 # 4. Free dead inputs
                 for (id, _, _) in input_specs
                     live[id] -= 1
-                    if free_intermediates && live[id] == 0 && !haskey(graph.tensors, (id, 1))
+                    if free_intermediates && live[id] == 0 && !persistent[id]
                         _release!(res, id, owned)
                     end
                 end
@@ -495,7 +530,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
 
                     for (id, _, _) in group_inputs
                         live[id] -= 1
-                        if free_intermediates && live[id] == 0 && !haskey(graph.tensors, (id, 1))
+                        if free_intermediates && live[id] == 0 && !persistent[id]
                             _release!(res, id, owned)
                         end
                     end

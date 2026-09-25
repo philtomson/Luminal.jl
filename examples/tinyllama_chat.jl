@@ -15,11 +15,14 @@ using Luminal.NN
 using Printf
 
 function main()
-    model_dir    = length(ARGS) >= 1 ? ARGS[1] : "/home/phil/devel/Luminal.jl/tinyllama_chat"
-    prompt       = length(ARGS) >= 2 ? ARGS[2] : "Once upon a time"
-    max_tokens   = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 100
-    rope_base    = length(ARGS) >= 4 ? parse(Float32, ARGS[4]) : 10000.0f0
+    args         = filter(a -> !startswith(a, "--"), ARGS)   # positionals; flags anywhere
+    model_dir    = length(args) >= 1 ? args[1] : "/home/phil/devel/Luminal.jl/tinyllama_chat"
+    prompt       = length(args) >= 2 ? args[2] : "Once upon a time"
+    max_tokens   = length(args) >= 3 ? parse(Int, args[3]) : 100
+    rope_base    = length(args) >= 4 ? parse(Float32, args[4]) : 10000.0f0
     chat_mode    = "--chat" in ARGS
+    search_arg   = findfirst(a -> startswith(a, "--search="), ARGS)
+    search       = search_arg === nothing ? :none : Symbol(split(ARGS[search_arg], "=")[2])
 
     # Apply chat template if requested
     if chat_mode
@@ -73,7 +76,8 @@ function main()
                                max_new_tokens=max_tokens,
                                max_seq=256,
                                device=device,
-                               rope_base=rope_base)  # Decided by command-line or default
+                               rope_base=rope_base,  # Decided by command-line or default
+                               search=search)
     t1 = time()
 
     println(response)

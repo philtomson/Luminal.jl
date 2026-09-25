@@ -28,15 +28,20 @@ using Metatheory.VecExprModule: v_isexpr, v_head, v_children
 import ..Luminal
 using ..Luminal: Graph, ShapeTracker, realized_dims, add_op!, Op, DimType
 
-export Rewriter, to_egraph, saturate_graph!, choice_groups, extract_graph, static_cost
+export Rewriter, to_egraph, saturate_graph!, merge_projections!, choice_groups, decisions,
+       extract_graph, static_cost, measured_search
 
 # ---------------------------------------------------------------------------
 # Shape analysis
 # ---------------------------------------------------------------------------
 
+# Output dims of an e-class, and whether it depends only on weights (then compile()
+# constant-folds it and it costs nothing at run time).
 struct Shp
     dims::Tuple
+    isconst::Bool
 end
+Shp(dims::Tuple) = Shp(dims, false)
 
 # Views and op types are side tables (e-graph literals must hash by value).
 mutable struct BridgeCtx
@@ -44,12 +49,14 @@ mutable struct BridgeCtx
     view_index::Dict{Any, Int}
     optypes::Dict{Symbol, DataType}
     weights::Set{Int}          # node ids of persistent tensors (graph.tensors)
+    joint::Vector{Any}         # (label, classes, signature) from multi-node rewrites
 end
 const CTX = Ref{BridgeCtx}()   # read by `make`, which has no other way to reach it
 
 _lit(g, id) = get_constant(g, v_head(g[id].nodes[1]))
 _dims(g, id) = (d = g[id].data; d === nothing ? nothing : d.dims)
 _isone(x) = x isa Integer && x == 1
+_isconst(g, id) = (d = g[id].data; d !== nothing && d.isconst)
 
 function _broadcast(a::Tuple, b::Tuple)
     n = max(length(a), length(b))
@@ -71,10 +78,25 @@ end
 
 function EGraphs.make(g::EGraph{Expr,Shp}, n::VecExpr)
     v_isexpr(n) || return nothing
-    h = get_constant(g, v_head(n))
     ch = v_children(n)
+    d = _make_dims(g, get_constant(g, v_head(n)), ch)
+    d === nothing && return nothing
+    return Shp(d.dims, length(ch) > 1 && all(c -> _isconst(g, c), ch[2:end]))
+end
+
+function _make_dims(g, h, ch)
     if h === :xView
-        return Shp(Tuple(realized_dims(CTX[].views[_lit(g, ch[2])[1]])))
+        return Shp(Tuple(realized_dims(CTX[].views[_lit(g, ch[1])[1]])))
+    elseif h === :xPad
+        a = _dims(g, ch[2]); a === nothing && return nothing
+        p = _lit(g, ch[1])[1]
+        all(x -> x isa Integer, a) || return nothing
+        return Shp(ntuple(i -> i <= length(p) ? a[i] + p[i][1] + p[i][2] : a[i], length(a)))
+    elseif h === :xSlice
+        a = _dims(g, ch[2]); a === nothing && return nothing
+        r = _lit(g, ch[1])[1]
+        all(x -> x isa Integer, a) || return nothing
+        return Shp(ntuple(i -> i <= length(r) ? min(r[i][2], a[i]) - max(r[i][1], 0) : a[i], length(a)))
     elseif h === :xReshape
         return Shp(Tuple(_lit(g, ch[1])[1]))
     elseif h === :xExpand
@@ -97,7 +119,7 @@ end
 
 function EGraphs.join(a::Shp, b::Shp)
     isequal(a.dims, b.dims) || error("EGraphRewrite: merged e-classes disagree on shape: $(a.dims) vs $(b.dims)")
-    return a
+    return Shp(a.dims, a.isconst || b.isconst)
 end
 
 # ---------------------------------------------------------------------------
@@ -145,9 +167,10 @@ shared) and a synthetic root over `roots`, the node ids that must survive.
 """
 function to_egraph(graph::Graph, roots::Vector{Int})
     ctx = BridgeCtx(ShapeTracker[], Dict{Any,Int}(), Dict{Symbol,DataType}(),
-                    Set{Int}(first(k) for k in keys(graph.tensors)))
+                    Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
-    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.Expand)
+    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.Expand,
+              Luminal.Pad, Luminal.Slice)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
@@ -169,7 +192,9 @@ function to_egraph(graph::Graph, roots::Vector{Int})
         id = addexpr!(g, ex)
         ec = g[id]
         if ec.data === nothing
-            ec.data = Shp(dims)
+            isconst = nid in ctx.weights ||
+                      (!isempty(node.inputs) && all(_isconst(g, class_of[i]) for (i, _, _) in node.inputs))
+            ec.data = Shp(dims, isconst)
         elseif !isequal(ec.data.dims, dims)
             error("EGraphRewrite: shape analysis gives $(ec.data.dims) for node $nid ($(typeof(op))) but the graph has $dims")
         end
@@ -264,6 +289,15 @@ function static_cost(g, n::VecExpr)
     h = get_constant(g, v_head(n))
     h in (:xIn, :xView, :xReshape, :xRoots) && return 0.0
     ch = v_children(n)
+    length(ch) > 1 && all(c -> _isconst(g, c), ch[2:end]) && return 0.0   # constant-folded
+    if h === :xSlice
+        a = _dims(g, ch[2])
+        a === nothing && return LAUNCH_BYTES
+        r = _lit(g, ch[1])[1]
+        out = ntuple(i -> i <= length(r) ? min(r[i][2], a[i]) - max(r[i][1], 0) : a[i], length(a))
+        k = findfirst(i -> out[i] != a[i], 1:length(a))
+        (k === nothing || all(out[i] == 1 for i in k+1:length(a))) && return 0.0   # aliases
+    end
     ins = [_numel(_dims(g, c)) for c in ch[2:end]]
     if h === :xMatMulF16
         return 2.0 * ins[1] + 4.0 * sum(ins[2:end]) + LAUNCH_BYTES
@@ -347,6 +381,93 @@ function _dag_extract(g, choices)
     return Dict(id => (b[1], b[2]) for (id, b) in best)
 end
 
+# Total cost of the DAG reachable from `root` under `pick` (each class counted
+# once), or Inf if the picks form a cycle.
+function _total_cost(g, pick, root)
+    state = Dict{Id, Int8}()          # 1 = on stack, 2 = done
+    total = 0.0
+    function visit(c)
+        c = find(g, c)
+        st = get(state, c, Int8(0))
+        st == 2 && return true
+        st == 1 && return false       # back edge: cycle
+        state[c] = 1
+        n = pick[c]
+        if v_isexpr(n)
+            for ch in v_children(n)
+                visit(ch) || return false
+            end
+        end
+        total += static_cost(g, n)
+        state[c] = 2
+        return true
+    end
+    return visit(root) ? total : Inf
+end
+
+function _reachable(g, pick, root)
+    seen = Set{Id}()
+    stack = [find(g, root)]
+    while !isempty(stack)
+        c = pop!(stack)
+        c in seen && continue
+        push!(seen, c)
+        n = pick[c]
+        v_isexpr(n) && for ch in v_children(n); push!(stack, find(g, ch)); end
+    end
+    return seen
+end
+
+# Greedy extraction decides one class at a time and cannot see that a subgraph
+# it avoids is needed anyway by another consumer. Refine: try switching any class
+# to any alternative (respecting forced choices). A switch can pull classes into
+# the DAG that are currently picked assuming they stand alone (e.g. the links of
+# a scaled-matmul chain); re-pick those for their marginal cost given what the
+# DAG already contains, then keep the move if the total DAG cost drops.
+function _refine!(g, pick, choices, root, est)
+    best = _total_cost(g, pick, root)
+    S = _reachable(g, pick, root)
+    marginal(m, S) = static_cost(g, m) +
+        (v_isexpr(m) ? sum((find(g, ch) in S ? 0.0 : get(est, find(g, ch), Inf) for ch in v_children(m)); init=0.0) : 0.0)
+    improved = true
+    while improved
+        improved = false
+        for id in sort!(collect(S))
+            haskey(choices, id) && continue
+            ec = g[id]
+            length(ec.nodes) > 1 || continue
+            for n in ec.nodes
+                (v_isexpr(n) && n !== pick[id]) || continue
+                all(c -> haskey(pick, find(g, c)), v_children(n)) || continue
+                saved = Dict{Id, VecExpr}(id => pick[id])
+                pick[id] = n
+                for _ in 1:3                      # complete newly reachable classes
+                    S2 = _reachable(g, pick, root)
+                    for k in setdiff(S2, S)
+                        haskey(choices, k) && continue
+                        alts = [m for m in g[k].nodes if v_isexpr(m) &&
+                                all(c -> haskey(pick, find(g, c)), v_children(m))]
+                        isempty(alts) && continue
+                        m = argmin(m -> marginal(m, S2), alts)
+                        if m !== pick[k]
+                            haskey(saved, k) || (saved[k] = pick[k])
+                            pick[k] = m
+                        end
+                    end
+                end
+                t = _total_cost(g, pick, root)
+                if t < best - 1e-6
+                    best, improved = t, true
+                    S = _reachable(g, pick, root)
+                else
+                    for (k, m) in saved; pick[k] = m; end
+                end
+            end
+        end
+    end
+    return best
+end
+
 """
     extract_graph(rw; choices=Dict{Id,Symbol}()) -> (graph, idmap)
 
@@ -358,7 +479,9 @@ persistent tensors are carried over.
 function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
     g = rw.g
     CTX[] = rw.ctx
-    cost = _dag_extract(g, choices)
+    greedy = _dag_extract(g, choices)
+    pick = Dict(id => b[2] for (id, b) in greedy)
+    _refine!(g, pick, choices, g.root, Dict(id => b[1] for (id, b) in greedy))
     ng = Graph()
     memo = Dict{Id, Int}()
     idmap = Dict{Int, Int}()
@@ -368,7 +491,7 @@ function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
         haskey(memo, cid) && return memo[cid]
         cid in visiting && error("EGraphRewrite: extraction chose a cycle")
         push!(visiting, cid)
-        n = cost[cid][2]
+        n = pick[cid]
         h = get_constant(g, v_head(n))
         ch = v_children(n)
         params = _lit(g, ch[1])
@@ -382,7 +505,7 @@ function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
         else
             inputs = Tuple{Int, Int, ShapeTracker}[]
             for c in ch[2:end]
-                cn = cost[find(g, c)][2]
+                cn = pick[find(g, c)]
                 if get_constant(g, v_head(cn)) === :xView
                     src = build(v_children(cn)[2])
                     push!(inputs, (src, 0, deepcopy(rw.ctx.views[_lit(g, v_children(cn)[1])[1]])))
@@ -401,6 +524,266 @@ function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
         idmap[r] = build(rw.class_of[r])
     end
     return ng, idmap
+end
+
+# ---------------------------------------------------------------------------
+# Multi-node rewrite: merged projections
+# ---------------------------------------------------------------------------
+
+"""
+    merge_projections!(rw; precision=false) -> Int
+
+For weight matmuls that share an input (q/k/v, gate/up), add the alternative
+`Slice_i(MatMul(concat(W_1..W_n), x))` to each member's e-class. The concat is
+Pad + Add over weights, which compile() constant-folds. Metatheory patterns
+are single-rooted, so this runs as a pass over the e-graph. Each merged group
+is recorded as one joint decision (all members switch together). Returns the
+number of groups merged.
+"""
+function merge_projections!(rw::Rewriter; precision::Bool=false)
+    g = rw.g
+    CTX[] = rw.ctx
+    groups = Dict{Id, Vector{Tuple{Id, Id}}}()      # input class => [(matmul class, weight class)]
+    for (_, ec) in g.classes, n in ec.nodes
+        (v_isexpr(n) && get_constant(g, v_head(n)) === :xMatMul) || continue
+        ch = v_children(n)
+        w, x = find(g, ch[2]), find(g, ch[3])
+        wd = _dims(g, w)
+        (_is_weight(g, g[w]) && wd !== nothing && length(wd) == 2) || continue
+        push!(get!(groups, x, Tuple{Id, Id}[]), (find(g, ec.id), w))
+    end
+    merged = 0
+    for (x, members) in sort!(collect(groups), by = first)
+        members = unique(last, sort!(members))
+        length(members) >= 2 || continue
+        K = _dims(g, members[1][2])[2]
+        all(_dims(g, w)[2] == K for (_, w) in members) || continue
+        rows = [_dims(g, w)[1] for (_, w) in members]
+        total = sum(rows)
+        wcat, off = nothing, 0
+        for ((_, w), r) in zip(members, rows)
+            pad = Expr(:call, :xPad, ([(off, total - off - r), (0, 0)] |> _freeze,), g[w])
+            wcat = wcat === nothing ? pad : Expr(:call, :xAdd, (), wcat, pad)
+            off += r
+        end
+        wc = addexpr!(g, wcat)
+        y = addexpr!(g, Expr(:call, :xMatMul, (), g[wc], g[x]))
+        precision && union!(g, y, addexpr!(g, Expr(:call, :xMatMulF16, (), g[wc], g[x])))
+        rebuild!(g)
+        rank = length(_dims(g, y))
+        off = 0
+        classes = Id[]
+        for ((mc, _), r) in zip(members, rows)
+            ranges = ntuple(i -> i == 1 ? (off, off + r) : (0, typemax(Int)), rank)
+            sl = addexpr!(g, Expr(:call, :xSlice, (ranges,), g[find(g, y)]))
+            union!(g, mc, sl)
+            push!(classes, mc)
+            off += r
+        end
+        rebuild!(g)
+        push!(rw.ctx.joint, (string("merge ", Tuple(rows), " x ", _dims(g, x)), classes))
+        merged += 1
+    end
+    return merged
+end
+
+# ---------------------------------------------------------------------------
+# Decisions and measured search
+# ---------------------------------------------------------------------------
+
+"""
+    decisions(rw) -> Vector{(label, options)}
+
+What the search chooses between. Each option is a `choices` dict for
+`extract_graph` (the first, empty, option leaves the pick to the cost model).
+Per-class choice groups get one option per alternative signature; merged
+projections found by `merge_projections!` get one joint option that moves every
+member of every same-shaped group (e.g. all 22 layers' q/k/v) to the merged form.
+"""
+function decisions(rw::Rewriter)
+    g = rw.g
+    out = Tuple{String, Vector{Dict{Id, String}}}[]
+    for (key, cls, sigs) in choice_groups(rw)
+        opts = [Dict{Id, String}()]
+        for sig in sigs
+            push!(opts, Dict{Id, String}(find(g, c) => sig for c in cls))
+        end
+        push!(out, (string(key[2], ": ", join(sigs, " | ")), opts))
+    end
+    joint = Dict{String, Vector{Id}}()
+    for (label, classes) in rw.ctx.joint
+        append!(get!(joint, label, Id[]), classes)
+    end
+    for (label, classes) in sort!(collect(joint), by = first)
+        forced = Dict{Id, String}()
+        for c in classes
+            sig = [signature(g, n) for n in g[find(g, c)].nodes if v_isexpr(n) && get_constant(g, v_head(n)) === :xSlice]
+            isempty(sig) || (forced[find(g, c)] = first(sig))
+        end
+        push!(out, (label, [Dict{Id, String}(), forced]))
+    end
+    return out
+end
+
+_option_name(opt) = isempty(opt) ? "static" : first(values(opt))
+
+"""
+    measured_search(rw, make_runner; rounds=5, steps=10, margin=0.01, log=true,
+                    cache_dir=nothing, cache_tag="")
+
+Coordinate descent over `decisions(rw)`. `make_runner(choices)` must build the
+candidate graph, check it against a reference, and return a zero-argument
+function that runs one synchronized step -- or `nothing` to reject it.
+
+A candidate replaces the incumbent only if, timed in `rounds` interleaved
+rounds of `steps` steps each, its median per-step time is lower by more than
+`margin` and it wins at least 80% of the rounds; single timings on a GPU vary
+by a few percent. Returns `(choices, per-step time of the incumbent)`.
+
+With `cache_dir`, the winning option per decision is stored in a file keyed by
+the decision set and `cache_tag` (e.g. the device); a later search of the same
+graph applies those choices after one verification instead of timing again.
+"""
+function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10,
+                         margin::Float64=0.01, log::Bool=true,
+                         cache_dir::Union{Nothing,String}=nothing, cache_tag::AbstractString="")
+    function timed(run)
+        t = time()
+        for _ in 1:steps; run(); end
+        return (time() - t) / steps
+    end
+    function median_(v)
+        s = sort(v); n = length(s)
+        return isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2
+    end
+    ds = decisions(rw)
+    cache_file = cache_dir === nothing ? nothing :
+        joinpath(cache_dir, string(hash((cache_tag, [(l, map(_option_name, o)) for (l, o) in ds])), base = 16) * ".txt")
+    if cache_file !== nothing && isfile(cache_file)
+        kept = Dict{String, String}()
+        for line in eachline(cache_file)
+            parts = split(line, '\t')
+            length(parts) == 2 && (kept[parts[2]] = parts[1])
+        end
+        cached = Dict{Id, String}()
+        for (label, opts) in ds, o in opts
+            get(kept, label, nothing) == _option_name(o) && merge!(cached, o)
+        end
+        run = make_runner(cached)
+        if run !== nothing
+            log && println("  using cached search result ", cache_file)
+            return cached, median_([(run(); timed(run)) for _ in 1:rounds])
+        end
+        log && println("  cached choices failed verification; searching again")
+    end
+
+    current = Dict{Id, String}()
+    kept_labels = Tuple{String, String}[]
+    incumbent = make_runner(current)
+    incumbent === nothing && error("measured_search: the static extraction failed verification")
+    for _ in 1:3; incumbent(); end
+    for (label, opts) in ds
+        for opt in opts[2:end]
+            trial = merge(current, opt)
+            cand = make_runner(trial)
+            if cand === nothing
+                log && println("  rejected (verification): ", label)
+                continue
+            end
+            for _ in 1:3; cand(); end
+            ti, tc = Float64[], Float64[]
+            for _ in 1:rounds
+                push!(ti, timed(incumbent)); push!(tc, timed(cand))
+            end
+            wins = count(tc .< ti)
+            mi, mc = median_(ti), median_(tc)
+            keep = mc < mi * (1 - margin) && wins >= ceil(Int, 0.8 * rounds)
+            log && println(string("  ", keep ? "KEEP  " : "      ", rpad(label, 48)[1:min(end, 48)],
+                                  " -> ", rpad(_option_name(opt), 34), round(1e3mi, digits=2), " -> ",
+                                  round(1e3mc, digits=2), " ms  (", wins, "/", rounds, " rounds)"))
+            if keep
+                current, incumbent = trial, cand
+                filter!(kl -> kl[2] != label, kept_labels)
+                push!(kept_labels, (_option_name(opt), label))
+            end
+            GC.gc()
+        end
+    end
+    if cache_file !== nothing
+        mkpath(dirname(cache_file))
+        open(cache_file, "w") do io
+            for (opt, label) in kept_labels; println(io, opt, '\t', label); end
+        end
+    end
+    return current, median_([timed(incumbent) for _ in 1:rounds])
+end
+
+# ---------------------------------------------------------------------------
+# compile(...; search=...) entry point
+# ---------------------------------------------------------------------------
+
+"""
+    RewrittenGraph
+
+A compiled rewritten graph addressed by the *original* graph's node ids:
+calling it takes inputs keyed by original ids, and indexing its results with
+an original retained id returns that output.
+"""
+struct RewrittenGraph
+    cg::Any                    # Luminal.CompiledGraph of the rewritten graph
+    idmap::Dict{Int, Int}      # original node id => rewritten node id
+end
+
+struct RemappedResults
+    results::Vector{Any}
+    idmap::Dict{Int, Int}
+end
+Base.getindex(r::RemappedResults, id::Int) = r.results[r.idmap[id]]
+
+function (r::RewrittenGraph)(inputs::Dict; kwargs...)
+    mapped = Dict{Int, Any}(r.idmap[k] => v for (k, v) in inputs if haskey(r.idmap, k))
+    return RemappedResults(r.cg(mapped; kwargs...), r.idmap)
+end
+
+_input_ids(graph) = [nid for (nid, n) in enumerate(graph.nodes)
+                     if n.op isa Luminal.Function && n.op.name == "InputTensor" && !haskey(graph.tensors, (nid, 1))]
+
+function compile_searched(graph::Graph; search::Symbol, precision::Bool, search_inputs, search_cache,
+                          device, retain::Vector{Int}, kwargs...)
+    search in (:static, :measured) || error("search must be :none, :static or :measured")
+    isempty(retain) && error("compile(...; search=$search) needs `retain`: the node ids to keep")
+    rw = to_egraph(graph, retain)
+    saturate_graph!(rw; precision=precision)
+    merge_projections!(rw; precision=precision)
+    function build(choices)
+        ng, m = extract_graph(rw; choices=choices)
+        cg = Luminal.compile(ng; device=device, retain=[m[r] for r in retain if haskey(m, r)], kwargs...)
+        return RewrittenGraph(cg, m)
+    end
+    search === :static && return build(Dict{Id, String}())
+
+    # Default inputs: zeros, placed on the device once (host inputs would be copied
+    # in on every timed run).
+    inputs = search_inputs !== nothing ? search_inputs : Dict{Int, Any}(
+        id => Luminal.to_device(zeros(Float32, (Int(Luminal.eval_dim(d)) for d in realized_dims(graph.shapes[id]))...), device)
+        for id in _input_ids(graph))
+    outs = [r for r in retain if !(r in _input_ids(graph))]
+    ref = Luminal.compile(graph; device=device, retain=retain, kwargs...)(inputs; device=device)
+    reference = Dict(o => Array{Float32}(ref[o]) for o in outs)
+    ref = nothing; GC.gc()
+    function make_runner(choices)
+        r = build(choices)
+        res = r(inputs; device=device)
+        for o in outs
+            got = Array{Float32}(res[o])
+            scale = max(maximum(abs, reference[o]; init=0f0), 1f-6)
+            maximum(abs.(got .- reference[o]); init=0f0) / scale < 1f-3 || return nothing
+        end
+        return () -> (r(inputs; device=device); Luminal.synchronize_device(device); nothing)
+    end
+    choices, _ = measured_search(rw, make_runner; cache_dir=search_cache,
+                                 cache_tag=string(nameof(typeof(device)), precision, kwargs))
+    return build(choices)
 end
 
 end # module EGraphRewrite

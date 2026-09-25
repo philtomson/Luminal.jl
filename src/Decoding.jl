@@ -36,6 +36,10 @@ End-to-end greedy text generation for Llama-style (decoder-only) models.
 - `max_seq`       : KV cache capacity (default 2048)
 - `rope_base`     : RoPE base frequency (500000 for Llama-3, 10000 for Llama-2/Phi-3)
 - `device`        : Device to run on; defaults to `get_device()`
+- `search`        : `:none`, `:static` or `:measured`: compile the decode graph
+                    through the e-graph rewrite layer (see `compile`). On GPU the
+                    search also chooses Float16 weights per matmul. `:measured`
+                    results are cached per model and device.
 """
 function llama_generate(model,
                          tokenizer::LlamaTokenizer,
@@ -44,7 +48,8 @@ function llama_generate(model,
                          max_new_tokens::Int=200,
                          max_seq::Int=2048,
                          rope_base::Float32=500000f0,
-                         device=nothing)
+                         device=nothing,
+                         search::Symbol=:none)
 
     target_device = (device === nothing ? get_device() : device)
 
@@ -147,8 +152,15 @@ function llama_generate(model,
     )
     # The decode graph is shape-static, so on AMD GPUs it is captured once as a
     # HIP graph and replayed each token.
-    exec_fn = compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
-                      weight_dtype=wdtype, capture=target_device isa Luminal.AMDDevice)
+    capture = target_device isa Luminal.AMDDevice
+    exec_fn = if search === :none
+        compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
+                weight_dtype=wdtype, capture=capture)
+    else
+        @info "Searching equivalent decode graphs ($search)..."
+        compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
+                capture=capture, search=search, precision=wdtype === Float16)
+    end
 
     for step in 0:(max_new_tokens - 2)
         pos = start_pos + step
