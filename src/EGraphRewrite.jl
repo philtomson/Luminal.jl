@@ -320,8 +320,22 @@ function static_cost(g, n::VecExpr)
         (k === nothing || all(out[i] == 1 for i in k+1:length(a))) && return 0.0   # aliases
     end
     ins = [_numel(_dims(g, c)) for c in ch[2:end]]
+    # Weight matmul (2D left operand, weight-sized): the Float16 kernel is a GEMV
+    # that loops over the N right-hand columns, so its cost grows ~linearly in N,
+    # while rocBLAS's Float32 GEMM stays bandwidth-bound far longer. Calibrated on
+    # TinyLlama prefill (Radeon 8060S): f16/f32 time is ~0.55 at N=1, ~1 at N=16,
+    # ~2.6 at N=64, ~3.3 at N=256.
+    wd = h in (:xMatMul, :xMatMulF16) ? _dims(g, ch[2]) : nothing
+    if wd !== nothing && length(wd) == 2 && all(x -> x isa Integer, wd) && ins[1] >= 1 << 16
+        N = max(1, ins[2] ÷ max(1, wd[2]))
+        if h === :xMatMulF16
+            # Group sizes cost the same to the model; prefer the default on ties.
+            tie = _lit(g, ch[1])[1] == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
+            return 2.0 * ins[1] * (1 + N / 12) + 4.0 * ins[2] + LAUNCH_BYTES + tie
+        end
+        return 4.0 * ins[1] * (1 + N / 64) + 4.0 * ins[2] + LAUNCH_BYTES
+    end
     if h === :xMatMulF16
-        # Group sizes cost the same to the model; prefer the default on ties.
         tie = _lit(g, ch[1])[1] == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
         return 2.0 * ins[1] + 4.0 * sum(ins[2:end]) + LAUNCH_BYTES + tie
     elseif h === :xMatMul || h === :xMatMulT || h === :xMul || h === :xAdd
@@ -675,12 +689,15 @@ the decision set and `cache_tag` (e.g. the device); a later search of the same
 graph applies those choices after one verification instead of timing again.
 """
 function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10,
-                         margin::Float64=0.01, log::Bool=true,
+                         round_budget::Float64=0.3, margin::Float64=0.01, log::Bool=true,
                          cache_dir::Union{Nothing,String}=nothing, cache_tag::AbstractString="")
+    # Steps per timing round: `steps`, reduced so a round takes about `round_budget`
+    # seconds (a prefill graph can take ~0.5 s per run).
+    nsteps = Ref(steps)
     function timed(run)
         t = time()
-        for _ in 1:steps; run(); end
-        return (time() - t) / steps
+        for _ in 1:nsteps[]; run(); end
+        return (time() - t) / nsteps[]
     end
     function median_(v)
         s = sort(v); n = length(s)
@@ -702,6 +719,8 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
         run = make_runner(cached)
         if run !== nothing
             log && println("  using cached search result ", cache_file)
+            run(); t1 = (t = time(); run(); time() - t)
+            nsteps[] = clamp(round(Int, round_budget / max(t1, 1e-6)), 1, steps)
             return cached, median_([(run(); timed(run)) for _ in 1:rounds])
         end
         log && println("  cached choices failed verification; searching again")
@@ -712,6 +731,8 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
     incumbent = make_runner(current)
     incumbent === nothing && error("measured_search: the static extraction failed verification")
     for _ in 1:3; incumbent(); end
+    t1 = (t = time(); incumbent(); time() - t)
+    nsteps[] = clamp(round(Int, round_budget / max(t1, 1e-6)), 1, steps)
     for (label, opts) in ds
         for opt in opts[2:end]
             trial = merge(current, opt)

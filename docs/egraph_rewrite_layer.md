@@ -124,6 +124,26 @@ One lesson: variants the cost model can't tell apart must tie-break toward the
 known-good default. Extraction by rule order picked group 64 and started the
 search at 17.8 ms.
 
+**Prefill** (`examples/prefill_search.jl`, ms per run of the compiled prefill graph):
+
+| Prompt tokens | Float32 | Float16 | static search | measured search |
+|---|---|---|---|---|
+| 16 | 45.4 | 48.2 | 48.0 | **36.8** |
+| 64 | 69.2 | 179.3 | 68.5 | **62.3** |
+| 256 | 227.3 | 736.1 | 227.4 | **222.9** |
+
+The Float16 kernel is a GEMV that loops over the prompt's columns, so for
+prefill it loses to rocBLAS's Float32 GEMM from about 16 tokens up (3x at 256).
+The static cost model now accounts for the column count N (calibrated on these
+measurements), so the static pick is right from 64 tokens up. The measured
+search finds mixes no fixed choice gives: at 16 tokens Float32 for lm_head and
+gate/up but Float16 with 128-thread groups for the 2048-row projections (-19% vs
+Float32), and merged projections at 64 and 256 tokens. Steps per timing round
+now scale to the graph's run time, which cut the 256-token search from 62 to 9
+minutes. `llama_generate` pads prompts to power-of-two buckets when `search` is
+set (causal attention: the padding cannot change the prompt's positions), and
+by default uses Float16 prefill weights only for prompts of 8 tokens or fewer.
+
 Latest full search (kernel variants, group size 256 default, merges): **14.54
 ms/token** with Float16, vs 14.9 for the plain Float16 path.
 
@@ -187,9 +207,9 @@ folding and slice aliasing); `compile(...; search=...)`; old paths deleted.
 Next:
 1. **Kernel alternatives as rules:** GEMV vs GEMM, HalfWeight workgroup size,
    transpose flags. These are where the measurable wins are for decode.
-2. **Prefill:** the rewrites that were neutral for decode (expand elimination,
-   layout) should matter with many tokens; `search` needs symbolic-shape
-   support (`search_inputs` + `sym_vals`) for the variable-length prefill graph.
+2. **Prefill GEMM for Float16 weights:** a tiled Float16-weight GEMM (or
+   dequantize-to-Float32 tiles for rocBLAS) would let prefill keep the Float16
+   memory savings; today it falls back to Float32 weights beyond ~16 tokens.
 3. **Faster search:** extraction (~8 s on 3,100 e-classes) and per-candidate
    compiles dominate; incremental re-extraction and reusing compiled subgraphs.
 4. **Search strategy:** coordinate descent is enough for ~18 decisions. Upstream

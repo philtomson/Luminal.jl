@@ -61,13 +61,17 @@ function llama_generate(model,
     @info "Prompt: $(length(prompt_ids)) tokens"
 
     # 3. Prefill — full prompt in one shot
-    #    Build & compile a prefill graph of the right sequence length
+    #    Build & compile a prefill graph of the right sequence length. With `search`,
+    #    the prompt is padded (token 0) to a power-of-two bucket so one searched graph
+    #    (cached per bucket) serves every prompt up to that length; attention is
+    #    causal, so the padding cannot change the first `plen` positions.
     plen = length(prompt_ids)
+    slen = search === :none ? plen : max(16, nextpow(2, plen))
     pfx_graph = Graph()
     pfx_reg   = WeightRegistry()
     # Rebuild model structure for the prefill length graph
     pfx_model = _rebuild_model_like(model, pfx_graph, pfx_reg; rope_base=rope_base)
-    pfx_input = Luminal.tensor(pfx_graph, [plen, 1])
+    pfx_input = Luminal.tensor(pfx_graph, [slen, 1])
     pfx_out, pfx_kvs = pfx_model(pfx_input, 0; return_kv=true)
     
     # Mark K/V tensors for retrieval so we can populate the cache
@@ -86,11 +90,25 @@ function llama_generate(model,
     
     # We must explicitly retain nodes we want to retrieve 
     retain_pfx = collect(pfx_graph.to_retrieve)
-    # On GPU, matmul weights are stored as Float16 (compute stays Float32)
-    wdtype = target_device isa Luminal.AbstractGPUDevice ? Float16 : Float32
-    pfx_exec = compile(pfx_graph; device=target_device, retain=retain_pfx, weight_dtype=wdtype)
+    on_gpu = target_device isa Luminal.AbstractGPUDevice
+    # Decode (one column per matmul) is fastest with Float16 weights. Prefill is not:
+    # the Float16 kernel is a GEMV looping over the prompt's columns, while rocBLAS's
+    # Float32 GEMM stays bandwidth-bound. Measured on TinyLlama: f16 is ~1x f32 at 16
+    # tokens and ~3x slower at 64+, so prefill uses Float16 only for very short prompts.
+    wdtype = on_gpu ? Float16 : Float32
+    pfx_wdtype = (on_gpu && plen <= 8) ? Float16 : Float32
+    ids = zeros(Float32, slen, 1)
+    ids[1:plen, 1] .= prompt_ids
+    pfx_inputs = Dict{Int,Any}(pfx_input.id => ids)
+    pfx_exec = if search === :none
+        compile(pfx_graph; device=target_device, retain=retain_pfx, weight_dtype=pfx_wdtype)
+    else
+        @info "Searching equivalent prefill graphs ($search, bucket $slen)..."
+        compile(pfx_graph; device=target_device, retain=vcat(retain_pfx, pfx_input.id),
+                search=search, precision=on_gpu,
+                search_inputs=Dict{Int,Any}(pfx_input.id => Luminal.to_device(ids, target_device)))
+    end
 
-    pfx_inputs = Dict{Int,Any}(pfx_input.id => Float32.(Base.reshape(prompt_ids, plen, 1)))
     pfx_results = pfx_exec(pfx_inputs; device=target_device)
     prefill_logits = Array{Float32}(pfx_results[pfx_out.id])  # (vocab, plen, 1)
 
@@ -131,9 +149,10 @@ function llama_generate(model,
     for (i, (k, v)) in enumerate(pfx_kvs)
         # Prefill K/V shape: (head_dim, plen, kv_heads, batch)
         # Cache slot shape: (head_dim, max_seq, kv_heads, batch)
-        # Both live on target_device: in-place device-side copy into the cache.
-        view(cache.self_cache[i][1], :, 1:plen, :, :) .= pfx_results[k.id]
-        view(cache.self_cache[i][2], :, 1:plen, :, :) .= pfx_results[v.id]
+        # Both live on target_device: in-place device-side copy into the cache
+        # (only the prompt's positions when the prefill graph was padded).
+        view(cache.self_cache[i][1], :, 1:plen, :, :) .= view(pfx_results[k.id], :, 1:plen, :, :)
+        view(cache.self_cache[i][2], :, 1:plen, :, :) .= view(pfx_results[v.id], :, 1:plen, :, :)
     end
 
     @info "Compiling position-agnostic decode graph..."
