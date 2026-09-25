@@ -381,6 +381,10 @@ function realize_view(data, st::ShapeTracker)
     (data isa HalfWeight || data isa HalfWeightN || data isa QuantWeight) && return data  # consumed whole, as a matmul weight
     # If buffer already matches logical size, it's likely already realized (common in interpreter)
     r_dims = realized_dims(st)
+    # Already exactly this shape (e.g. a strided slice view): pass through unchanged
+    # rather than reshaping it into a wrapper GPU broadcasts may not handle.
+    data isa AbstractArray && ndims(data) == length(r_dims) &&
+        all(i -> r_dims[i] isa Integer && size(data, i) == r_dims[i], 1:ndims(data)) && return data
     if length(data) == prod(Int.(Luminal.eval_dim.(r_dims))) && length(data) > 1
         return Base.reshape(data, Int.(Luminal.eval_dim.(r_dims))...)
     end

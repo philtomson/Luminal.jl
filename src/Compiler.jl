@@ -175,8 +175,8 @@ end
 # Movement ops that don't reorder data can return a reshaped alias of a
 # contiguous input instead of copying it: any Reshape, an Expand that doesn't
 # change the element count, and a Permute that only moves size-1 dims.
-function _alias_view(op, arg, sz)
-    op isa Luminal.Slice && return _alias_slice(op, arg, sz)
+function _alias_view(op, arg, sz; strided_ok::Bool=false)
+    op isa Luminal.Slice && return _alias_slice(op, arg, sz; strided_ok=strided_ok)
     (op isa Luminal.Reshape || op isa Luminal.Permute || op isa Luminal.Expand) || return nothing
     (arg isa DenseArray && length(arg) == prod(sz)) || return nothing
     if op isa Luminal.Permute
@@ -188,13 +188,22 @@ end
 # A slice is a contiguous block of a column-major array when every dim after the
 # first one it cuts has extent 1 -- e.g. a row range of a (rows, 1, 1) matmul
 # output. Then it is a reshaped range of the input's memory.
-function _alias_slice(op, arg, sz)
+# With `strided_ok` (every consumer is elementwise, and GPU broadcasts read
+# strided views), a non-contiguous slice is returned as a SubArray view instead.
+function _alias_slice(op, arg, sz; strided_ok::Bool=false)
     (arg isa DenseArray && prod(sz) > 0) || return nothing   # empty slices take the copy path
     n = ndims(arg)
     length(sz) == n || return nothing
     k = findfirst(i -> sz[i] != size(arg, i), 1:n)
     k === nothing && return Base.reshape(arg, sz)
-    all(sz[i] == 1 for i in k+1:n) || return nothing
+    if !all(sz[i] == 1 for i in k+1:n)
+        strided_ok || return nothing
+        ranges = ntuple(i -> begin
+            lo = i <= length(op.ranges) ? max(0, Int(op.ranges[i][1])) : 0
+            (lo + 1):(lo + sz[i])
+        end, n)
+        return view(arg, ranges...)
+    end
     start = ntuple(i -> i <= length(op.ranges) ? max(0, Int(op.ranges[i][1])) + 1 : 1, n)
     off = LinearIndices(arg)[CartesianIndex(start)] - 1
     return Base.reshape(view(vec(arg), off+1:off+prod(sz)), sz)
@@ -406,29 +415,85 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
-    # 3. Identify fusible intermediates. An elementwise node is fused into its
+    processed_pads = falses(length(graph.nodes))
+    # 3. Concatenations. concat_along builds Add(Pad(a), Pad(b)), the Pads placing a
+    # and b in complementary ranges of one axis: 5 kernels (fill + copy per Pad, then
+    # the Add). When the Pads feed only that Add, it runs as one step that copies a
+    # and b into their ranges of the output; the Pads get no step.
+    concats = Dict{Int, Any}()   # Add node => (axis, [(source id, source view, offset)])
+    for (node_id, node) in enumerate(graph.nodes)
+        (node.op isa Luminal.Add && length(node.inputs) == 2 && !persistent[node_id]) || continue
+        parts = Any[]
+        for (pid, _, st) in node.inputs
+            pn = graph.nodes[pid]
+            (pn.op isa Luminal.Pad && consumer_count[pid] == 1 && !persistent[pid] &&
+             _is_trivial_view(st, graph.shapes[pid])) || break
+            axes = [i for (i, (lo, hi)) in enumerate(pn.op.padding) if !(isequal(lo, 0) && isequal(hi, 0))]
+            length(axes) == 1 && all(x -> x isa Integer, pn.op.padding[axes[1]]) || break
+            push!(parts, (pid, axes[1], pn.op.padding[axes[1]], pn.inputs[1]))
+        end
+        length(parts) == 2 && parts[1][2] == parts[2][2] || continue
+        axis = parts[1][2]
+        dims = try [eval_dim(d) for d in realized_dims(graph.shapes[node_id])] catch; continue end
+        all(p -> isequal(Luminal.DimType[eval_dim(d) for d in realized_dims(graph.shapes[p[1]])], dims), parts) || continue
+        # the two ranges must tile the axis exactly
+        rs = sort([(lo, dims[axis] - hi) for (_, _, (lo, hi), _) in parts])
+        (rs[1][1] == 0 && rs[1][2] == rs[2][1] && rs[2][2] == dims[axis]) || continue
+        concats[node_id] = (axis, [(src, sst, lo) for (_, _, (lo, _), (src, _, sst)) in parts])
+        for (pid, _, _, _) in parts; processed_pads[pid] = true; end
+    end
+
+    # 4. Identify fusible intermediates. An elementwise node is fused into its
     # consumer when that is its only use, the consumer is elementwise too, and the
     # consumer reads it unchanged.
     fusible_intermediates = Set{Int}()
     for (node_id, node) in enumerate(graph.nodes)
         fuse || break
         (is_elementwise(node.op) && !(node.op isa Luminal.Constant)) || continue
+        haskey(concats, node_id) && continue
         consumer_count[node_id] == 1 && length(consumers[node_id]) == 1 || continue
         persistent[node_id] && continue
         cid, st = consumers[node_id][1]
+        haskey(concats, cid) && continue
         c_op = graph.nodes[cid].op
         (is_elementwise(c_op) && !(c_op isa Luminal.Constant)) || continue
         _is_trivial_view(st, graph.shapes[node_id]) && push!(fusible_intermediates, node_id)
     end
 
     steps = Base.Function[]
-    processed = copy(folded)   # folded nodes need no step
+    processed = folded .| processed_pads   # folded nodes and concatenated Pads need no step
     owned = fill(false, length(graph.nodes))  # buffers allocated by this graph's own steps
     dynamic = false  # true if any shape depends on symbolic dims (sym_vals)
 
     for (node_id, node) in enumerate(graph.nodes)
         processed[node_id] && continue
         op = node.op
+
+        if haskey(concats, node_id)
+            axis, parts = concats[node_id]
+            node_shape = graph.shapes[node_id]
+            dims = Tuple(eval_dim(d) for d in realized_dims(node_shape))
+            src_sts = [evaluate_shapes(sst, Dict{Symbol,Int}()) for (_, sst, _) in parts]
+            owned[node_id] = true
+            backing = Ref{Any}(nothing)
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates)
+                out = res[node_id]
+                for (k, (src, _, lo)) in enumerate(parts)
+                    a = realize_view(res[src], src_sts[k])
+                    rng = ntuple(i -> i == axis ? ((lo + 1):(lo + size(a, axis))) : (1:dims[i]), length(dims))
+                    view(out, rng...) .= a
+                end
+                for (src, _, _) in parts
+                    live[src] -= 1
+                    if free_intermediates && live[src] == 0 && !persistent[src]
+                        _release!(res, src, owned)
+                    end
+                end
+            end)
+            processed[node_id] = true
+            continue
+        end
 
         if op isa Luminal.Constant
             val = to_device(op.value, compile_device)
@@ -467,6 +532,12 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             owned[node_id] = !is_persistent
             backing = Ref{Any}(nothing)  # reuse mode on GPU: flat buffer with spare capacity
             aliased = Ref(false)         # res[node_id] currently aliases an input's memory
+            # A Slice read only by elementwise ops may be a strided view (no copy). Only
+            # when buffers are not freed mid-run: a SubArray does not hold a reference
+            # on its parent's GPU buffer the way a reshape does.
+            strided_ok = !free_intermediates && op isa Luminal.Slice && !isempty(consumers[node_id]) &&
+                         all(is_elementwise(graph.nodes[c].op) for (c, _) in consumers[node_id]) &&
+                         !(node_id in retain)
 
             # Shapes free of symbolic dims are evaluated once here instead of every run.
             static = try
@@ -490,7 +561,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 if !is_persistent
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
                     sz = Tuple(dims_int)
-                    alias = length(step_args) == 1 ? _alias_view(run_op, step_args[1], sz) : nothing
+                    alias = length(step_args) == 1 ? _alias_view(run_op, step_args[1], sz; strided_ok=strided_ok) : nothing
                     if alias !== nothing
                         res[node_id] = alias
                         aliased[] = true
