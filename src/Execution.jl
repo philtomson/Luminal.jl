@@ -992,8 +992,9 @@ end
 end
 
 # CPU Fallback for Flash Attention
+# Same layout as the GPU kernel: (HeadDim, Seq, Head, Batch)
 function flash_attn_cpu(q, k, v, scale, causal)
-    B, H, N, D = size(q)
+    D, N, H, B = size(q)
     out = similar(q)
     for b in 1:B, h in 1:H
         for i in 1:N
@@ -1003,18 +1004,18 @@ function flash_attn_cpu(q, k, v, scale, causal)
             for j in 1:N
                 if causal && j > i continue end
                 # Dot product
-                dot = sum(q[b, h, i, :] .* k[b, h, j, :]) * scale
+                dot = sum(q[:, i, h, b] .* k[:, j, h, b]) * scale
                 # Online softmax
                 m_next = max(m_i, dot)
                 p = exp(dot - m_next)
                 scale_old = exp(m_i - m_next)
                 if isnan(scale_old) scale_old = 0.0f0 end
                 
-                o_row = o_row .* scale_old .+ p .* v[b, h, j, :]
+                o_row = o_row .* scale_old .+ p .* v[:, j, h, b]
                 l_i = l_i * scale_old + p
                 m_i = m_next
             end
-            out[b, h, i, :] = o_row ./ l_i
+            out[:, i, h, b] = o_row ./ l_i
         end
     end
     return out
@@ -1196,6 +1197,12 @@ function execute(graph::Graph, output_ids::Vector{Int}, initial_inputs::Dict, de
             # For Constant, we need device
             if op isa Constant
                  current_result = execute_op(op, device)
+            elseif hasmethod(execute_op!, Tuple{Any, typeof(op), map(typeof, input_values)...})
+                 # Same in-place kernels as the compiled path, into an output of the
+                 # node's shape (so every op compile() supports runs here too)
+                 dims = Int[eval_dim(d) for d in realized_dims(node_shape)]
+                 current_result = zero_tensor(device, Float32, dims...)
+                 execute_op!(current_result, op, input_values...)
             else
                  current_result = execute_op(op, input_values...)
             end

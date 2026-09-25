@@ -1,6 +1,7 @@
 module LlamaTokenization
 
 using JSON3
+import ..Luminal: encode, decode
 
 export LlamaTokenizer, encode, decode
 

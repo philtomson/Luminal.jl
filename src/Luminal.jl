@@ -6,6 +6,12 @@ using SymbolicUtils: Sym, BasicSymbolic
 # Type alias for dimension values: either a concrete Int or a symbolic expression
 const DimType = Union{Int, BasicSymbolic{Int}}
 
+# Tokenizer interface: every tokenizer (Llama, Whisper) adds methods to these, so
+# `encode`/`decode` dispatch on the tokenizer type instead of being two
+# different, conflicting exported functions.
+function encode end
+function decode end
+
 # Shape Tracking
 include("ShapeTracker.jl")
 export ShapeTracker

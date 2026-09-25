@@ -16,6 +16,7 @@
 #   prefix = sot_sequence(tok; language="en", task=:transcribe)
 
 using JSON3
+import ..Luminal: encode, decode
 
 export WhisperTokenizer, encode, decode, sot_sequence, LANGUAGES
 

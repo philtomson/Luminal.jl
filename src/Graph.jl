@@ -74,7 +74,7 @@ _st_key(st::ShapeTracker) = (st.dims, st.indexes, st.fake, st.mask, st.padding)
 
 Define a new input tensor on the graph.
 """
-function tensor(graph::Graph, shape::AbstractVector)
+function tensor(graph::Graph, shape::AbstractVector{<:Union{Integer, SymbolicUtils.BasicSymbolic}})
     st = ShapeTracker(shape)
     op = Function("InputTensor")
     inputs = Vector{Tuple{Int, Int, ShapeTracker}}()
@@ -85,10 +85,16 @@ end
     tensor(graph::Graph, data::AbstractArray)
 
 Convenience method to create an input tensor with shape matching the provided data.
+(A vector of integers or symbolic dims is a shape, not data: see the method above.)
 """
 function tensor(graph::Graph, data::AbstractArray)
     return tensor(graph, Int[size(data)...])
 end
+
+# An untyped vector is a shape if every element is an integer or a symbolic dim
+tensor(graph::Graph, v::AbstractVector{Any}) =
+    all(e -> e isa Union{Integer, SymbolicUtils.BasicSymbolic}, v) ?
+        tensor(graph, DimType[e for e in v]) : tensor(graph, Int[size(v)...])
 
 """
     constant(graph::Graph, value::Number)

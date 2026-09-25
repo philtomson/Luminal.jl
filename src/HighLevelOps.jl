@@ -377,10 +377,10 @@ function gather(matrix::GraphTensor, indexes::GraphTensor)
     return add_op!(m_cont.graph_ref, Function("Gather"), inputs, output_shape)
 end
 function flash_attention(q::GraphTensor, k::GraphTensor, v::GraphTensor; scale=nothing, causal=false)
-    # q, k, v shape: (Batch, Head, Seq, HeadDim)
+    # q, k, v shape: (HeadDim, Seq, Head, Batch), the layout the Llama code uses
     q_dims = realized_dims(q.shape)
     if isnothing(scale)
-        scale = 1.0f0 / sqrt(Float32(q_dims[end]))
+        scale = 1.0f0 / sqrt(Float32(q_dims[1]))
     end
     
     inputs = [(q.id, 0, q.shape), (k.id, 0, k.shape), (v.id, 0, v.shape)]
