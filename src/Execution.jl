@@ -9,7 +9,7 @@ using GPUArrays
 using KernelAbstractions
 
 
-export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight
+export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight
 
 # Helper for batch matrix multiplication
 function batch_matmul(A, B)
@@ -82,6 +82,103 @@ end
 Base.size(w::HalfWeight) = (size(w.t, 2), size(w.t, 1))
 Base.getindex(w::HalfWeight, i::Int, j::Int) = w.t[j, i]
 
+# A matmul weight stored as Float16 in its own (Out, In) layout, for rocBLAS's
+# mixed-precision GEMM (MatMulF16(_, :gemm_ex)): untransposed, gemm_ex is ~1.7-2.3x
+# faster than Float32 GEMM on TinyLlama's shapes; transposed it is not.
+struct HalfWeightN{A} <: AbstractMatrix{Float16}
+    w::A   # (Out, In) Float16
+end
+# (The inner constructor is called explicitly: this outer method has the same
+# signature as the default one-argument constructor and replaces it.)
+HalfWeightN(W::AbstractMatrix) = (w = similar(W, Float16, size(W)...); w .= W; HalfWeightN{typeof(w)}(w))
+Base.size(w::HalfWeightN) = size(w.w)
+Base.getindex(w::HalfWeightN, i::Int, j::Int) = w.w[i, j]
+
+# A matmul weight quantized to int8 with one symmetric Float32 scale per output row
+# (scale = max|row| / 127), transposed to (In, Out) so each row is contiguous and
+# read as 16-byte vectors of 16 int8. Weight-only: activations stay Float32. Half
+# the bytes of Float16, for bandwidth-bound decode.
+struct QuantWeight{Q, V, S} <: AbstractMatrix{Float32}
+    q::Q       # (In, Out) Int8
+    v::V       # (In/16, Out) NTuple{16, Int8} view of `q`
+    scale::S   # (Out,) Float32
+end
+function QuantWeight(W::AbstractMatrix)
+    scale = vec(maximum(abs, W; dims=2)) ./ 127f0
+    scale .= max.(scale, floatmin(Float32))
+    qf = permutedims(W ./ scale, (2, 1))                     # (In, Out) Float32, in [-127, 127]
+    q = similar(W, Int8, size(W, 2), size(W, 1))
+    q .= unsafe_trunc.(Int8, round.(qf))
+    v = Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), size(q, 1) ÷ 16, size(q, 2))
+    return QuantWeight(q, v, scale)
+end
+Base.size(w::QuantWeight) = (size(w.q, 2), size(w.q, 1))
+Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[i]
+
+# Y[:, c] = scale .* (Wq * X[:, c]): like the Float16 GEMV, one workgroup per output
+# row, 16 int8 weights per load, Float32 accumulation, scaled once per row.
+@kernel function _q8_matmul_kernel!(Y, @Const(Wv), @Const(scale), @Const(Xv), K16, N)
+    row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256,)
+    for c in 1:N
+        acc = 0f0
+        k = lid
+        while k <= K16
+            @inbounds w = Wv[k, row]
+            @inbounds xa = Xv[2k - 1, c]
+            @inbounds xb = Xv[2k, c]
+            acc += Float32(w[1]) * xa[1] + Float32(w[2]) * xa[2] + Float32(w[3]) * xa[3] + Float32(w[4]) * xa[4] +
+                   Float32(w[5]) * xa[5] + Float32(w[6]) * xa[6] + Float32(w[7]) * xa[7] + Float32(w[8]) * xa[8] +
+                   Float32(w[9]) * xb[1] + Float32(w[10]) * xb[2] + Float32(w[11]) * xb[3] + Float32(w[12]) * xb[4] +
+                   Float32(w[13]) * xb[5] + Float32(w[14]) * xb[6] + Float32(w[15]) * xb[7] + Float32(w[16]) * xb[8]
+            k += G
+        end
+        @inbounds s[lid] = acc
+        @synchronize
+        stride = G ÷ 2
+        while stride > 0
+            lid <= stride && (@inbounds s[lid] += s[lid + stride])
+            @synchronize
+            stride ÷= 2
+        end
+        lid == 1 && (@inbounds Y[row, c] = s[1] * scale[row])
+        @synchronize
+    end
+end
+
+function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_HALF_GROUP)
+    K, M = size(W.q)
+    N = length(B) ÷ K
+    Bc = B isa DenseArray ? B : copy(B)
+    Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
+    _q8_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
+        Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N; ndrange = M * group)
+    return C
+end
+
+# Float16 copies of activations for gemm_ex, reused per (device array type, size):
+# a captured graph bakes in the pointer, so they must outlive every call.
+const _GEMM_EX_WORKSPACE = Dict{Any, Any}()
+
+# C (Out, N) = W * B via rocBLAS gemm_ex: Float16 W and B (B rounded into a
+# workspace), Float32 accumulation and output. Trailing dims of B/C flatten into N.
+function _gemm_ex_f16!(C, W::HalfWeightN, B)
+    M, K = size(W.w)
+    N = length(B) ÷ K
+    Bc = B isa DenseArray ? B : copy(B)
+    x16 = get!(() -> similar(Bc, Float16, K, N), _GEMM_EX_WORKSPACE, (typeof(Bc), K, N))
+    x16 .= Base.reshape(Bc, K, N)
+    C2 = Base.reshape(C, M, N)
+    RB = AMDGPU.rocBLAS
+    α = Ref{Float32}(1f0); β = Ref{Float32}(0f0)
+    p(A) = reinterpret(Ptr{Cvoid}, pointer(A))
+    RB.rocblas_gemm_ex_64(RB.handle(), RB.rocblas_operation_none, RB.rocblas_operation_none,
+        M, N, K, α, p(W.w), RB.rocblas_datatype_f16_r, M, p(x16), RB.rocblas_datatype_f16_r, K,
+        β, p(C2), RB.rocblas_datatype_f32_r, M, p(C2), RB.rocblas_datatype_f32_r, M,
+        RB.rocblas_datatype_f32_r, RB.rocblas_gemm_algo_standard, Int32(0), UInt32(0))
+    return C
+end
+
 # Y[:, c] = W * X[:, c]. One workgroup per output row; the row stays in cache
 # while the workgroup loops over the columns of X, so weights are read once.
 @kernel function _half_matmul_kernel!(Y, @Const(Wv), @Const(Xv), K8, N)
@@ -128,12 +225,12 @@ end
 # WeakRef to its source and only counts as a hit if it still points to `W`.
 const _HALF_WEIGHTS = Dict{UInt, Tuple{WeakRef, Any}}()
 const _HALF_WEIGHTS_LOCK = ReentrantLock()
-function half_weight(W)
-    key = objectid(W)
+function half_weight(W, ::Type{T} = HalfWeight) where {T}
+    key = hash(T, objectid(W))
     lock(_HALF_WEIGHTS_LOCK) do
         entry = get(_HALF_WEIGHTS, key, nothing)
         entry !== nothing && entry[1].value === W && return entry[2]
-        hw = HalfWeight(W)
+        hw = T(W)
         _HALF_WEIGHTS[key] = (WeakRef(W), hw)
         finalizer(W) do _
             @async lock(_HALF_WEIGHTS_LOCK) do
@@ -190,6 +287,7 @@ end
 
 function batch_matmul!(C, A, B)
     A isa HalfWeight && return _half_matmul!(C, A, B)
+    A isa QuantWeight && return _q8_matmul!(C, A, B)
     A = _ensure_contiguous(A)
     B = _ensure_contiguous(B)
     # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
@@ -253,7 +351,7 @@ function batch_matmul!(C, A, B)
 end
 
 function realize_view(data, st::ShapeTracker)
-    data isa HalfWeight && return data  # only ever consumed whole, as a matmul weight
+    (data isa HalfWeight || data isa HalfWeightN || data isa QuantWeight) && return data  # consumed whole, as a matmul weight
     # If buffer already matches logical size, it's likely already realized (common in interpreter)
     r_dims = realized_dims(st)
     if length(data) == prod(Int.(Luminal.eval_dim.(r_dims))) && length(data) > 1
@@ -484,8 +582,14 @@ end
 
 execute_op!(out, op::Contiguous, a) = copyto!(out, a)
 execute_op!(out, op::MatMul, a, b) = batch_matmul!(out, a, b)
-execute_op!(out, op::MatMulF16, a, b) =   # `a` is a HalfWeight once compiled
-    a isa HalfWeight ? _half_matmul!(out, a, b; group=op.group) : batch_matmul!(out, a, b)
+function execute_op!(out, op::MatMulF16, a, b)   # `a` is a HalfWeight(N) once compiled
+    a isa HalfWeight && return _half_matmul!(out, a, b; group=op.group)
+    a isa HalfWeightN && a.w isa ROCArray && return _gemm_ex_f16!(out, a, b)
+    a isa HalfWeightN && return batch_matmul!(out, Float32.(a.w), b)
+    return batch_matmul!(out, a, b)
+end
+execute_op!(out, op::MatMulQ8, a, b) =   # `a` is a QuantWeight once compiled
+    a isa QuantWeight ? _q8_matmul!(out, a, b; group=op.group) : batch_matmul!(out, a, b)
 execute_op!(out, op::MatMulT, a, b) = batch_matmul_t!(out, a, b, op.ta, op.tb)
 
 # Reduce `a` over dimension `dim` into `out` (which has that dim dropped or 1).

@@ -108,7 +108,7 @@ function _make_dims(g, h, ch)
         (a === nothing || b === nothing) && return nothing
         r = _broadcast(a, b)
         return r === nothing ? nothing : Shp(r)
-    elseif h === :xMatMul || h === :xMatMulF16 || h === :xMatMulT
+    elseif h === :xMatMul || h === :xMatMulF16 || h === :xMatMulQ8 || h === :xMatMulT
         a, b = _dims(g, ch[2]), _dims(g, ch[3])
         (a === nothing || b === nothing) && return nothing
         if h === :xMatMulT
@@ -174,7 +174,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
     ctx = BridgeCtx(ShapeTracker[], Dict{Any,Int}(), Dict{Symbol,DataType}(),
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
-    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulT,
+    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulT,
               Luminal.Expand, Luminal.Pad, Luminal.Slice)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
@@ -260,12 +260,44 @@ end
 # Precision choice (not exact: rounds weights to Float16): a weight matmul may run
 # with Float16 weights, with the GEMV kernel at any of its workgroup sizes (the
 # best one depends on the matrix shape). Opt-in.
-const HALF_GROUPS = (64, 128, 256)
 _half_ok(g, w) = _is_weight(g, w) && w.data !== nothing && length(w.data.dims) == 2
+const WEIGHT_VARIANTS = ((64, :gemv), (128, :gemv), (256, :gemv))
 const PRECISION_RULES = @theory q w x begin
-    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((64,)), $w, $x)) : nothing
-    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((128,)), $w, $x)) : nothing
-    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256,)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((64, :gemv)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((128, :gemv)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256, :gemv)), $w, $x)) : nothing
+end
+
+# precision=:activations additionally offers rocBLAS's mixed-precision GEMM
+# (:gemm_ex), which rounds the *activations* to Float16 too: ~2x Float32 GEMM for
+# prefill-sized inputs, but ~5e-3 relative logit error over TinyLlama's 22 layers.
+const ACTIVATION_VARIANTS = ((256, :gemm_ex),)
+const ACTIVATION_RULES = @theory q w x begin
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256, :gemm_ex)), $w, $x)) : nothing
+end
+
+# precision=:int8 offers weight-only int8 (one scale per output row) for weight
+# matmuls: half the bytes of Float16 for decode, lossy (see docs).
+const INT8_VARIANTS = ((256,),)
+const INT8_RULES = @theory q w x begin
+    xMatMul(q::Tuple, w, x) => (_half_ok(_egraph, w) && w.data.dims[2] % 16 == 0) ?
+                                :(xMatMulQ8($((256,)), $w, $x)) : nothing
+end
+
+# `precision` enables reduced-precision alternatives: false (exact rewrites only);
+# true or :weights (Float16 weights, Float32 activations); :activations (also
+# Float16 activations); :int8 (int8 weights); or a collection, e.g. (:weights, :int8).
+function _precision_features(precision)
+    precision === false && return Set{Symbol}()
+    precision === true && return Set([:weights])
+    precision isa Symbol && return _precision_features((precision,))
+    f = Set{Symbol}()
+    for p in precision
+        p in (:weights, :activations, :int8) || error("unknown precision $p (use :weights, :activations, :int8)")
+        push!(f, p)
+        p === :activations && push!(f, :weights)
+    end
+    return f
 end
 
 # Kernel choice: a matmul whose operand is a Permute swapping the first two dims can
@@ -285,9 +317,13 @@ end
 
 Apply the rule sets until saturation (or the iteration/size limits).
 """
-function saturate_graph!(rw::Rewriter; precision::Bool=false, iterations::Int=16)
+function saturate_graph!(rw::Rewriter; precision=false, iterations::Int=16)
     CTX[] = rw.ctx
-    theory = vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES, precision ? PRECISION_RULES : RewriteRule[])
+    f = _precision_features(precision)
+    theory = vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES,
+                  :weights in f ? PRECISION_RULES : RewriteRule[],
+                  :activations in f ? ACTIVATION_RULES : RewriteRule[],
+                  :int8 in f ? INT8_RULES : RewriteRule[])
     params = SaturationParams(timeout=iterations, eclasslimit=0, enodelimit=0)
     return saturate!(rw.g, theory, params)
 end
@@ -325,18 +361,29 @@ function static_cost(g, n::VecExpr)
     # while rocBLAS's Float32 GEMM stays bandwidth-bound far longer. Calibrated on
     # TinyLlama prefill (Radeon 8060S): f16/f32 time is ~0.55 at N=1, ~1 at N=16,
     # ~2.6 at N=64, ~3.3 at N=256.
-    wd = h in (:xMatMul, :xMatMulF16) ? _dims(g, ch[2]) : nothing
+    wd = h in (:xMatMul, :xMatMulF16, :xMatMulQ8) ? _dims(g, ch[2]) : nothing
     if wd !== nothing && length(wd) == 2 && all(x -> x isa Integer, wd) && ins[1] >= 1 << 16
         N = max(1, ins[2] ÷ max(1, wd[2]))
-        if h === :xMatMulF16
-            # Group sizes cost the same to the model; prefer the default on ties.
+        if h === :xMatMulQ8
+            # int8 GEMV: 1 byte per weight, same column scaling as the Float16 GEMV
             tie = _lit(g, ch[1])[1] == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
+            return 1.0 * ins[1] * (1 + N / 12) + 4.0 * ins[2] + LAUNCH_BYTES + tie
+        end
+        if h === :xMatMulF16
+            grp, impl = _lit(g, ch[1])
+            if impl === :gemm_ex
+                # ~2x Float32 GEMM at any N, plus a fixed overhead that loses to the
+                # GEMV for one or two columns (measured: 108 vs 53 us at N=1, 2048^2)
+                return 2.0 * ins[1] * (1.5 + N / 64) + 4.0 * ins[2] + LAUNCH_BYTES
+            end
+            # Group sizes cost the same to the model; prefer the default on ties.
+            tie = grp == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
             return 2.0 * ins[1] * (1 + N / 12) + 4.0 * ins[2] + LAUNCH_BYTES + tie
         end
         return 4.0 * ins[1] * (1 + N / 64) + 4.0 * ins[2] + LAUNCH_BYTES
     end
     if h === :xMatMulF16
-        tie = _lit(g, ch[1])[1] == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
+        tie = _lit(g, ch[1]) == (Luminal.DEFAULT_HALF_GROUP, :gemv) ? 0.0 : 1.0
         return 2.0 * ins[1] + 4.0 * sum(ins[2:end]) + LAUNCH_BYTES + tie
     elseif h === :xMatMul || h === :xMatMulT || h === :xMul || h === :xAdd
         a = (h === :xMatMul || h === :xMatMulT) ? 0 : maximum(ins; init=0)   # elementwise output ~ largest input
@@ -580,7 +627,8 @@ are single-rooted, so this runs as a pass over the e-graph. Each merged group
 is recorded as one joint decision (all members switch together). Returns the
 number of groups merged.
 """
-function merge_projections!(rw::Rewriter; precision::Bool=false)
+function merge_projections!(rw::Rewriter; precision=false)
+    f = _precision_features(precision)
     g = rw.g
     CTX[] = rw.ctx
     groups = Dict{Id, Vector{Tuple{Id, Id}}}()      # input class => [(matmul class, weight class)]
@@ -608,9 +656,13 @@ function merge_projections!(rw::Rewriter; precision::Bool=false)
         end
         wc = addexpr!(g, wcat)
         y = addexpr!(g, Expr(:call, :xMatMul, (), g[wc], g[x]))
-        if precision
-            for grp in HALF_GROUPS
-                union!(g, y, addexpr!(g, Expr(:call, :xMatMulF16, (grp,), g[wc], g[x])))
+        f16 = (:weights in f ? WEIGHT_VARIANTS : ())..., (:activations in f ? ACTIVATION_VARIANTS : ())...
+        for variant in f16
+            union!(g, y, addexpr!(g, Expr(:call, :xMatMulF16, variant, g[wc], g[x])))
+        end
+        if :int8 in f && K % 16 == 0
+            for variant in INT8_VARIANTS
+                union!(g, y, addexpr!(g, Expr(:call, :xMatMulQ8, variant, g[wc], g[x])))
             end
         end
         rebuild!(g)
@@ -729,7 +781,8 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
     current = Dict{Id, String}()
     kept_labels = Tuple{String, String}[]
     incumbent = make_runner(current)
-    incumbent === nothing && error("measured_search: the static extraction failed verification")
+    incumbent === nothing && error("measured_search: the static extraction failed verification " *
+        "(with precision=:activations, consider a looser search_tolerance)")
     for _ in 1:3; incumbent(); end
     t1 = (t = time(); incumbent(); time() - t)
     nsteps[] = clamp(round(Int, round_budget / max(t1, 1e-6)), 1, steps)
@@ -799,7 +852,8 @@ end
 _input_ids(graph) = [nid for (nid, n) in enumerate(graph.nodes)
                      if n.op isa Luminal.Function && n.op.name == "InputTensor" && !haskey(graph.tensors, (nid, 1))]
 
-function compile_searched(graph::Graph; search::Symbol, precision::Bool, search_inputs, search_cache,
+function compile_searched(graph::Graph; search::Symbol, precision, search_inputs, search_cache,
+                          search_tolerance::Real=1e-3,
                           device, retain::Vector{Int}, kwargs...)
     search in (:static, :measured) || error("search must be :none, :static or :measured")
     isempty(retain) && error("compile(...; search=$search) needs `retain`: the node ids to keep")
@@ -828,12 +882,12 @@ function compile_searched(graph::Graph; search::Symbol, precision::Bool, search_
         for o in outs
             got = Array{Float32}(res[o])
             scale = max(maximum(abs, reference[o]; init=0f0), 1f-6)
-            maximum(abs.(got .- reference[o]); init=0f0) / scale < 1f-3 || return nothing
+            maximum(abs.(got .- reference[o]); init=0f0) / scale < search_tolerance || return nothing
         end
         return () -> (r(inputs; device=device); Luminal.synchronize_device(device); nothing)
     end
     choices, _ = measured_search(rw, make_runner; cache_dir=search_cache,
-                                 cache_tag=string(nameof(typeof(device)), precision, kwargs))
+                                 cache_tag=string(nameof(typeof(device)), precision, search_tolerance, kwargs))
     return build(choices)
 end
 

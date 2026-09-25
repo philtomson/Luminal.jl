@@ -144,6 +144,23 @@ minutes. `llama_generate` pads prompts to power-of-two buckets when `search` is
 set (causal attention: the padding cannot change the prompt's positions), and
 by default uses Float16 prefill weights only for prompts of 8 tokens or fewer.
 
+**Float16 prefill GEMM.** A hand-written tiled Float16-weight GEMM (KernelAbstractions)
+was correct but 2-4x slower than rocBLAS's Float32 SGEMM; dequantizing to Float32
+then calling SGEMM was also slower. rocBLAS's mixed-precision `gemm_ex` (Float16
+weights *and* activations, Float32 accumulation) on an untransposed (Out, In)
+weight is 1.7-2.3x faster than Float32 GEMM at every column count, but rounds
+activations: 2-5e-3 relative logit error over 22 layers. It is opt-in as
+`precision=:activations` (`MatMulF16(_, :gemm_ex)`, weight stored as `HalfWeightN`),
+with `search_tolerance` set accordingly:
+
+| Prompt tokens | Float32 | static, :weights | static, :activations | measured, :activations |
+|---|---|---|---|---|
+| 16 | 45.5 | 48.0 | 24.4 | **22.2** |
+| 64 | 69.4 | 68.5 | 40.8 | **~39-41** |
+| 256 | 228.3 | 228.7 | 139.2 | **135.5** |
+
+Top-1 prediction agreed with Float32 at every prompt position at all three lengths.
+
 Latest full search (kernel variants, group size 256 default, merges): **14.54
 ms/token** with Float16, vs 14.9 for the plain Float16 path.
 
@@ -207,9 +224,8 @@ folding and slice aliasing); `compile(...; search=...)`; old paths deleted.
 Next:
 1. **Kernel alternatives as rules:** GEMV vs GEMM, HalfWeight workgroup size,
    transpose flags. These are where the measurable wins are for decode.
-2. **Prefill GEMM for Float16 weights:** a tiled Float16-weight GEMM (or
-   dequantize-to-Float32 tiles for rocBLAS) would let prefill keep the Float16
-   memory savings; today it falls back to Float32 weights beyond ~16 tokens.
+2. **Int8 weights for decode** (`MatMulQ8`, `precision=:int8`): in progress;
+   accuracy is measured by `examples/quant_eval.jl`.
 3. **Faster search:** extraction (~8 s on 3,100 e-classes) and per-candidate
    compiles dominate; incremental re-extraction and reusing compiled subgraphs.
 4. **Search strategy:** coordinate descent is enough for ~18 decisions. Upstream

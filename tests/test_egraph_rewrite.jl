@@ -130,5 +130,26 @@ end
                 @test Array(out) ≈ W * x rtol = 1e-5
             end
         end
+
+        @testset "MatMulF16 gemm_ex (Float16 activations)" begin
+            W = Float32.(Float16.(randn(Float32, 96, 64)))
+            x = randn(Float32, 64, 5, 2)
+            hn = Luminal.half_weight(Luminal.to_device(W, dev), Luminal.HalfWeightN)
+            @test hn isa Luminal.HalfWeightN && size(hn) == (96, 64)
+            out = Luminal.zero_tensor(dev, Float32, 96, 5, 2)
+            Luminal.execute_op!(out, Luminal.MatMulF16(256, :gemm_ex), hn, Luminal.to_device(x, dev))
+            ref = Base.reshape(W * Base.reshape(x, 64, :), 96, 5, 2)
+            @test Array(out) ≈ ref rtol = 1e-3       # activations rounded to Float16
+
+            # compile() stores a gemm_ex-only weight untransposed (HalfWeightN)
+            g = Graph()
+            w = Luminal.tensor(g, [96, 64]); xin = Luminal.tensor(g, [64, 5, 2])
+            y = Luminal.add_op!(g, Luminal.MatMulF16(256, :gemm_ex), [(w.id, 0, w.shape), (xin.id, 0, xin.shape)],
+                                Luminal.ShapeTracker([96, 5, 2]))
+            g.tensors[(w.id, 1)] = Luminal.to_device(W, dev)
+            ex = compile(g; device=dev, retain=[y.id])
+            @test ex.results[w.id] isa Luminal.HalfWeightN
+            @test Array(ex(Dict{Int,Any}(xin.id => x); device=dev)[y.id]) ≈ ref rtol = 1e-3
+        end
     end
 end

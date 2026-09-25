@@ -86,14 +86,29 @@ end
 struct MatMul <: Op end
 # Same product as MatMul, with the (weight) left operand stored as Float16 on GPU.
 # A precision choice the rewrite layer can select per matmul; compute stays Float32.
-# `group` is the GEMV kernel's threads per output row (64, 128 or 256). 256 is the
-# default: the measured search picked it for every TinyLlama projection shape on
-# a Radeon 8060S.
+# `impl` picks the kernel:
+#   :gemv    -- Float16 weights, Float32 activations and accumulation; `group` is
+#               the threads per output row (64, 128, 256; 256 is the default: the
+#               measured search picked it for every TinyLlama projection on a
+#               Radeon 8060S). Best for one or a few columns (decode).
+#   :gemm_ex -- rocBLAS mixed-precision GEMM: activations are also rounded to
+#               Float16 (Float32 accumulation and output). ~2x Float32 GEMM for
+#               many columns (prefill), with ~2e-4 relative error per matmul.
 struct MatMulF16 <: Op
     group::Int
+    impl::Symbol
 end
 const DEFAULT_HALF_GROUP = 256
-MatMulF16() = MatMulF16(DEFAULT_HALF_GROUP)
+MatMulF16() = MatMulF16(DEFAULT_HALF_GROUP, :gemv)
+MatMulF16(group::Int) = MatMulF16(group, :gemv)
+
+# Same product as MatMul with the (weight) left operand stored as int8 with one
+# Float32 scale per output row (weight-only quantization; activations and
+# accumulation stay Float32). `group` is the GEMV's threads per output row.
+struct MatMulQ8 <: Op
+    group::Int
+end
+MatMulQ8() = MatMulQ8(DEFAULT_HALF_GROUP)
 
 # op(A) * op(B), where op transposes the first two dims when its flag is set:
 # a matmul that reads a permuted operand through BLAS transpose flags instead of

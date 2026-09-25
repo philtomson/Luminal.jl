@@ -8,7 +8,7 @@
 #      K/V at position plen — reported per layer, so the first diverging layer is visible.
 #   C. The decode step's logits must equal prefill(prompt)'s last-position logits.
 #
-# Usage: julia --project=. debug_decode.jl [model_dir] [cpu|gpu] [f32|f16] [capture]
+# Usage: julia --project=. debug_decode.jl [model_dir] [cpu|gpu] [f32|f16|int8] [capture]
 #   f16 stores matmul weights as Float16 (compile(...; weight_dtype=Float16))
 
 using Luminal
@@ -37,7 +37,7 @@ end
 function main()
     model_dir = length(ARGS) >= 1 ? ARGS[1] : joinpath(@__DIR__, "tinyllama_chat")
     device = (length(ARGS) >= 2 && ARGS[2] == "cpu") ? CPUDevice() : get_device()
-    wdtype = (length(ARGS) >= 3 && ARGS[3] == "f16") ? Float16 : Float32
+    wdtype = length(ARGS) >= 3 ? Dict("f16" => Float16, "int8" => Int8, "f32" => Float32)[ARGS[3]] : Float32
     capture = "capture" in ARGS
     println("Matmul weights: ", wdtype, "  HIP graph capture: ", capture)
     rope_base = 10000f0

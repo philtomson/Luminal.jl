@@ -58,3 +58,35 @@ if get_device() isa Luminal.AbstractGPUDevice
         @test Luminal.half_weight(W) === hw          # and the entry is now W's
     end
 end
+
+if get_device() isa Luminal.AbstractGPUDevice
+    @testset "int8 weights (QuantWeight / MatMulQ8)" begin
+        dev = get_device()
+        W = randn(Float32, 96, 64)
+        qw = Luminal.QuantWeight(Luminal.to_device(W, dev))
+        @test size(qw) == (96, 64)
+        # dequantized weights are within half a quantization step of the original
+        scale = Array(qw.scale)
+        deq = Float32.(permutedims(Array(qw.q))) .* scale
+        @test all(abs.(deq .- W) .<= scale ./ 2 .+ 1f-6)
+
+        x = randn(Float32, 64, 5)
+        for grp in (64, 128, 256)
+            out = Luminal.zero_tensor(dev, Float32, 96, 5)
+            Luminal.execute_op!(out, Luminal.MatMulQ8(grp), qw, Luminal.to_device(x, dev))
+            @test Array(out) ≈ deq * x rtol = 1e-5          # exact w.r.t. the int8 weights
+        end
+
+        # compile(...; weight_dtype=Int8) quantizes plain MatMul weights
+        g = Graph()
+        lin = NN.Linear(64, 96, g; bias=false)
+        xin = Luminal.tensor(g, [64, 3, 1])
+        y = lin(xin)
+        g.tensors[(lin.weight.id, 1)] = Luminal.to_device(W, dev)
+        ex = compile(g; device=dev, retain=[y.id], weight_dtype=Int8)
+        @test ex.results[lin.weight.id] isa Luminal.QuantWeight
+        xv = randn(Float32, 64, 3, 1)
+        @test Array(ex(Dict{Int,Any}(xin.id => xv); device=dev)[y.id]) ≈
+              Base.reshape(deq * Base.reshape(xv, 64, 3), 96, 3, 1) rtol = 1e-5
+    end
+end

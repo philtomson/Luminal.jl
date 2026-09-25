@@ -45,22 +45,31 @@ for plen in LENGTHS
     ids = Luminal.to_device(Float32.(rand(0:31999, plen, 1)), DEV)   # on device: no copy per run
     inputs = Dict{Int,Any}(inp.id => ids)
     common = (device=DEV, retain=retain, free_intermediates=false, capture=true)
-    ref = Array{Float32}(compile(g; common...)(inputs; device=DEV)[out.id])
-    relerr(ex) = (r = Array{Float32}(ex(inputs; device=DEV)[out.id]); maximum(abs.(r .- ref)) / maximum(abs.(ref)))
+    ref = Array{Float32}(compile(g; common...)(inputs; device=DEV)[out.id])   # (vocab, plen, 1)
+    function accuracy(ex)
+        r = Array{Float32}(ex(inputs; device=DEV)[out.id])
+        err = maximum(abs.(r .- ref)) / maximum(abs.(ref))
+        top1 = count(i -> argmax(r[:, i, 1]) == argmax(ref[:, i, 1]), 1:plen)
+        return err, top1
+    end
+    report(label, ex, tc) = begin
+        err, top1 = accuracy(ex)
+        @printf("  %-34s %8.2f ms/run   relerr %.1e   top-1 %d/%d   (compile %.0f s)\n",
+                label, steady_ms(ex, inputs), err, top1, plen, tc)
+    end
 
     println("\n== prompt length $plen: $(length(g.nodes)) nodes")
     for (label, kw) in (("f32 weights", (;)), ("f16 weights", (weight_dtype=Float16,)),
-                        ("static search (+precision)", (search=:static, precision=true)))
+                        ("static search, :weights", (search=:static, precision=:weights)),
+                        ("static search, :activations", (search=:static, precision=:activations)))
         t0 = time()
         ex = compile(g; common..., kw...)
-        tc = time() - t0
-        @printf("  %-28s %8.2f ms/run   relerr %.1e   (compile %.1f s)\n", label, steady_ms(ex, inputs), relerr(ex), tc)
+        report(label, ex, time() - t0)
         ex = nothing; GC.gc()
     end
     t0 = time()
-    ex = compile(g; common..., search=:measured, precision=true, search_inputs=inputs)
-    tc = time() - t0
-    @printf("  %-28s %8.2f ms/run   relerr %.1e   (search + compile %.0f s)\n",
-            "measured search (+precision)", steady_ms(ex, inputs), relerr(ex), tc)
+    ex = compile(g; common..., search=:measured, precision=:activations, search_tolerance=1e-2,
+                 search_inputs=inputs)
+    report("measured search, :activations", ex, time() - t0)
     ex = nothing; GC.gc()
 end
