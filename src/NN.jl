@@ -605,25 +605,14 @@ function llama_self_attn_cached(sa::SelfAttention,
     q     = apply_rotary_embeddings(q,     step_pos_tensor; base=rope_base)
     k_new = apply_rotary_embeddings(k_new, step_pos_tensor; base=rope_base)
 
-    # Group query heads by KV head: head h = g + G*kv, the order repeat_kv uses.
-    # (D, 1, H, B) -> (D, G, KVH, B) -> q_t (G, D, KVH, B)
-    q_t = Luminal.permute(Luminal.reshape(q, [D, G, KVH, batch]), [2, 1, 3, 4])
+    # Attention over cache slots [0, pos) plus the current token, in one kernel
+    # (see Luminal.DecodeAttention): scores, softmax and the weighted sum of V,
+    # grouped-query heads reading their KV head directly. (D, H, B) is the
+    # head-major order the output projection expects.
     scale = 1.0f0 / sqrt(Float32(D))
-
-    # Scores against the cache (G, max_seq, KVH, B), masking slots >= pos, and
-    # against the current token (G, 1, KVH, B); only these small score tensors
-    # are concatenated, never K/V.
-    valid = Luminal.arange(x.graph_ref, max_seq) < step_pos_tensor        # 1 where j < pos
-    mask  = Luminal.reshape((valid - 1.0f0) * 1f9, [1, max_seq])         # 0 or -1e9
-    s_past = Luminal.matmul(q_t, past_k) * scale + mask
-    s_new  = Luminal.matmul(q_t, k_new) * scale
-    probs  = Luminal.softmax(Luminal.concat_along(s_past, s_new, 2), 2)  # (G, max_seq+1, KVH, B)
-    p_past = Luminal.slice_along(probs, 2, 0, max_seq)
-    p_new  = Luminal.slice_along(probs, 2, max_seq, max_seq + 1)
-
-    # out^T = V * p^T lands directly in (D, G, KVH, B) = (D, H) head order
-    out = Luminal.matmul(past_v, Luminal.permute(p_past, [2, 1, 3, 4])) +
-          Luminal.matmul(v_new,  Luminal.permute(p_new,  [2, 1, 3, 4]))
+    ins = [(t.id, 0, t.shape) for t in (q, past_k, past_v, k_new, v_new, step_pos_tensor)]
+    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(scale), ins,
+                          Luminal.ShapeTracker([D, sa.n_heads, batch]))
     out = Luminal.reshape(out, [hidden, 1, batch])
 
     return sa.o_proj(out), k_new, v_new

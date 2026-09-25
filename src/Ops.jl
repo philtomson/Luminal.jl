@@ -117,6 +117,15 @@ MatMulQ8() = MatMulQ8(128)
 # copies on the decode path) -- one launch instead.
 struct RotaryEmbed <: Op end
 
+# Single-token (decode) attention over a KV cache, in one kernel. Inputs:
+#   q (D, 1, H, B), past_k and past_v (D, max_seq, KVH, B), k_new and v_new
+#   (D, 1, KVH, B), pos (1,) -- the number of valid cache slots (slots >= pos are
+#   ignored). Query head h uses KV head (h-1) ÷ (H/KVH) + 1 (grouped-query).
+# Output (D, H, B): softmax(scale * q.[K_past[:, 1:pos], k_new]) * [V_past; v_new].
+struct DecodeAttention <: Op
+    scale::Float32
+end
+
 # op(A) * op(B), where op transposes the first two dims when its flag is set:
 # a matmul that reads a permuted operand through BLAS transpose flags instead of
 # materializing the Permute.

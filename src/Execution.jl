@@ -93,6 +93,134 @@ function execute_op!(out, op::RotaryEmbed, x, c, s)
     return out
 end
 
+# --- Decode attention ---------------------------------------------------------
+# One workgroup per (query head, batch). Scores for the n = pos + 1 positions
+# (cache slots 1..pos, then the new token) live in local memory: dot products,
+# then a parallel max and sum for the softmax, then the probability-weighted sum
+# of V with the workgroup split into G ÷ D slices over positions.
+const DECODE_ATTN_MAX_CTX = 8192
+@kernel function _decode_attn_kernel!(out, @Const(q), @Const(pk), @Const(pv), @Const(kn), @Const(vn),
+                                      @Const(posv), scale, Gq)
+    # Values shared across barriers must be @uniform (the CPU backend splits the
+    # kernel into loops at each @synchronize); the softmax statistics go through
+    # local memory (`stats`) for the same reason.
+    grp = @index(Group, Linear); lid = @index(Local, Linear)
+    T = @uniform @groupsize()[1]
+    D = @uniform size(q, 1)
+    H = @uniform size(q, 3)
+    h = @uniform (@index(Group, Linear) - 1) % size(q, 3) + 1
+    b = @uniform (@index(Group, Linear) - 1) ÷ size(q, 3) + 1
+    kv = @uniform (h - 1) ÷ Gq + 1
+    pos = @uniform unsafe_trunc(Int, @inbounds posv[1])
+    n = @uniform pos + 1
+    sc = @localmem Float32 (DECODE_ATTN_MAX_CTX,)
+    red = @localmem Float32 (256,)
+    stats = @localmem Float32 (2,)
+    # 1. scores
+    j = lid
+    while j <= n
+        acc = 0f0
+        if j <= pos
+            for d in 1:D
+                @inbounds acc += q[d, 1, h, b] * pk[d, j, kv, b]
+            end
+        else
+            for d in 1:D
+                @inbounds acc += q[d, 1, h, b] * kn[d, 1, kv, b]
+            end
+        end
+        @inbounds sc[j] = acc * scale
+        j += T
+    end
+    @synchronize
+    # 2. max
+    m = -Inf32
+    j = lid
+    while j <= n
+        @inbounds m = max(m, sc[j])
+        j += T
+    end
+    @inbounds red[lid] = m
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        lid <= stride && (@inbounds red[lid] = max(red[lid], red[lid + stride]))
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds stats[1] = red[1])
+    @synchronize
+    # 3. exp and sum
+    ssum = 0f0
+    j = lid
+    while j <= n
+        @inbounds e = exp(sc[j] - stats[1])
+        @inbounds sc[j] = e
+        ssum += e
+        j += T
+    end
+    @inbounds red[lid] = ssum
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        lid <= stride && (@inbounds red[lid] += red[lid + stride])
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds stats[2] = 1f0 / red[1])
+    @synchronize
+    # 4. out[d] = sum_j p_j V[d, j]; thread (d, part) covers positions part, part + P, ...
+    P = T ÷ D
+    d = (lid - 1) % D + 1
+    part = (lid - 1) ÷ D + 1
+    acc = 0f0
+    if part <= P
+        j = part
+        while j <= n
+            if j <= pos
+                @inbounds acc += sc[j] * pv[d, j, kv, b]
+            else
+                @inbounds acc += sc[j] * vn[d, 1, kv, b]
+            end
+            j += P
+        end
+    end
+    @inbounds red[lid] = acc
+    @synchronize
+    if lid <= D
+        tot = 0f0
+        for p in 0:P-1
+            @inbounds tot += red[lid + p * D]
+        end
+        @inbounds out[lid, h, b] = tot * stats[2]
+    end
+end
+
+function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
+    D, H, B = size(q, 1), size(q, 3), size(q, 4)
+    KVH = size(pk, 3)
+    if !(out isa AnyGPUArray)          # CPU: plain loops (the kernel's reductions are GPU-shaped)
+        pos = Int(posv[1]); G = H ÷ KVH
+        o3 = Base.reshape(out, D, H, B)
+        for b in 1:B, h in 1:H
+            kv = (h - 1) ÷ G + 1
+            s = Float32[op.scale * sum(q[d, 1, h, b] * (j <= pos ? pk[d, j, kv, b] : kn[d, 1, kv, b]) for d in 1:D)
+                        for j in 1:pos+1]
+            p = exp.(s .- maximum(s)); p ./= sum(p)
+            for d in 1:D
+                o3[d, h, b] = sum(p[j] * (j <= pos ? pv[d, j, kv, b] : vn[d, 1, kv, b]) for j in 1:pos+1)
+            end
+        end
+        return out
+    end
+    size(pk, 2) + 1 <= DECODE_ATTN_MAX_CTX || error("DecodeAttention: cache longer than $(DECODE_ATTN_MAX_CTX)")
+    (D <= 256 && 256 % D == 0) || error("DecodeAttention: head_dim must divide 256")
+    o3 = Base.reshape(out, D, H, B)
+    _decode_attn_kernel!(KernelAbstractions.get_backend(o3), 256)(
+        o3, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH; ndrange = H * B * 256)
+    return out
+end
+
 # --- Float16 matmul weights ---------------------------------------------------
 # A matmul weight stored as Float16, transposed to (In, Out) so that each output
 # row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps
