@@ -21,4 +21,17 @@ using Luminal
         @test pads == 4
         @test count(st -> hasfield(typeof(st), :op) && getfield(st, :op) isa Luminal.Pad, ex.steps) == 0
     end
+
+    # An Expand read only by elementwise ops is a broadcast view: no Expand kernel
+    for dev in unique([CPUDevice(), get_device()]), free in (true, false)
+        g = Graph()
+        a = Luminal.tensor(g, [6, 3]); b = Luminal.tensor(g, [6, 4, 3])
+        out = Luminal.expand(a, 2, 4) * b + 1f0
+        av, bv = randn(Float32, 6, 3), randn(Float32, 6, 4, 3)
+        ex = compile(g; device=dev, retain=[out.id], free_intermediates=free)
+        @test Array(ex(Dict{Int,Any}(a.id => av, b.id => bv); device=dev)[out.id]) ≈
+              Base.reshape(av, 6, 1, 3) .* bv .+ 1f0
+        expand_steps = [st for st in ex.steps if hasfield(typeof(st), :op) && getfield(st, :op) isa Luminal.Expand]
+        @test all(st -> getfield(st, :aliased)[], expand_steps)
+    end
 end

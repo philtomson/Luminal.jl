@@ -532,6 +532,10 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             owned[node_id] = !is_persistent
             backing = Ref{Any}(nothing)  # reuse mode on GPU: flat buffer with spare capacity
             aliased = Ref(false)         # res[node_id] currently aliases an input's memory
+            # An Expand read only by elementwise ops is a broadcastable view (no copy).
+            bcast_ok = op isa Luminal.Expand && !isempty(consumers[node_id]) &&
+                       all(is_elementwise(graph.nodes[c].op) && !haskey(concats, c) for (c, _) in consumers[node_id]) &&
+                       !(node_id in retain)
             # A Slice read only by elementwise ops may be a strided view (no copy). Only
             # when buffers are not freed mid-run: a SubArray does not hold a reference
             # on its parent's GPU buffer the way a reshape does.
@@ -562,6 +566,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
                     sz = Tuple(dims_int)
                     alias = length(step_args) == 1 ? _alias_view(run_op, step_args[1], sz; strided_ok=strided_ok) : nothing
+                    if alias === nothing && bcast_ok && step_args[1] isa AbstractArray
+                        a = step_args[1]
+                        alias = Luminal.BroadcastView(Base.reshape(a,
+                            (size(a)[1:run_op.dim-1]..., 1, size(a)[run_op.dim:end]...)))
+                    end
                     if alias !== nothing
                         res[node_id] = alias
                         aliased[] = true

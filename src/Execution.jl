@@ -63,6 +63,15 @@ function _ensure_contiguous(x)
     return x
 end
 
+# An Expand whose every consumer is elementwise is not materialized: its result is
+# the input with a size-1 dim inserted, which broadcasting expands on the fly.
+# Wrapped so realize_view can tell it apart from a genuinely size-1 tensor.
+struct BroadcastView{A}
+    a::A
+end
+Base.size(b::BroadcastView) = size(b.a)
+Base.length(b::BroadcastView) = length(b.a)
+
 # --- Float16 matmul weights ---------------------------------------------------
 # A matmul weight stored as Float16, transposed to (In, Out) so that each output
 # row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps
@@ -385,6 +394,9 @@ function realize_view(data, st::ShapeTracker)
     # rather than reshaping it into a wrapper GPU broadcasts may not handle.
     data isa AbstractArray && ndims(data) == length(r_dims) &&
         all(i -> r_dims[i] isa Integer && size(data, i) == r_dims[i], 1:ndims(data)) && return data
+    # A broadcastable view (an elided Expand: size 1 where the graph says k) is also
+    # passed through; only elementwise ops read these, and broadcasting expands it.
+    data isa BroadcastView && return data.a
     if length(data) == prod(Int.(Luminal.eval_dim.(r_dims))) && length(data) > 1
         return Base.reshape(data, Int.(Luminal.eval_dim.(r_dims))...)
     end
