@@ -16,19 +16,28 @@ const N_FRAMES     = N_SAMPLES ÷ HOP_LENGTH       # 3000 frames per spectrogram
 
 # ── Mel Filterbank ─────────────────────────────────────────────────────────
 
+# Slaney mel scale (librosa's default, used by Whisper): linear below 1 kHz,
+# logarithmic above.
+const _MEL_F_SP     = 200.0 / 3
+const _MEL_MIN_LOG  = 1000.0
+const _MEL_LOGSTEP  = log(6.4) / 27.0
+const _MEL_MIN_LOGM = _MEL_MIN_LOG / _MEL_F_SP
+
 """
     hz_to_mel(hz)
 
-Convert a frequency in Hz to the HTK Mel scale used by Whisper.
+Convert a frequency in Hz to the Slaney Mel scale used by Whisper.
 """
-hz_to_mel(hz::Real) = 2595.0 * log10(1.0 + hz / 700.0)
+hz_to_mel(hz::Real) = hz < _MEL_MIN_LOG ? hz / _MEL_F_SP :
+                      _MEL_MIN_LOGM + log(hz / _MEL_MIN_LOG) / _MEL_LOGSTEP
 
 """
     mel_to_hz(mel)
 
-Convert a Mel-scale value back to Hz.
+Convert a Slaney Mel-scale value back to Hz.
 """
-mel_to_hz(mel::Real) = 700.0 * (10.0^(mel / 2595.0) - 1.0)
+mel_to_hz(mel::Real) = mel < _MEL_MIN_LOGM ? mel * _MEL_F_SP :
+                       _MEL_MIN_LOG * exp(_MEL_LOGSTEP * (mel - _MEL_MIN_LOGM))
 
 """
     mel_filters(n_mels::Int=80; sr=SAMPLE_RATE, n_fft=N_FFT, fmin=0.0, fmax=sr/2) -> Matrix{Float32}
@@ -69,12 +78,12 @@ function mel_filters(n_mels::Int=80;
         end
     end
 
-    # Slaney-style normalization: divide each filter by its width in Hz
-    # (librosa uses norm="slaney" by default, which makes filters unit-area)
+    # Slaney normalization (librosa norm="slaney"): scale each filter by
+    # 2 / its width in Hz, so every filter has unit area
     for m in 1:n_mels
         width_hz = mel_points[m + 2] - mel_points[m]
         if width_hz > 0
-            filters[m, :] ./= Float32(width_hz)
+            filters[m, :] .*= Float32(2.0 / width_hz)
         end
     end
 
@@ -118,7 +127,8 @@ function stft_power(audio::Vector{Float32};
     # We centre-pad the audio by n_fft÷2 on each side (reflect), then
     # compute exactly the frames that Whisper does.
     pad = n_fft ÷ 2
-    padded = vcat(reverse(audio[1:pad]), audio, reverse(audio[end-pad+1:end]))
+    # Reflect padding without repeating the edge sample (torch/numpy "reflect")
+    padded = vcat(audio[pad+1:-1:2], audio, audio[end-1:-1:end-pad])
 
     n_frames = (length(padded) - n_fft) ÷ hop_length  # drop last frame
     power    = Matrix{Float32}(undef, n_freqs, n_frames)
@@ -184,654 +194,449 @@ Load an audio file as a 16 kHz mono Float32 waveform using ffmpeg.
 Returns a Vector{Float32} with values in [-1, 1].
 """
 function load_audio_file(path::String)
-    cmd = `ffmpeg -nostdin -threads 0 -i $path -f f32le -ac 1 -ar $(SAMPLE_RATE) -`
+    cmd = `ffmpeg -nostdin -loglevel error -threads 0 -i $path -f f32le -ac 1 -ar $(SAMPLE_RATE) -`
     out = read(cmd)
     return reinterpret(Float32, out)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Encoder Constants
+# Model constants (openai/whisper-tiny). Other sizes are built by passing the
+# dimensions to `AudioEncoder` / `TextDecoder`.
 const D_MODEL = 384
 const ENC_LAYERS = 4
 const ENC_FFN_DIM = 1536
 const HEADS = 6
 const HEAD_DIM = D_MODEL ÷ HEADS
 const N_MEL_BINS = 80
+const MAX_SOURCE_POSITION = 1500
 
-# Decoder Constants
-const VOCAB_SIZE = 51864
+const VOCAB_SIZE = 51865
 const DEC_LAYERS = 4
 const DEC_FFN_DIM = 1536
 const MAX_TARGET_POSITION = 448
 
-function sinusoids(channels::Int, length::Int, cx::Luminal.Graph)
-    max_timescale = 10000.0f0
-    log_timescale_increment = log(max_timescale) / (channels / 2 - 1)
-    
-    # inv_timescales: e^(-log_inc * i)
-    inv_ts = Float32[exp(-log_timescale_increment * i) for i in 0:(channels÷2)-1]
-    inv_timescales = Luminal.tensor(cx, inv_ts) # [channels/2]
-    
-    # scaled_time = arange(length) * inv_timescales
-    # arange: [length] -> expand to [length, channels/2]
-    # inv_ts: [channels/2] -> expand to [length, channels/2]
-    
-    # For now arange needs a concrete size or symbol support:
-    time_seq = Luminal.arange(cx, length)
-    
-    # Broadcasting: (length, 1) * (1, channels/2) = (length, channels/2)
-    time_exp = Luminal.expand(time_seq, 2, channels ÷ 2)
-    inv_exp = Luminal.expand(inv_timescales, 1, length)
-    
-    scaled_time = time_exp * inv_exp
-    
-    # concat sin and cos
-    return Luminal.concat_along(Luminal.sin(scaled_time), Luminal.cos(scaled_time), 2)
-end
+# Activations use the (Hidden, Seq, Batch) layout throughout; attention heads are
+# (HeadDim, Seq, Heads, Batch). The encoder input is the log-mel spectrogram as
+# (n_mels, frames, batch).
+
+# Whisper's activation is the exact (erf) GELU.
+_gelu(x::Luminal.GraphTensor) = Luminal.gelu(x; approximate=false)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Whisper Architecture definitions
-# Whisper Self-Attention
+# Attention
 # ─────────────────────────────────────────────────────────────────────────────
 
-struct WhisperSelfAttention
+"""
+    WhisperAttention(hidden, n_heads, cx, reg=nothing, prefix="self_attn")
+
+Multi-head attention with Whisper's projections (`k_proj` has no bias). Used for
+the encoder and decoder self-attention and for the decoder's cross-attention.
+"""
+struct WhisperAttention
     q_proj::Linear
     k_proj::Linear
     v_proj::Linear
-    o_proj::Linear
+    out_proj::Linear
+    n_heads::Int
 end
 
-function WhisperSelfAttention(hidden::Int, cx::Luminal.Graph,
-                               reg=nothing, prefix::String="attn")
-    return WhisperSelfAttention(
+function WhisperAttention(hidden::Int, n_heads::Int, cx::Luminal.Graph,
+                          reg=nothing, prefix::String="self_attn")
+    return WhisperAttention(
         _linear(hidden, hidden, cx, reg, "$(prefix).q_proj"; bias=true),
         _linear(hidden, hidden, cx, reg, "$(prefix).k_proj"; bias=false),
         _linear(hidden, hidden, cx, reg, "$(prefix).v_proj"; bias=true),
         _linear(hidden, hidden, cx, reg, "$(prefix).out_proj"; bias=true),
-    )
+        n_heads)
 end
 
-function (sa::WhisperSelfAttention)(x::Luminal.GraphTensor, mask::Bool, cache=nothing)
-    batch, seq, hidden = Luminal.realized_dims(x.shape)
-    scale = (Float32(hidden) / Float32(HEADS)) ^ -0.25f0
+const WhisperSelfAttention  = WhisperAttention
+const WhisperCrossAttention = WhisperAttention
 
-    queries = Luminal.permute(Luminal.reshape(sa.q_proj(x) * scale, [batch, seq, HEADS, HEAD_DIM]), [1, 3, 2, 4])
-    keys    = Luminal.contiguous(Luminal.permute(Luminal.reshape(sa.k_proj(x) * scale, [batch, seq, HEADS, HEAD_DIM]), [1, 3, 4, 2]))
-    values  = Luminal.permute(Luminal.reshape(sa.v_proj(x), [batch, seq, HEADS, HEAD_DIM]), [1, 3, 2, 4])
+# (Hidden, S, B) -> (HeadDim, S, Heads, B). Projections are packed head-major, so
+# the head dimension is the fastest-varying one.
+function _split_heads(x::Luminal.GraphTensor, n_heads::Int)
+    hidden, s, b = Luminal.realized_dims(x.shape)
+    return Luminal.permute(Luminal.reshape(x, [hidden ÷ n_heads, n_heads, s, b]), [1, 3, 2, 4])
+end
 
-    weights = Luminal.matmul(queries, keys)
-
-    if mask
-        attention_mask = Luminal.triu(x.graph_ref, seq, 1) * -1f9
-        mask_expanded = Luminal.expand(Luminal.expand(attention_mask, 1, HEADS), 1, batch)
-        weights = weights + mask_expanded
+# Scaled dot-product attention over (D, S, H, B) heads -> (D*H, Sq, B).
+function _attend(q::Luminal.GraphTensor, k::Luminal.GraphTensor, v::Luminal.GraphTensor;
+                 causal::Bool=false)
+    d, sq, h, b = Luminal.realized_dims(q.shape)
+    scale = 1.0f0 / sqrt(Float32(d))
+    weights = Luminal.matmul(Luminal.permute(q, [2, 1, 3, 4]), k) * scale   # (Sq, Sk, H, B)
+    if causal && sq > 1
+        mask = Luminal.triu(q.graph_ref, sq, 1) * -1f9
+        weights = weights + Luminal.expand(Luminal.expand(mask, 3, h), 4, b)
     end
+    probs = Luminal.softmax(weights, 2)
+    out = Luminal.matmul(probs, Luminal.permute(v, [2, 1, 3, 4]))           # (Sq, D, H, B)
+    return Luminal.reshape(Luminal.permute(out, [2, 3, 1, 4]), [d * h, sq, b])
+end
 
-    probs = Luminal.softmax(weights, 4)
-    out   = Luminal.matmul(probs, values)
-    out   = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [batch, seq, hidden])
+"""
+    (a::WhisperAttention)(x, kv=x; causal=false)
 
-    return sa.o_proj(out), (keys, values)
+`x`: (Hidden, Sq, B) queries; `kv`: (Hidden, Sk, B) keys/values source (the
+encoder output for cross-attention).
+"""
+function (a::WhisperAttention)(x::Luminal.GraphTensor, kv::Luminal.GraphTensor=x;
+                               causal::Bool=false)
+    q = _split_heads(a.q_proj(x), a.n_heads)
+    k = _split_heads(a.k_proj(kv), a.n_heads)
+    v = _split_heads(a.v_proj(kv), a.n_heads)
+    return a.out_proj(_attend(q, k, v; causal=causal))
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Whisper Cross-Attention
-# ─────────────────────────────────────────────────────────────────────────────
-
-struct WhisperCrossAttention
-    q_proj::Linear
-    k_proj::Linear
-    v_proj::Linear
-    o_proj::Linear
-end
-
-function WhisperCrossAttention(hidden::Int, cx::Luminal.Graph,
-                                reg=nothing, prefix::String="cross_attn")
-    return WhisperCrossAttention(
-        _linear(hidden, hidden, cx, reg, "$(prefix).q_proj"; bias=true),
-        _linear(hidden, hidden, cx, reg, "$(prefix).k_proj"; bias=false),
-        _linear(hidden, hidden, cx, reg, "$(prefix).v_proj"; bias=true),
-        _linear(hidden, hidden, cx, reg, "$(prefix).out_proj"; bias=true),
-    )
-end
-
-function (ca::WhisperCrossAttention)(queries_t::Luminal.GraphTensor,
-                                     keys_t::Luminal.GraphTensor,
-                                     values_t::Luminal.GraphTensor)
-    batch, dec_seq, hidden = Luminal.realized_dims(queries_t.shape)
-    _, enc_seq, _          = Luminal.realized_dims(keys_t.shape)
-
-    scale   = (Float32(hidden) / Float32(HEADS)) ^ -0.25f0
-    queries = Luminal.permute(Luminal.reshape(ca.q_proj(queries_t) * scale, [batch, dec_seq, HEADS, HEAD_DIM]), [1, 3, 2, 4])
-    keys    = Luminal.contiguous(Luminal.permute(Luminal.reshape(ca.k_proj(keys_t) * scale, [batch, enc_seq, HEADS, HEAD_DIM]), [1, 3, 4, 2]))
-    values  = Luminal.permute(Luminal.reshape(ca.v_proj(values_t), [batch, enc_seq, HEADS, HEAD_DIM]), [1, 3, 2, 4])
-
-    weights = Luminal.matmul(queries, keys)
-    probs   = Luminal.softmax(weights, 4)
-    out     = Luminal.matmul(probs, values)
-    out     = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [batch, dec_seq, hidden])
-
-    return ca.o_proj(out), (keys, values)
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Encoder Transformer Block
+# Encoder
 # ─────────────────────────────────────────────────────────────────────────────
 
 struct EncoderTransformerBlock
-    attn::WhisperSelfAttention
-    attn_norm::LayerNorm
-    ff1::Linear
-    ff2::Linear
-    ff_norm::LayerNorm
+    self_attn::WhisperAttention
+    self_attn_layer_norm::LayerNorm
+    fc1::Linear
+    fc2::Linear
+    final_layer_norm::LayerNorm
 end
 
-function EncoderTransformerBlock(hidden::Int, ff::Int, cx::Luminal.Graph,
-                                  reg=nothing, prefix::String="block")
+function EncoderTransformerBlock(hidden::Int, n_heads::Int, ff::Int, cx::Luminal.Graph,
+                                 reg=nothing, prefix::String="block")
     return EncoderTransformerBlock(
-        WhisperSelfAttention(hidden, cx, reg, "$(prefix).attn"),
-        _layernorm(hidden, cx, reg, "$(prefix).attn_layer_norm"),
-        _linear(hidden, ff,     cx, reg, "$(prefix).mlp.fc1"),
-        _linear(ff,     hidden, cx, reg, "$(prefix).mlp.fc2"),
-        _layernorm(hidden, cx, reg, "$(prefix).final_layer_norm"),
-    )
+        WhisperAttention(hidden, n_heads, cx, reg, "$(prefix).self_attn"),
+        _layernorm(hidden, cx, reg, "$(prefix).self_attn_layer_norm"),
+        _linear(hidden, ff,     cx, reg, "$(prefix).fc1"),
+        _linear(ff,     hidden, cx, reg, "$(prefix).fc2"),
+        _layernorm(hidden, cx, reg, "$(prefix).final_layer_norm"))
 end
 
-function (etb::EncoderTransformerBlock)(x::Luminal.GraphTensor)
-    normed  = etb.attn_norm(x)
-    y, _    = etb.attn(normed, false)
-    x       = x + y
-    normed_ff = etb.ff_norm(x)
-    y = etb.ff2(Luminal.gelu(etb.ff1(normed_ff)))
-    return x + y
+function (b::EncoderTransformerBlock)(x::Luminal.GraphTensor)
+    x = x + b.self_attn(b.self_attn_layer_norm(x))
+    return x + b.fc2(_gelu(b.fc1(b.final_layer_norm(x))))
 end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Audio Encoder
-# ─────────────────────────────────────────────────────────────────────────────
 
 struct AudioEncoder
     conv1::Conv1D
     conv2::Conv1D
+    embed_positions::Luminal.GraphTensor    # (max_source_positions, Hidden)
     layers::Vector{EncoderTransformerBlock}
-    post_ln::LayerNorm
+    layer_norm::LayerNorm
 end
 
 """
-    AudioEncoder(cx; reg=nothing)
+    AudioEncoder(cx; reg=nothing, d_model, n_layers, n_heads, ffn_dim, n_mels, max_positions)
 
-Build the Whisper AudioEncoder.  Pass a `WeightRegistry` to register all
-parameter tensors with their HuggingFace safetensors key names.
+Build the Whisper audio encoder (defaults: whisper-tiny). Pass a `WeightRegistry`
+to register every parameter under its Hugging Face safetensors key.
 """
-function AudioEncoder(cx::Luminal.Graph; reg=nothing)
+function AudioEncoder(cx::Luminal.Graph; reg=nothing,
+                      d_model::Int=D_MODEL, n_layers::Int=ENC_LAYERS, n_heads::Int=HEADS,
+                      ffn_dim::Int=ENC_FFN_DIM, n_mels::Int=N_MEL_BINS,
+                      max_positions::Int=MAX_SOURCE_POSITION)
     pfx = "model.encoder"
-    layers = [
-        EncoderTransformerBlock(D_MODEL, ENC_FFN_DIM, cx, reg,
-                                "$(pfx).layers.$(i-1)")
-        for i in 1:ENC_LAYERS
-    ]
-    enc = AudioEncoder(
-        _conv1d(N_MEL_BINS, D_MODEL, 3, cx, reg, "$(pfx).conv1"; stride=1, padding=1),
-        _conv1d(D_MODEL,    D_MODEL, 3, cx, reg, "$(pfx).conv2"; stride=2, padding=1),
-        layers,
-        _layernorm(D_MODEL, cx, reg, "$(pfx).layer_norm"),
-    )
-    return enc
+    pos = Luminal.tensor(cx, [max_positions, d_model])
+    reg !== nothing && register_weight!(reg, "$(pfx).embed_positions.weight", pos)
+    return AudioEncoder(
+        _conv1d(n_mels,  d_model, 3, cx, reg, "$(pfx).conv1"; stride=1, padding=1),
+        _conv1d(d_model, d_model, 3, cx, reg, "$(pfx).conv2"; stride=2, padding=1),
+        pos,
+        [EncoderTransformerBlock(d_model, n_heads, ffn_dim, cx, reg, "$(pfx).layers.$(i-1)")
+         for i in 1:n_layers],
+        _layernorm(d_model, cx, reg, "$(pfx).layer_norm"))
 end
 
-function (ae::AudioEncoder)(x::Luminal.GraphTensor)
-    _, _, seq = Luminal.realized_dims(x.shape)
+# Rows [0, s) of a (positions, Hidden) table as (Hidden, s, 1).
+function _positions(table::Luminal.GraphTensor, s)
+    return Luminal.permute(Luminal.slice_along(table, 1, 0, s), [2, 1])
+end
 
-    x = ae.conv1(x)
-    x = Luminal.gelu(x)
-    x = ae.conv2(x)
-    x = Luminal.gelu(x)
-    x = Luminal.permute(x, [1, 3, 2])
+"""
+    (ae::AudioEncoder)(mel)
 
-    _, seq_out, _ = Luminal.realized_dims(x.shape)
-    seq_div_2 = typeof(seq_out) == Int ? seq_out : 1
-
-    pos_embs = sinusoids(D_MODEL, seq_div_2, x.graph_ref)
-    batch    = Luminal.realized_dims(x.shape)[1]
-    pos_embs = Luminal.expand(pos_embs, 1, batch)
-
-    x = x + pos_embs
+`mel`: (n_mels, frames, B) log-mel spectrogram -> (Hidden, frames ÷ 2, B).
+"""
+function (ae::AudioEncoder)(mel::Luminal.GraphTensor)
+    x = _gelu(ae.conv1(mel))
+    x = _gelu(ae.conv2(x))
+    x = x + _positions(ae.embed_positions, Luminal.realized_dims(x.shape)[2])
     for layer in ae.layers
         x = layer(x)
     end
-    return ae.post_ln(x)
+    return ae.layer_norm(x)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Decoder Transformer Block
+# Decoder
 # ─────────────────────────────────────────────────────────────────────────────
 
 struct DecoderTransformerBlock
-    attn::WhisperSelfAttention
-    attn_norm::LayerNorm
-    cross_attn::WhisperCrossAttention
-    cross_attn_norm::LayerNorm
-    ff1::Linear
-    ff2::Linear
-    ff_norm::LayerNorm
+    self_attn::WhisperAttention
+    self_attn_layer_norm::LayerNorm
+    encoder_attn::WhisperAttention
+    encoder_attn_layer_norm::LayerNorm
+    fc1::Linear
+    fc2::Linear
+    final_layer_norm::LayerNorm
 end
 
-function DecoderTransformerBlock(hidden::Int, ff::Int, cx::Luminal.Graph,
-                                  reg=nothing, prefix::String="block")
+function DecoderTransformerBlock(hidden::Int, n_heads::Int, ff::Int, cx::Luminal.Graph,
+                                 reg=nothing, prefix::String="block")
     return DecoderTransformerBlock(
-        WhisperSelfAttention(hidden, cx, reg, "$(prefix).self_attn"),
+        WhisperAttention(hidden, n_heads, cx, reg, "$(prefix).self_attn"),
         _layernorm(hidden, cx, reg, "$(prefix).self_attn_layer_norm"),
-        WhisperCrossAttention(hidden, cx, reg, "$(prefix).encoder_attn"),
+        WhisperAttention(hidden, n_heads, cx, reg, "$(prefix).encoder_attn"),
         _layernorm(hidden, cx, reg, "$(prefix).encoder_attn_layer_norm"),
         _linear(hidden, ff,     cx, reg, "$(prefix).fc1"),
         _linear(ff,     hidden, cx, reg, "$(prefix).fc2"),
-        _layernorm(hidden, cx, reg, "$(prefix).final_layer_norm"),
-    )
+        _layernorm(hidden, cx, reg, "$(prefix).final_layer_norm"))
 end
 
-function (dtb::DecoderTransformerBlock)(x::Luminal.GraphTensor, encoded::Luminal.GraphTensor)
-    normed    = dtb.attn_norm(x)
-    y, _      = dtb.attn(normed, true)
-    x         = x + y
-    normed_cr = dtb.cross_attn_norm(x)
-    y, _      = dtb.cross_attn(normed_cr, encoded, encoded)
-    x         = x + y
-    normed_ff = dtb.ff_norm(x)
-    y = dtb.ff2(Luminal.gelu(dtb.ff1(normed_ff)))
-    return x + y
+function (b::DecoderTransformerBlock)(x::Luminal.GraphTensor, encoded::Luminal.GraphTensor)
+    x = x + b.self_attn(b.self_attn_layer_norm(x); causal=true)
+    x = x + b.encoder_attn(b.encoder_attn_layer_norm(x), encoded)
+    return x + b.fc2(_gelu(b.fc1(b.final_layer_norm(x))))
 end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Text Decoder
-# ─────────────────────────────────────────────────────────────────────────────
 
 struct TextDecoder
-    embedding::Embedding
-    pos_embedding::Luminal.GraphTensor
+    embed_tokens::Embedding                   # (Vocab, Hidden), tied to the output head
+    embed_positions::Luminal.GraphTensor      # (max_target_positions, Hidden)
     layers::Vector{DecoderTransformerBlock}
     layer_norm::LayerNorm
 end
 
 """
-    TextDecoder(cx; reg=nothing)
+    TextDecoder(cx; reg=nothing, d_model, n_layers, n_heads, ffn_dim, vocab_size, max_positions)
 
-Build the Whisper TextDecoder.  Pass a `WeightRegistry` to register all
-parameter tensors with their HuggingFace safetensors key names.
+Build the Whisper text decoder (defaults: whisper-tiny). Pass a `WeightRegistry`
+to register every parameter under its Hugging Face safetensors key.
 """
-function TextDecoder(cx::Luminal.Graph; reg=nothing)
+function TextDecoder(cx::Luminal.Graph; reg=nothing,
+                     d_model::Int=D_MODEL, n_layers::Int=DEC_LAYERS, n_heads::Int=HEADS,
+                     ffn_dim::Int=DEC_FFN_DIM, vocab_size::Int=VOCAB_SIZE,
+                     max_positions::Int=MAX_TARGET_POSITION)
     pfx = "model.decoder"
-    emb_weight = Luminal.tensor(cx, [VOCAB_SIZE, D_MODEL])
-    pos_emb    = Luminal.tensor(cx, [MAX_TARGET_POSITION, D_MODEL])
-
-    if reg !== nothing
-        register_weight!(reg, "$(pfx).embed_tokens.weight", emb_weight)
-        register_weight!(reg, "$(pfx).embed_positions.weight", pos_emb)
-    end
-
-    layers = [
-        DecoderTransformerBlock(D_MODEL, DEC_FFN_DIM, cx, reg,
-                                "$(pfx).layers.$(i-1)")
-        for i in 1:DEC_LAYERS
-    ]
-
+    pos = Luminal.tensor(cx, [max_positions, d_model])
+    reg !== nothing && register_weight!(reg, "$(pfx).embed_positions.weight", pos)
     return TextDecoder(
-        Embedding(emb_weight),          # reuse registered tensor
-        pos_emb,
-        layers,
-        _layernorm(D_MODEL, cx, reg, "$(pfx).layer_norm"),
-    )
+        _embedding(vocab_size, d_model, cx, reg, "$(pfx).embed_tokens"),
+        pos,
+        [DecoderTransformerBlock(d_model, n_heads, ffn_dim, cx, reg, "$(pfx).layers.$(i-1)")
+         for i in 1:n_layers],
+        _layernorm(d_model, cx, reg, "$(pfx).layer_norm"))
 end
 
-function (td::TextDecoder)(enc_output::Luminal.GraphTensor, input::Luminal.GraphTensor)
-    x = td.embedding(input)
+"""
+    (td::TextDecoder)(encoded, tokens)
 
-    _, cur_seq = Luminal.realized_dims(input.shape)
-    cur_seq_int = typeof(cur_seq) == Int ? cur_seq : 1
-
-    pos_emb_sliced = Luminal.contiguous(Luminal.slice_along(td.pos_embedding, 1, 0, cur_seq_int))
-    x = x + Luminal.expand(pos_emb_sliced, 1, Luminal.realized_dims(x.shape)[1])
-
+Full-sequence (uncached) decoder. `encoded`: (Hidden, S_enc, B) encoder output;
+`tokens`: (S, B) 0-indexed token ids. Returns logits (Vocab, S, B).
+"""
+function (td::TextDecoder)(encoded::Luminal.GraphTensor, tokens::Luminal.GraphTensor)
+    x = td.embed_tokens(tokens)
+    x = x + _positions(td.embed_positions, Luminal.realized_dims(x.shape)[2])
     for layer in td.layers
-        x = layer(x, enc_output)
+        x = layer(x, encoded)
     end
+    return Luminal.matmul(td.embed_tokens.weight, td.layer_norm(x))
+end
 
-    out    = td.layer_norm(x)
-    logits = Luminal.matmul(out, Luminal.permute(td.embedding.weight, [2, 1]))
-    return logits
+# Dimensions of a built decoder, for rebuilding it in another graph.
+function decoder_config(td::TextDecoder)
+    vocab, d_model = Luminal.realized_dims(td.embed_tokens.weight.shape)
+    layer = td.layers[1]
+    return (d_model=d_model, n_layers=length(td.layers), n_heads=layer.self_attn.n_heads,
+            ffn_dim=Luminal.realized_dims(layer.fc1.weight.shape)[1], vocab_size=vocab,
+            max_positions=Luminal.realized_dims(td.embed_positions.shape)[1])
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KV Cache Infrastructure
+# KV-cached incremental decoding
 #
-# Design: "Incremental Decode Graph"
-# The past KV cache is a pre-allocated input tensor (batch, heads, max_seq, head_dim).
-# Each decode step, new K/V is written at position `step_pos` using
-# slice_along + concat_along (the graph's existing pad/slice ops).
-# The updated cache is an output the host feeds back at the next step.
+# The decode step is one shape-static graph for every position: the position is
+# data (a (1,) tensor), self-attention reads the device-resident cache under
+# `DecodeAttention`, and the host writes each step's K/V slot into the cache in
+# place. Cross-attention K/V are projected once from the encoder output.
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
     KVCacheState
 
-Host-side state manager for one decode session.
+Device-resident K/V for one decode session.
+- `self_cache[i]`: `(K, V)` for decoder layer i, each (head_dim, max_seq, heads, batch)
+- `cross_cache[i]`: `(K, V)` projected from the encoder output, each
+  (head_dim, enc_seq, heads, batch)
+- `step_pos`: 0-indexed position of the next token
 """
-mutable struct KVCacheState
+mutable struct KVCacheState{A<:AbstractArray{Float32,4}}
     step_pos::Int
     max_seq::Int
-    self_cache::Vector{Tuple{Array{Float32,4}, Array{Float32,4}}}   # per layer
-    cross_cache::Vector{Tuple{Array{Float32,4}, Array{Float32,4}}}  # per layer (fixed)
+    self_cache::Vector{Tuple{A, A}}
+    cross_cache::Vector{Tuple{A, A}}
 end
 
 """
-    KVCacheState(batch, n_layers, n_heads, head_dim, enc_seq; max_seq=MAX_TARGET_POSITION)
+    KVCacheState(n_layers, n_heads, head_dim, enc_seq; batch=1, max_seq=MAX_TARGET_POSITION,
+                 device=CPUDevice())
 
-Allocate a zeroed KV cache for a new decode session.
+Allocate a zeroed cache.
 """
-function KVCacheState(batch::Int, n_layers::Int, n_heads::Int, head_dim::Int, enc_seq::Int;
-                      max_seq::Int=MAX_TARGET_POSITION)
-    self  = [(zeros(Float32, batch, n_heads, max_seq, head_dim),
-              zeros(Float32, batch, n_heads, max_seq, head_dim))
-             for _ in 1:n_layers]
-    cross = [(zeros(Float32, batch, n_heads, enc_seq, head_dim),
-              zeros(Float32, batch, n_heads, enc_seq, head_dim))
-             for _ in 1:n_layers]
-    return KVCacheState(0, max_seq, self, cross)
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Graph-level cached attention helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    _kv_scatter(past, new_slot, step_pos)
-
-Insert `new_slot` (shape …×1×D) into `past` (…×max_seq×D) at index `step_pos`
-using slice-and-concat operations that are native to the Luminal graph.
-"""
-function _kv_scatter(past::Luminal.GraphTensor, new_slot::Luminal.GraphTensor, step_pos::Int)
-    max_seq = Luminal.realized_dims(past.shape)[3]
-    suffix_len = max_seq - step_pos - 1
-
-    if step_pos == 0
-        return Luminal.concat_along(new_slot,
-                   Luminal.slice_along(past, 3, 1, max_seq), 3)
-    elseif suffix_len == 0
-        return Luminal.concat_along(
-                   Luminal.slice_along(past, 3, 0, step_pos),
-                   new_slot, 3)
-    else
-        return Luminal.concat_along(
-                   Luminal.concat_along(
-                       Luminal.slice_along(past, 3, 0, step_pos),
-                       new_slot, 3),
-                   Luminal.slice_along(past, 3, step_pos + 1, max_seq), 3)
-    end
+function KVCacheState(n_layers::Int, n_heads::Int, head_dim::Int, enc_seq::Int;
+                      batch::Int=1, max_seq::Int=MAX_TARGET_POSITION,
+                      device::Luminal.AbstractDevice=Luminal.CPUDevice())
+    z(s) = Luminal.zero_tensor(device, Float32, head_dim, s, n_heads, batch)
+    return KVCacheState(0, max_seq,
+                        [(z(max_seq), z(max_seq)) for _ in 1:n_layers],
+                        [(z(enc_seq), z(enc_seq)) for _ in 1:n_layers])
 end
 
 """
-    whisper_self_attn_cached(sa, x, step_pos, past_k, past_v)
+    whisper_self_attn_cached(sa, x, pos_tensor, past_k, past_v)
 
-Single-token cached self-attention.
-
-- `x`       : (batch, 1, hidden)
-- `step_pos`: current 0-indexed decode position
-- `past_k`  : (batch, heads, max_seq, head_dim)
-- `past_v`  : (batch, heads, max_seq, head_dim)
-
-Returns `(output, new_k, new_v)`.
+Single-token causal self-attention against the cache.
+- `x`: (Hidden, 1, B); `pos_tensor`: (1,) current position, as data
+- `past_k`, `past_v`: (head_dim, max_seq, heads, B); slots `>= pos` are ignored
+Returns `(output, k_new, v_new)`, with this token's (head_dim, 1, heads, B) K/V slot.
 """
-function whisper_self_attn_cached(sa::WhisperSelfAttention,
-                                   x::Luminal.GraphTensor,
-                                   step_pos::Int,
-                                   past_k::Luminal.GraphTensor,
-                                   past_v::Luminal.GraphTensor)
-    batch, _, hidden = Luminal.realized_dims(x.shape)
-    scale = (Float32(hidden) / Float32(HEADS)) ^ -0.25f0
-
-    # Project: (batch, 1, hidden) → (batch, heads, 1, head_dim)
-    q = Luminal.permute(
-        Luminal.reshape(sa.q_proj(x) * scale, [batch, 1, HEADS, HEAD_DIM]),
-        [1, 3, 2, 4])
-    # k_new: (batch, heads, 1, head_dim) after fixing permute order
-    k_new = Luminal.contiguous(
-        Luminal.permute(
-            Luminal.reshape(sa.k_proj(x) * scale, [batch, 1, HEADS, HEAD_DIM]),
-            [1, 3, 2, 4]))
-    v_new = Luminal.permute(
-        Luminal.reshape(sa.v_proj(x), [batch, 1, HEADS, HEAD_DIM]),
-        [1, 3, 2, 4])
-
-    # Update cache
-    new_k = _kv_scatter(past_k, k_new, step_pos)
-    new_v = _kv_scatter(past_v, v_new, step_pos)
-
-    # Attend over context [0 : step_pos+1]
-    k_ctx   = Luminal.slice_along(new_k, 3, 0, step_pos + 1)   # (b, h, ctx, d)
-    v_ctx   = Luminal.slice_along(new_v, 3, 0, step_pos + 1)   # (b, h, ctx, d)
-    k_ctx_t = Luminal.contiguous(Luminal.permute(k_ctx, [1, 2, 4, 3]))  # (b, h, d, ctx)
-
-    weights = Luminal.matmul(q, k_ctx_t)     # (b, h, 1, ctx)
-    probs   = Luminal.softmax(weights, 4)
-    out     = Luminal.matmul(probs, v_ctx)   # (b, h, 1, d)
-    out     = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [batch, 1, hidden])
-
-    return sa.o_proj(out), new_k, new_v
+function whisper_self_attn_cached(sa::WhisperAttention, x::Luminal.GraphTensor,
+                                  pos_tensor::Luminal.GraphTensor,
+                                  past_k::Luminal.GraphTensor, past_v::Luminal.GraphTensor)
+    hidden, _, batch = Luminal.realized_dims(x.shape)
+    d = hidden ÷ sa.n_heads
+    q     = _split_heads(sa.q_proj(x), sa.n_heads)
+    k_new = _split_heads(sa.k_proj(x), sa.n_heads)
+    v_new = _split_heads(sa.v_proj(x), sa.n_heads)
+    ins = [(t.id, 0, t.shape) for t in (q, past_k, past_v, k_new, v_new, pos_tensor)]
+    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(1.0f0 / sqrt(Float32(d))), ins,
+                          Luminal.ShapeTracker([d, sa.n_heads, batch]))
+    return sa.out_proj(Luminal.reshape(out, [hidden, 1, batch])), k_new, v_new
 end
 
 """
     whisper_cross_attn_cached(ca, x, enc_k, enc_v)
 
-Single-token cross-attention using the pre-computed encoder K/V.
-- `enc_k`, `enc_v`: (batch, heads, enc_seq, head_dim)
+Single-token cross-attention against the projected encoder K/V.
+- `x`: (Hidden, 1, B); `enc_k`, `enc_v`: (head_dim, enc_seq, heads, B)
 """
-function whisper_cross_attn_cached(ca::WhisperCrossAttention,
-                                    x::Luminal.GraphTensor,
-                                    enc_k::Luminal.GraphTensor,
-                                    enc_v::Luminal.GraphTensor)
-    batch, _, hidden = Luminal.realized_dims(x.shape)
-    scale = (Float32(hidden) / Float32(HEADS)) ^ -0.25f0
-
-    q   = Luminal.permute(
-              Luminal.reshape(ca.q_proj(x) * scale, [batch, 1, HEADS, HEAD_DIM]),
-              [1, 3, 2, 4])                              # (b, h, 1, d)
-    k_t = Luminal.contiguous(Luminal.permute(enc_k, [1, 2, 4, 3]))  # (b, h, d, enc_seq)
-
-    weights = Luminal.matmul(q, k_t)         # (b, h, 1, enc_seq)
-    probs   = Luminal.softmax(weights, 4)
-    out     = Luminal.matmul(probs, enc_v)   # (b, h, 1, d)
-    out     = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [batch, 1, hidden])
-    return ca.o_proj(out)
+function whisper_cross_attn_cached(ca::WhisperAttention, x::Luminal.GraphTensor,
+                                   enc_k::Luminal.GraphTensor, enc_v::Luminal.GraphTensor)
+    hidden, _, batch = Luminal.realized_dims(x.shape)
+    d = hidden ÷ ca.n_heads
+    q = _split_heads(ca.q_proj(x), ca.n_heads)                            # (D, 1, H, B)
+    # With one query every transpose below moves a size-1 dim, so none copies.
+    scores = Luminal.matmul(Luminal.permute(q, [2, 1, 3, 4]), enc_k) *
+             (1.0f0 / sqrt(Float32(d)))                                   # (1, S, H, B)
+    probs = Luminal.softmax(scores, 2)
+    out = Luminal.matmul(enc_v, Luminal.permute(probs, [2, 1, 3, 4]))    # (D, 1, H, B)
+    out = Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [hidden, 1, batch])
+    return ca.out_proj(out)
 end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Incremental Decode Step Graph
-# ─────────────────────────────────────────────────────────────────────────────
 
 """
     IncrementalDecodeGraph
 
-Node IDs for driving one step of the incremental decode graph.
+Node IDs for driving the incremental decode graph.
 """
 struct IncrementalDecodeGraph
     token_input_id::Int
+    pos_input_id::Int
     cross_k_ids::Vector{Int}          # encoder K inputs, per layer
     cross_v_ids::Vector{Int}          # encoder V inputs, per layer
-    self_k_ids::Vector{Int}           # past self-K inputs, per layer
-    self_v_ids::Vector{Int}           # past self-V inputs, per layer
-    logits_id::Int                    # output logits
-    new_self_k_ids::Vector{Int}       # output updated self-K, per layer
-    new_self_v_ids::Vector{Int}       # output updated self-V, per layer
-    step_pos::Base.RefValue{Int}      # current decode position (host-managed)
+    self_k_ids::Vector{Int}           # self-attention K cache inputs, per layer
+    self_v_ids::Vector{Int}           # self-attention V cache inputs, per layer
+    logits_id::Int                    # (Vocab, 1, B)
+    new_self_k_ids::Vector{Int}       # this step's K slot per layer, (D, 1, H, B)
+    new_self_v_ids::Vector{Int}       # this step's V slot per layer, (D, 1, H, B)
 end
 
 """
-    build_decode_step!(td, graph, enc_seq, step_pos; max_seq, batch)
+    build_decode_step!(td, graph, enc_seq; max_seq=MAX_TARGET_POSITION, batch=1)
 
-Build the single-step incremental decode graph inside `graph`.
-
-One graph must be built PER step_pos value (since `step_pos` is baked into
-the slice positions). For typical use, build up to `max_decode_steps` graphs
-ahead of time, or rebuild lazily per step.
-
-Returns an `IncrementalDecodeGraph`.
+Build the single-token decode graph for `td` (whose weights live in `graph`).
+The graph is independent of the position, so it is compiled (and captured) once.
 """
-function build_decode_step!(td::TextDecoder, graph::Luminal.Graph,
-                             enc_seq::Int, step_pos::Int;
-                             max_seq::Int=MAX_TARGET_POSITION,
-                             batch::Int=1)
-    n_layers = length(td.layers)
+function build_decode_step!(td::TextDecoder, graph::Luminal.Graph, enc_seq::Int;
+                            max_seq::Int=MAX_TARGET_POSITION, batch::Int=1)
+    cfg = decoder_config(td)
+    h, d = cfg.n_heads, cfg.d_model ÷ cfg.n_heads
+    n = cfg.n_layers
+    token_in = Luminal.tensor(graph, [1, batch])
+    pos_in   = Luminal.tensor(graph, [1])
+    cross_k  = [Luminal.tensor(graph, [d, enc_seq, h, batch]) for _ in 1:n]
+    cross_v  = [Luminal.tensor(graph, [d, enc_seq, h, batch]) for _ in 1:n]
+    self_k   = [Luminal.tensor(graph, [d, max_seq, h, batch]) for _ in 1:n]
+    self_v   = [Luminal.tensor(graph, [d, max_seq, h, batch]) for _ in 1:n]
 
-    # ── Define inputs ────────────────────────────────────────────────────────
-    token_in = Luminal.tensor(graph, [batch, 1])
+    x = td.embed_tokens(token_in)                                              # (Hidden, 1, B)
+    x = x + Embedding(td.embed_positions)(Luminal.reshape(pos_in, [1, 1]))     # (Hidden, 1, 1)
 
-    cross_k_tensors = [Luminal.tensor(graph, [batch, HEADS, enc_seq, HEAD_DIM])
-                       for _ in 1:n_layers]
-    cross_v_tensors = [Luminal.tensor(graph, [batch, HEADS, enc_seq, HEAD_DIM])
-                       for _ in 1:n_layers]
-    self_k_tensors  = [Luminal.tensor(graph, [batch, HEADS, max_seq, HEAD_DIM])
-                       for _ in 1:n_layers]
-    self_v_tensors  = [Luminal.tensor(graph, [batch, HEADS, max_seq, HEAD_DIM])
-                       for _ in 1:n_layers]
-
-    # ── Embedding + positional ───────────────────────────────────────────────
-    x = td.embedding(token_in)                                  # (batch, 1, D_MODEL)
-    pos_slot = Luminal.contiguous(
-        Luminal.slice_along(td.pos_embedding, 1, step_pos, step_pos + 1))
-    x = x + Luminal.expand(pos_slot, 1, batch)                 # add positional
-
-    # ── Decoder layers ───────────────────────────────────────────────────────
-    new_self_k_tensors = Luminal.GraphTensor[]
-    new_self_v_tensors = Luminal.GraphTensor[]
-
+    new_k = Luminal.GraphTensor[]
+    new_v = Luminal.GraphTensor[]
     for (i, layer) in enumerate(td.layers)
-        normed        = layer.attn_norm(x)
-        attn_out, nk, nv = whisper_self_attn_cached(
-            layer.attn, normed, step_pos,
-            self_k_tensors[i], self_v_tensors[i])
-        x = x + attn_out
-        push!(new_self_k_tensors, nk)
-        push!(new_self_v_tensors, nv)
-
-        normed_cr = layer.cross_attn_norm(x)
-        cross_out = whisper_cross_attn_cached(
-            layer.cross_attn, normed_cr,
-            cross_k_tensors[i], cross_v_tensors[i])
-        x = x + cross_out
-
-        normed_ff = layer.ff_norm(x)
-        y = layer.ff2(Luminal.gelu(layer.ff1(normed_ff)))
+        y, nk, nv = whisper_self_attn_cached(layer.self_attn, layer.self_attn_layer_norm(x),
+                                             pos_in, self_k[i], self_v[i])
         x = x + y
+        push!(new_k, nk)
+        push!(new_v, nv)
+        x = x + whisper_cross_attn_cached(layer.encoder_attn, layer.encoder_attn_layer_norm(x),
+                                          cross_k[i], cross_v[i])
+        x = x + layer.fc2(_gelu(layer.fc1(layer.final_layer_norm(x))))
     end
+    logits = Luminal.matmul(td.embed_tokens.weight, td.layer_norm(x))          # (Vocab, 1, B)
 
-    out    = td.layer_norm(x)                                   # (batch, 1, D_MODEL)
-    logits = Luminal.matmul(
-        Luminal.contiguous(Luminal.slice_along(out, 2, 0, 1)),
-        Luminal.permute(td.embedding.weight, [2, 1]))           # (batch, 1, vocab)
-
-    return IncrementalDecodeGraph(
-        token_in.id,
-        [t.id for t in cross_k_tensors],
-        [t.id for t in cross_v_tensors],
-        [t.id for t in self_k_tensors],
-        [t.id for t in self_v_tensors],
-        logits.id,
-        [t.id for t in new_self_k_tensors],
-        [t.id for t in new_self_v_tensors],
-        Ref(step_pos))
+    ids(ts) = [t.id for t in ts]
+    return IncrementalDecodeGraph(token_in.id, pos_in.id, ids(cross_k), ids(cross_v),
+                                  ids(self_k), ids(self_v), logits.id, ids(new_k), ids(new_v))
 end
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Host-side decode step helper
-# ─────────────────────────────────────────────────────────────────────────────
-
 """
-    decode_step!(exec_fn, idg, cache, token_ids, cross_kv_arrays; device=nothing)
+    decode_step!(exec_fn, idg, cache, token_ids; device=get_device())
 
-Execute one step of the incremental decode graph.
-
-- `exec_fn`        : compiled execution function
-- `idg`            : `IncrementalDecodeGraph` built for this `step_pos`
-- `cache`          : `KVCacheState`  (mutated: self_cache updated, step_pos incremented)
-- `token_ids`      : `Matrix{Float32}` of shape (batch, 1)
-- `cross_kv_arrays`: `Vector` of `(k_array, v_array)` per layer (from encoder precompute)
-
-Returns `logits::Array{Float32}` of shape (batch, 1, vocab_size).
+Run one decode step for `token_ids` (one 0-indexed token per batch entry) at
+position `cache.step_pos`, write its K/V into the cache and advance the position.
+Returns the (Vocab, 1, B) logits.
 """
-function decode_step!(exec_obj::Any,
-                      idg::IncrementalDecodeGraph,
-                      cache::KVCacheState,
-                      token_ids::Matrix{Float32},
-                      cross_kv_arrays::Vector;
+function decode_step!(exec_fn, idg::IncrementalDecodeGraph, cache::KVCacheState,
+                      token_ids::AbstractVector{<:Integer};
                       device=Luminal.get_device())
-    inputs = Dict{Int, Any}()
-    inputs[idg.token_input_id] = token_ids
-
-    for (i, (ck, cv)) in enumerate(cross_kv_arrays)
-        inputs[idg.cross_k_ids[i]] = ck
-        inputs[idg.cross_v_ids[i]] = cv
-    end
-
+    cache.step_pos < cache.max_seq || error("KV cache full ($(cache.max_seq) positions)")
+    inputs = Dict{Int, Any}(idg.token_input_id => Float32.(Base.reshape(token_ids, 1, :)),
+                            idg.pos_input_id => Float32[cache.step_pos])
     for i in eachindex(idg.self_k_ids)
-        inputs[idg.self_k_ids[i]] = cache.self_cache[i][1]
-        inputs[idg.self_v_ids[i]] = cache.self_cache[i][2]
+        inputs[idg.self_k_ids[i]]  = cache.self_cache[i][1]
+        inputs[idg.self_v_ids[i]]  = cache.self_cache[i][2]
+        inputs[idg.cross_k_ids[i]] = cache.cross_cache[i][1]
+        inputs[idg.cross_v_ids[i]] = cache.cross_cache[i][2]
     end
-
-    all_output_ids = vcat(
-        [idg.logits_id],
-        idg.new_self_k_ids,
-        idg.new_self_v_ids)
-
-    result = if exec_obj isa Luminal.Graph
-        Luminal.execute(exec_obj, all_output_ids, inputs, device)
+    results = if exec_fn isa Luminal.Graph
+        Luminal.execute(exec_fn, vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids),
+                        inputs, device)
     else
-        # CompiledGraph returns results vector indexed by node_id
-        res_vec = exec_obj(inputs, device)
-        Dict{Int, Any}(id => res_vec[id] for id in all_output_ids)
+        exec_fn(inputs; device=device)
     end
-
+    slot = cache.step_pos + 1
     for i in eachindex(idg.new_self_k_ids)
-        cache.self_cache[i] = (
-            result[idg.new_self_k_ids[i]],
-            result[idg.new_self_v_ids[i]])
+        k_cache, v_cache = cache.self_cache[i]
+        view(k_cache, :, slot:slot, :, :) .= results[idg.new_self_k_ids[i]]
+        view(v_cache, :, slot:slot, :, :) .= results[idg.new_self_v_ids[i]]
     end
-
     cache.step_pos += 1
-    return result[idg.logits_id]
+    return results[idg.logits_id]
 end
 
 """
-    project_cross_kv(td::TextDecoder, graph::Luminal.Graph, enc_output::Luminal.GraphTensor)
+    project_cross_kv(td, enc_output) -> Vector{Tuple{GraphTensor, GraphTensor}}
 
-Compute the cross-attention K and V projections for all decoder layers.
-Returns `Vector{Tuple{GraphTensor, GraphTensor}}`.
+Cross-attention K and V for every decoder layer from the (Hidden, S_enc, B)
+encoder output, each as a contiguous (head_dim, S_enc, heads, B) tensor.
 """
-function project_cross_kv(td::TextDecoder, graph::Luminal.Graph, enc_output::Luminal.GraphTensor)
-    batch, seq, d_model = Luminal.realized_dims(enc_output.shape)
-    kv = Tuple{Luminal.GraphTensor, Luminal.GraphTensor}[]
-    
-    scale = (Float32(d_model) / Float32(HEADS)) ^ -0.25f0
-    
-    for layer in td.layers
-        ca = layer.cross_attn
-        
-        # Project K: (batch, seq, hidden) -> (batch, seq, heads, head_dim) -> (batch, heads, seq, head_dim)
-        k = Luminal.permute(
-            Luminal.reshape(ca.k_proj(enc_output) * scale, [batch, seq, HEADS, HEAD_DIM]),
-            [1, 3, 2, 4])
-        
-        # Project V: (batch, seq, hidden) -> (batch, heads, seq, head_dim)
-        v = Luminal.permute(
-            Luminal.reshape(ca.v_proj(enc_output), [batch, seq, HEADS, HEAD_DIM]),
-            [1, 3, 2, 4])
-            
-        push!(kv, (Luminal.contiguous(k), Luminal.contiguous(v)))
-    end
-    return kv
+function project_cross_kv(td::TextDecoder, enc_output::Luminal.GraphTensor)
+    return [(Luminal.contiguous(_split_heads(l.encoder_attn.k_proj(enc_output), l.encoder_attn.n_heads)),
+             Luminal.contiguous(_split_heads(l.encoder_attn.v_proj(enc_output), l.encoder_attn.n_heads)))
+            for l in td.layers]
 end
 
 export KVCacheState, IncrementalDecodeGraph, build_decode_step!, decode_step!,
-       whisper_self_attn_cached, whisper_cross_attn_cached, project_cross_kv,
+       whisper_self_attn_cached, whisper_cross_attn_cached, project_cross_kv, decoder_config,
        D_MODEL, HEADS, HEAD_DIM, MAX_TARGET_POSITION, VOCAB_SIZE, DEC_LAYERS
-
-

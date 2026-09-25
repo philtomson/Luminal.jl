@@ -28,8 +28,14 @@ end
 
     # Encoder layers should be registered with layer index
     @test any(occursin("layers.0", k) for k in wkeys)
-    @test any(occursin("layers.0.attn.q_proj.weight", k) for k in wkeys)
-    @test any(occursin("layers.0.mlp.fc1.weight", k) for k in wkeys)
+    # Hugging Face key names
+    @test "model.encoder.layers.0.self_attn.q_proj.weight" in wkeys
+    @test "model.encoder.layers.0.fc1.weight" in wkeys
+    @test "model.encoder.embed_positions.weight" in wkeys
+    @test !("model.encoder.layers.0.self_attn.k_proj.bias" in wkeys)   # k_proj has no bias
+    shape(k) = Tuple(Luminal.realized_dims(g.shapes[reg.mapping[k]]))
+    @test shape("model.encoder.conv1.weight") == (NN.D_MODEL, 80, 3)
+    @test shape("model.encoder.embed_positions.weight") == (1500, NN.D_MODEL)
 
     println("Registered $(length(reg.mapping)) encoder weight tensors")
 end
@@ -67,8 +73,9 @@ end
     @test length(dec_keys) > 0
     println("  Encoder params: $(length(enc_keys)), Decoder params: $(length(dec_keys))")
 
-    # The number of params registered should be > 100 (whisper-tiny has ~39M params)
-    @test n > 50
+    # Exactly the 167 tensors of openai/whisper-tiny's model.safetensors
+    @test n == 167
+    @test length(enc_keys) == 4 + 1 + 2 + 4 * 15   # convs, positions, final norm, layers
 end
 
 @testset "load_weights! with dummy safetensors file" begin

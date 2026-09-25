@@ -39,7 +39,7 @@ using JSON3
     
     # Mock enc_output
     batch, enc_seq = 1, 8
-    enc_output = rand(Float32, batch, enc_seq, NN.D_MODEL)
+    enc_output = rand(Float32, NN.D_MODEL, enc_seq, batch)   # (Hidden, S_enc, B)
     
     # 3. Mock weights_dict
     weights_dict = Dict{String, Array{Float32}}()
@@ -85,10 +85,23 @@ using JSON3
     # Using a very small max_len for speed
     text, ids = greedy_decode(td, tokenizer, enc_output, tmp_dir; max_len=5)
     
-    @test length(ids) > 0
-    @test ids[1] == tokenizer.sot_id
-    @test length(text) >= 0 
-    
-    println("Decoded text: ", repr(text))
-    println("Token IDs: ", ids)
+    @test ids[1:4] == sot_sequence(tokenizer)
+    @test 4 < length(ids) <= 5
+    @test text isa String
+end
+
+# Real checkpoint, when one is available: openai/whisper-tiny from Hugging Face
+# (git clone https://huggingface.co/openai/whisper-tiny), and a reference
+# produced by examples/whisper_reference.py.
+const WHISPER_DIR = get(ENV, "WHISPER_TINY_DIR", joinpath(@__DIR__, "..", "whisper_tiny"))
+if isfile(joinpath(WHISPER_DIR, "ref", "index.json"))
+    @testset "transcribe matches Hugging Face" begin
+        idx = JSON3.read(read(joinpath(WHISPER_DIR, "ref", "index.json"), String))
+        audio = collect(reinterpret(Float32, read(joinpath(WHISPER_DIR, "ref", "audio.f32"))))
+        text, ids = transcribe(WHISPER_DIR, audio)
+        @test ids == Int.(idx[Symbol("tokens.exact")])
+        @test text == idx[Symbol("text.exact")]
+    end
+else
+    @info "Skipping real-checkpoint transcription test (no $WHISPER_DIR/ref)"
 end

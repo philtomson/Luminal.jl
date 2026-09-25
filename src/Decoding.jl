@@ -9,6 +9,7 @@ using ..Luminal
 using ..Luminal.NN
 using ..Luminal.LlamaTokenization
 using AMDGPU
+using JSON3
 
 export greedy_decode, llama_generate
 
@@ -246,128 +247,131 @@ end
 export llama_generate
 
 """
-    greedy_decode(td, tokenizer, enc_output_array, model_weights_dir; 
-                  language="en", task=:transcribe, max_len=448, device=nothing)
+    greedy_decode(td, tokenizer, enc_output, weights; language="en", task=:transcribe,
+                  max_len=448, device=nothing, weight_dtype=Float32) -> (text, tokens)
 
-Run greedy decoding for the Whisper model.
+Greedy Whisper decoding with a device-resident KV cache.
 
-Args:
-- `td`                 : A Whisper TextDecoder instance (template for structure)
-- `tokenizer`          : A WhisperTokenizer instance
-- `enc_output_array`   : The output of the audio encoder (batch, enc_seq, d_model)
-- `model_weights_dir`  : Path to the directory containing weights.
-- `language`           : Target language code (e.g., "en")
-- `task`               : :transcribe or :translate
-- `max_len`            : Maximum number of tokens to decode
-- `device`             : Optional device to run on
+- `td`         : a `TextDecoder`, used only as the architecture template
+- `tokenizer`  : a `WhisperTokenizer`
+- `enc_output` : the audio encoder output, (Hidden, S_enc, 1)
+- `weights`    : model directory, or a `Dict` from `load_weights_to_dict`
+- `max_len`    : maximum length of the token sequence, prompt included
 
-Returns:
-- `String`             : The decoded transcript
-- `Vector{Int}`        : The sequence of token IDs (including SOT and EOT)
+The cross-attention K/V are projected once; then a single position-independent
+decode-step graph (captured as a HIP graph on AMD GPUs) is replayed per token:
+first for the start-of-transcript prompt, then for each greedily chosen token
+until end-of-text. Returns the decoded text and all token ids, the prompt included.
 """
-function greedy_decode(td::TextDecoder, 
-                       tokenizer::WhisperTokenizer, 
-                       enc_output_array::Array{Float32, 3},
-                       model_weights_dir::String;
+function greedy_decode(td::TextDecoder,
+                       tokenizer::WhisperTokenizer,
+                       enc_output::AbstractArray{Float32, 3},
+                       weights;
                        language::String="en",
                        task::Symbol=:transcribe,
-                       max_len::Int=448,
-                       device=nothing)
-    
-    batch, enc_seq, d_model = size(enc_output_array)
-    @assert batch == 1 "Batch size > 1 not supported in greedy_decode yet"
-    target_device = (device === nothing ? get_device() : device)
+                       max_len::Int=MAX_TARGET_POSITION,
+                       device=nothing,
+                       weight_dtype::Type=Float32)
+    hidden, enc_seq, batch = size(enc_output)
+    @assert batch == 1 "greedy_decode supports batch size 1"
+    dev = device === nothing ? get_device() : device
+    W = weights isa AbstractString ? load_weights_to_dict(weights; device=dev) : weights
+    cfg = decoder_config(td)
+    head_dim = cfg.d_model ÷ cfg.n_heads
 
-    # 1. Load weights once into memory
-    files = filter(f -> endswith(f, ".safetensors"), readdir(model_weights_dir; join=true))
-    weights_dict = Dict{String, Array}()
-    for f in files
-        merge!(weights_dict, Luminal.SafeTensors.load_safetensors(f))
+    # 1. Cross-attention K/V, projected once from the encoder output
+    cg = Graph(); creg = WeightRegistry()
+    ctd = TextDecoder(cg; reg=creg, cfg...)
+    enc_in = Luminal.tensor(cg, [hidden, enc_seq, batch])
+    kv = project_cross_kv(ctd, enc_in)
+    load_weights!(cg, creg, W; device=dev)
+    kv_ids = [id for (k, v) in kv for id in (k.id, v.id)]
+    cexec = compile(cg; device=dev, retain=kv_ids)
+    kv_res = cexec(Dict{Int,Any}(enc_in.id => enc_output); device=dev)
+
+    cache = KVCacheState(cfg.n_layers, cfg.n_heads, head_dim, enc_seq;
+                         batch=batch, max_seq=cfg.max_positions, device=dev)
+    for (i, (k, v)) in enumerate(kv)
+        cache.cross_cache[i][1] .= kv_res[k.id]
+        cache.cross_cache[i][2] .= kv_res[v.id]
     end
+    cexec = kv_res = nothing
 
-    # 2. Precompute Cross KV
-    # We build a small graph just for this
-    cg = Graph()
-    creg = WeightRegistry()
-    ctd = TextDecoder(cg; reg=creg)
-    
-    enc_in = Luminal.tensor(cg, [batch, enc_seq, d_model])
-    kv_tensors = project_cross_kv(ctd, cg, enc_in)
-    
-    # Pack K and V IDs for compilation
-    kv_ids = Int[]
-    for (k, v) in kv_tensors
-        push!(kv_ids, k.id)
-        push!(kv_ids, v.id)
-    end
-    
-    load_weights!(cg, creg, weights_dict; device=target_device)
-    c_exec = compile(cg)
-    
-    # Run precompute
-    kv_results = Luminal.execute(cg, kv_ids, Dict(enc_in.id => enc_output_array))
-    
-    # Format into layers: [(k,v), (k,v), ...]
-    cross_kv_arrays = Vector{Tuple{Array{Float32,4}, Array{Float32,4}}}()
-    for i in 1:length(td.layers)
-        push!(cross_kv_arrays, (kv_results[kv_ids[2i-1]], kv_results[kv_ids[2i]]))
-    end
+    # 2. The decode step: one shape-static graph for every position
+    g = Graph(); reg = WeightRegistry()
+    dtd = TextDecoder(g; reg=reg, cfg...)
+    idg = build_decode_step!(dtd, g, enc_seq; max_seq=cfg.max_positions, batch=batch)
+    load_weights!(g, reg, W; device=dev)
+    retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
+                  idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
+                  idg.cross_k_ids, idg.cross_v_ids)
+    exec = compile(g; device=dev, retain=retain, free_intermediates=false,
+                   weight_dtype=weight_dtype, capture=dev isa Luminal.AMDDevice)
 
-    # 3. Initialize KV Cache
-    cache = KVCacheState(batch, length(td.layers), HEADS, HEAD_DIM, enc_seq; 
-                         max_seq=MAX_TARGET_POSITION)
-
-    # 4. Starting sequence
+    # 3. Feed the prompt, then decode greedily
     tokens = sot_sequence(tokenizer; language=language, task=task, notimestamps=true)
-    
-    # 5. Greedy Decoding Loop
-    compiled_graphs = Dict{Int, Any}()
-
-    for _ in 1:max_len
-        pos = length(tokens) - 1
-        if pos >= MAX_TARGET_POSITION - 1
-            break
-        end
-        
-        # Get/Compile graph for this step position
-        if !haskey(compiled_graphs, pos)
-            g = Graph()
-            reg = WeightRegistry()
-            td_step = TextDecoder(g; reg=reg)
-            idg = build_decode_step!(td_step, g, enc_seq, pos; batch=batch)
-            load_weights!(g, reg, weights_dict; device=target_device)
-            exec_fn = compile(g)
-            compiled_graphs[pos] = (exec_fn, idg)
-        end
-        
-        exec_fn, idg = compiled_graphs[pos]
-        
-        # Run one step
-        current_token = Float32[tokens[end]]
-        token_input = Base.reshape(current_token, (1, 1)) # (batch, 1)
-        
-        exec_fn, idg = compiled_graphs[pos]
-        logits = decode_step!(exec_fn, idg, cache, token_input, cross_kv_arrays; device=target_device)
-        # logits shape: (batch, 1, vocab_size) -> (vocab_size,)
-        
-        # Greedy sample
-        next_token = argmax(view(logits, 1, 1, :))
-        
-        # Julia argmax is 1-indexed, but Whisper vocab is 0-indexed?
-        # Check: Whisper vocab is 0-indexed in vocab.json. 
-        # So next_token - 1.
-        push!(tokens, next_token - 1)
-        
-        # Stop if EOT
-        if tokens[end] == tokenizer.eot_id
-            break
-        end
+    logits = nothing
+    for t in tokens
+        logits = decode_step!(exec, idg, cache, [t]; device=dev)
+    end
+    while length(tokens) < max_len
+        next = argmax(view(Array{Float32}(logits), :, 1, 1)) - 1   # 0-indexed
+        push!(tokens, next)
+        (next == tokenizer.eot_id || cache.step_pos >= cache.max_seq) && break
+        logits = decode_step!(exec, idg, cache, [next]; device=dev)
     end
 
-    # 6. Decode tokens to text
-    decoded_text = decode(tokenizer, tokens; skip_special=true)
-    
-    return decoded_text, tokens
+    return decode(tokenizer, tokens; skip_special=true), tokens
 end
+
+# Whisper dimensions from a Hugging Face config.json (defaults: whisper-tiny).
+function _whisper_config(model_dir::String)
+    path = joinpath(model_dir, "config.json")
+    c = isfile(path) ? JSON3.read(read(path, String)) : Dict{Symbol,Any}()
+    get_(k, d) = Int(get(c, k, d))
+    enc = (d_model=get_(:d_model, D_MODEL), n_layers=get_(:encoder_layers, NN.ENC_LAYERS),
+           n_heads=get_(:encoder_attention_heads, HEADS),
+           ffn_dim=get_(:encoder_ffn_dim, NN.ENC_FFN_DIM), n_mels=get_(:num_mel_bins, NN.N_MEL_BINS),
+           max_positions=get_(:max_source_positions, NN.MAX_SOURCE_POSITION))
+    dec = (d_model=get_(:d_model, D_MODEL), n_layers=get_(:decoder_layers, DEC_LAYERS),
+           n_heads=get_(:decoder_attention_heads, HEADS),
+           ffn_dim=get_(:decoder_ffn_dim, NN.DEC_FFN_DIM), vocab_size=get_(:vocab_size, VOCAB_SIZE),
+           max_positions=get_(:max_target_positions, MAX_TARGET_POSITION))
+    return enc, dec
+end
+
+"""
+    transcribe(model_dir, audio; language="en", task=:transcribe, max_len=448,
+               device=nothing, weight_dtype=Float32) -> (text, tokens)
+
+Transcribe (or translate) up to 30 s of audio with a Hugging Face Whisper
+checkpoint directory (`config.json`, `model.safetensors` and tokenizer files).
+`audio` is a path (decoded with ffmpeg) or a 16 kHz mono `Vector{Float32}`.
+"""
+function transcribe(model_dir::String, audio;
+                    language::String="en", task::Symbol=:transcribe,
+                    max_len::Int=MAX_TARGET_POSITION, device=nothing,
+                    weight_dtype::Type=Float32)
+    dev = device === nothing ? get_device() : device
+    samples = audio isa AbstractString ? load_audio_file(audio) : Vector{Float32}(audio)
+    enc_cfg, dec_cfg = _whisper_config(model_dir)
+    mel = log_mel_spectrogram(pad_or_trim(samples); n_mels=enc_cfg.n_mels)
+    W = load_weights_to_dict(model_dir; device=dev)
+
+    g = Graph(); reg = WeightRegistry()
+    enc = AudioEncoder(g; reg=reg, enc_cfg...)
+    mel_in = Luminal.tensor(g, [size(mel)..., 1])
+    enc_out = enc(mel_in)
+    load_weights!(g, reg, W; device=dev)
+    exec = compile(g; device=dev, retain=[enc_out.id])
+    enc_arr = exec(Dict{Int,Any}(mel_in.id => Base.reshape(mel, size(mel)..., 1)); device=dev)[enc_out.id]
+
+    td = TextDecoder(Graph(); dec_cfg...)
+    return greedy_decode(td, WhisperTokenizer(model_dir), enc_arr, W;
+                         language=language, task=task, max_len=max_len, device=dev,
+                         weight_dtype=weight_dtype)
+end
+
+export transcribe
 
 end # module Decoding

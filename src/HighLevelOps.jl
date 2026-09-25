@@ -159,8 +159,24 @@ function swish(a::GraphTensor)
 end
 const silu = swish
 
-function gelu(a::GraphTensor)
-    return a * 0.5f0 * (1.0f0 + tanh(0.7978845608f0 * a * (1.0f0 + 0.044715f0 * a * a)))
+"""
+    gelu(a; approximate=true)
+
+GELU. `approximate=true` is the tanh approximation; `approximate=false` is the
+exact `0.5x(1 + erf(x/√2))` (PyTorch's default, used by Whisper), with erf from
+Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
+"""
+function gelu(a::GraphTensor; approximate::Bool=true)
+    approximate && return a * 0.5f0 * (1.0f0 + tanh(0.7978845608f0 * a * (1.0f0 + 0.044715f0 * a * a)))
+    # For z = |x|/√2, 1 - erf(z) = q = poly(t) exp(-z²) with t = 1/(1 + p z), so
+    # gelu(x) = x(1 - q/2) for x >= 0 and x q/2 for x < 0; both are relu(x) - |x| q/2.
+    ax = abs(a)
+    z = ax * Float32(1 / sqrt(2))
+    t = reciprocal(1.0f0 + 0.3275911f0 * z)
+    poly = t * (0.254829592f0 + t * (-0.284496736f0 + t * (1.421413741f0 +
+               t * (-1.453152027f0 + t * 1.061405429f0))))
+    q = poly * exp(-(z * z))
+    return relu(a) - ax * q * 0.5f0
 end
 
 function Base.tanh(a::GraphTensor)

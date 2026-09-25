@@ -2,114 +2,86 @@ using Test
 using Luminal
 using Luminal.NN
 
-# Small constants to keep the test fast
-const TEST_BATCH     = 1
-const TEST_ENC_SEQ   = 8       # small encoder sequence
-const TEST_MAX_SEQ   = 10      # short max decode length
-const TEST_N_LAYERS  = 1       # one decoder layer
-const TEST_STEPS     = 3       # decode 3 tokens
+# A small random Whisper decoder keeps these tests fast.
+const CFG = (d_model=64, n_layers=2, n_heads=4, ffn_dim=128, vocab_size=97, max_positions=12)
+const ENC_SEQ = 8
+
+function random_weights(g, reg)
+    Dict{String,Any}(k => 0.2f0 .* randn(Float32, Tuple(Luminal.realized_dims(g.shapes[id]))...)
+                     for (k, id) in reg.mapping)
+end
 
 @testset "KVCacheState allocation" begin
-    cache = NN.KVCacheState(TEST_BATCH, TEST_N_LAYERS, NN.HEADS, NN.HEAD_DIM,
-                             TEST_ENC_SEQ; max_seq=TEST_MAX_SEQ)
-
+    cache = NN.KVCacheState(CFG.n_layers, CFG.n_heads, 16, ENC_SEQ; max_seq=CFG.max_positions)
     @test cache.step_pos == 0
-    @test cache.max_seq  == TEST_MAX_SEQ
-    @test length(cache.self_cache)  == TEST_N_LAYERS
-    @test length(cache.cross_cache) == TEST_N_LAYERS
-
+    @test cache.max_seq == CFG.max_positions
+    @test length(cache.self_cache) == CFG.n_layers
+    @test length(cache.cross_cache) == CFG.n_layers
     sk, sv = cache.self_cache[1]
-    @test size(sk) == (TEST_BATCH, NN.HEADS, TEST_MAX_SEQ, NN.HEAD_DIM)
+    @test size(sk) == (16, CFG.max_positions, CFG.n_heads, 1)   # (D, max_seq, H, B)
     @test all(sk .== 0)
-
-    ck, cv = cache.cross_cache[1]
-    @test size(ck) == (TEST_BATCH, NN.HEADS, TEST_ENC_SEQ, NN.HEAD_DIM)
+    @test size(cache.cross_cache[1][1]) == (16, ENC_SEQ, CFG.n_heads, 1)
 end
 
-@testset "IncrementalDecodeGraph structure (step 0)" begin
-    g   = Graph()
-    reg = WeightRegistry()
-    dec = NN.TextDecoder(g; reg=reg)
-
-    step_g  = Graph()           # fresh graph for the decode step
-    # Reuse the same weight tensors from dec by rebinding them
-    # In practice: load weights into `step_g` pointing to the same buffers.
-    # For structural testing we just check the IDG fields are populated.
-
-    # Build a minimal (1-layer) TextDecoder on step_g using the same
-    # architecture parameters
-    dec2 = NN.TextDecoder(step_g)
-    idg = NN.build_decode_step!(dec2, step_g, TEST_ENC_SEQ, 0;
-                                 max_seq=TEST_MAX_SEQ, batch=TEST_BATCH)
-
-    @test idg.token_input_id > 0
-    @test length(idg.cross_k_ids) == NN.DEC_LAYERS
-    @test length(idg.self_k_ids)  == NN.DEC_LAYERS
-    @test length(idg.new_self_k_ids) == NN.DEC_LAYERS
-    @test idg.logits_id > 0
-    @test idg.step_pos[] == 0
-
-    println("IncrementalDecodeGraph: token_in=$(idg.token_input_id), logits=$(idg.logits_id), $(length(idg.self_k_ids)) layers")
+@testset "IncrementalDecodeGraph structure" begin
+    g = Graph()
+    td = NN.TextDecoder(g; CFG...)
+    idg = NN.build_decode_step!(td, g, ENC_SEQ; max_seq=CFG.max_positions)
+    @test length(idg.cross_k_ids) == CFG.n_layers
+    @test length(idg.self_k_ids) == CFG.n_layers
+    @test length(idg.new_self_k_ids) == CFG.n_layers
+    @test Luminal.realized_dims(g.shapes[idg.logits_id]) == [CFG.vocab_size, 1, 1]
+    @test Luminal.realized_dims(g.shapes[idg.new_self_k_ids[1]]) == [16, 1, CFG.n_heads, 1]
 end
 
-@testset "_kv_scatter places token at correct position" begin
-    g      = Graph()
-    # Minimal dims: (batch=1, heads=1, max_seq=4, head_dim=2)
-    past_k = Luminal.tensor(g, [1, 1, 4, 2])
-    new_k  = Luminal.tensor(g, [1, 1, 1, 2])
+# Cached decoding must reproduce the full-sequence decoder's logits at every position.
+devices = Any[CPUDevice()]
+Luminal.get_device() isa CPUDevice || push!(devices, Luminal.get_device())
+for dev in devices
+    @testset "cached decode == full decoder ($(nameof(typeof(dev))))" begin
+        tokens = [3, 17, 5, 42, 8, 0]
+        S = length(tokens)
+        enc = randn(Float32, CFG.d_model, ENC_SEQ, 1)
 
-    # step_pos = 0: new_k goes at front
-    updated0 = NN._kv_scatter(past_k, new_k, 0)
-    @test Luminal.realized_dims(updated0.shape)[3] == 4
+        # Full-sequence reference
+        g = Graph(); reg = WeightRegistry()
+        td = NN.TextDecoder(g; reg=reg, CFG...)
+        W = random_weights(g, reg)
+        enc_in = Luminal.tensor(g, [CFG.d_model, ENC_SEQ, 1])
+        tok_in = Luminal.tensor(g, [S, 1])
+        logits = td(enc_in, tok_in)
+        load_weights!(g, reg, W; device=dev)
+        full = Array(compile(g; device=dev, retain=[logits.id])(
+            Dict{Int,Any}(enc_in.id => enc, tok_in.id => Float32.(Base.reshape(tokens, S, 1)));
+            device=dev)[logits.id])
 
-    # step_pos = 1
-    updated1 = NN._kv_scatter(past_k, new_k, 1)
-    @test Luminal.realized_dims(updated1.shape)[3] == 4
+        # Cross K/V
+        cg = Graph(); creg = WeightRegistry()
+        ctd = NN.TextDecoder(cg; reg=creg, CFG...)
+        c_in = Luminal.tensor(cg, [CFG.d_model, ENC_SEQ, 1])
+        kv = NN.project_cross_kv(ctd, c_in)
+        load_weights!(cg, creg, W; device=dev)
+        kv_res = compile(cg; device=dev, retain=[t.id for p in kv for t in p])(
+            Dict{Int,Any}(c_in.id => enc); device=dev)
+        cache = NN.KVCacheState(CFG.n_layers, CFG.n_heads, CFG.d_model ÷ CFG.n_heads, ENC_SEQ;
+                                max_seq=CFG.max_positions, device=dev)
+        for (i, (k, v)) in enumerate(kv)
+            cache.cross_cache[i][1] .= kv_res[k.id]
+            cache.cross_cache[i][2] .= kv_res[v.id]
+        end
 
-    # step_pos = 3 (last slot)
-    updated3 = NN._kv_scatter(past_k, new_k, 3)
-    @test Luminal.realized_dims(updated3.shape)[3] == 4
-end
-
-@testset "whisper_self_attn_cached graph shapes" begin
-    g   = Graph()
-    reg = WeightRegistry()
-    # Use tiny dims manually by building a linear matching WhisperSelfAttention
-    sa = NN.WhisperSelfAttention(NN.D_MODEL, g, reg, "test.attn")
-
-    x      = Luminal.tensor(g, [TEST_BATCH, 1, NN.D_MODEL])          # (b, 1, hidden)
-    past_k = Luminal.tensor(g, [TEST_BATCH, NN.HEADS, TEST_MAX_SEQ, NN.HEAD_DIM])
-    past_v = Luminal.tensor(g, [TEST_BATCH, NN.HEADS, TEST_MAX_SEQ, NN.HEAD_DIM])
-
-    out, new_k, new_v = NN.whisper_self_attn_cached(sa, x, 0, past_k, past_v)
-
-    @test out   isa Luminal.GraphTensor
-    @test new_k isa Luminal.GraphTensor
-    @test new_v isa Luminal.GraphTensor
-
-    # Output should be (batch, 1, hidden)
-    out_dims  = Luminal.realized_dims(out.shape)
-    @test out_dims[1] == TEST_BATCH
-    @test out_dims[2] == 1
-    @test out_dims[3] == NN.D_MODEL
-
-    # Updated cache should preserve max_seq dim
-    nk_dims = Luminal.realized_dims(new_k.shape)
-    @test nk_dims[3] == TEST_MAX_SEQ
-    @test nk_dims[4] == NN.HEAD_DIM
-end
-
-@testset "whisper_cross_attn_cached graph shapes" begin
-    g   = Graph()
-    reg = WeightRegistry()
-    ca  = NN.WhisperCrossAttention(NN.D_MODEL, g, reg, "test.cross_attn")
-
-    x     = Luminal.tensor(g, [TEST_BATCH, 1, NN.D_MODEL])
-    enc_k = Luminal.tensor(g, [TEST_BATCH, NN.HEADS, TEST_ENC_SEQ, NN.HEAD_DIM])
-    enc_v = Luminal.tensor(g, [TEST_BATCH, NN.HEADS, TEST_ENC_SEQ, NN.HEAD_DIM])
-
-    out = NN.whisper_cross_attn_cached(ca, x, enc_k, enc_v)
-    @test out isa Luminal.GraphTensor
-    out_dims = Luminal.realized_dims(out.shape)
-    @test out_dims == [TEST_BATCH, 1, NN.D_MODEL]
+        # One compiled step graph, replayed per position
+        dg = Graph(); dreg = WeightRegistry()
+        dtd = NN.TextDecoder(dg; reg=dreg, CFG...)
+        idg = NN.build_decode_step!(dtd, dg, ENC_SEQ; max_seq=CFG.max_positions)
+        load_weights!(dg, dreg, W; device=dev)
+        retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids, idg.token_input_id,
+                      idg.pos_input_id, idg.self_k_ids, idg.self_v_ids, idg.cross_k_ids, idg.cross_v_ids)
+        exec = compile(dg; device=dev, retain=retain, free_intermediates=false)
+        for (p, t) in enumerate(tokens)
+            step = Array(NN.decode_step!(exec, idg, cache, [t]; device=dev))
+            @test step[:, 1, 1] ≈ full[:, p, 1] rtol=1e-4
+        end
+        @test cache.step_pos == S
+    end
 end
