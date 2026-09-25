@@ -1,321 +1,205 @@
-# Luminal Julia Port
+# Luminal.jl
 
-[![Julia](https://img.shields.io/badge/Julia-1.12.5-9558B2?style=for-the-badge&logo=julia&logoColor=white)](https://julialang.org/)
-[![Status](https://img.shields.io/badge/Status-Active%20Development-blue?style=for-the-badge)](https://github.com/jafioti/luminal)
+[![Julia](https://img.shields.io/badge/Julia-1.12-9558B2?style=for-the-badge&logo=julia&logoColor=white)](https://julialang.org/)
+[![Status](https://img.shields.io/badge/Status-Active%20Development-blue?style=for-the-badge)](https://github.com/luminal-ai/luminal)
 
-A Julia port of [Luminal](https://github.com/jafioti/luminal), a deep learning library using **ahead-of-time compilation** for high performance.
+A Julia port of [Luminal](https://github.com/luminal-ai/luminal), a deep learning
+library built on **ahead-of-time compilation of static graphs**. A model is
+written as a graph of a few primitive ops. `compile()` then fuses, aliases, folds
+and specializes that graph for a device, and can optionally search over
+equivalent graphs for the fastest one.
 
-> [!NOTE]
-> This is a port of the Luminal Rust library to Julia. Some features from the original Rust version are not yet implemented. See [Missing Features](#missing-features) for details.
+Models validated against Hugging Face `transformers`:
 
-## Quick Start
+- **TinyLlama 1.1B**: prefill plus KV-cached decode. Perplexity in Float32
+  matches the reference, and int8 weights cost +0.25%.
+- **Whisper** (tiny, and other sizes from their `config.json`): transcription
+  matches `transformers` token for token.
+
+## Quick start
 
 ```julia
 using Luminal
 
-# Setup graph and tensors
 g = Graph()
-a = tensor(g, (3, 1))
-b = tensor(g, (1, 4))
+a = tensor(g, [3, 1])
+b = tensor(g, [1, 4])
+c = matmul(a, b) * 2.0f0                 # nothing runs yet: this builds a graph
 
-# Do math...
-c = matmul(a, b)
+device = get_device()                    # AMDDevice, CUDADevice or CPUDevice
+exec = compile(g; device=device, retain=[c.id])
+result = exec(Dict(a.id => Float32[1; 2; 3;;], b.id => Float32[1 2 3 4]); device=device)
+Array(result[c.id])                      # 3×4
+```
 
-# Prepare inputs
-inputs = Dict(
-    a.id => Float32[1.0; 2.0; 3.0;;],
-    b.id => Float32[1.0 2.0 3.0 4.0]
-)
+Tensors are column-major. Activations use the **(Hidden, Seq, Batch)** layout
+and attention heads use (HeadDim, Seq, Heads, Batch). `matmul` is batched over
+trailing dimensions: (M, K, …) × (K, N, …).
 
-# Execute
-device = get_device()
-result = execute(g, c.id, inputs, device)
+### Transcribe audio (Whisper)
 
-println("Result: ", result)
+```julia
+using Luminal
+# git clone https://huggingface.co/openai/whisper-tiny
+text, tokens = transcribe("whisper-tiny", "speech.wav")   # ≤ 30 s, decoded with ffmpeg
+```
+
+### Generate text (Llama)
+
+```bash
+julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "Why is the sky blue?"
+julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --int8 --search=measured "..."
 ```
 
 ## Installation
 
 ```bash
-cd Julia
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-### Requirements
-
-- **Julia 1.12.5+**
-- **CUDA.jl** (for NVIDIA GPUs)
-- **AMDGPU.jl** (for AMD GPUs)  
-- **SymbolicUtils.jl** v3.31.0
-- **Metatheory.jl** v3.0 (from the `ale/3.0` branch of `JuliaSymbolics/Metatheory.jl`)
+Requirements:
+- Julia 1.12.
+- For AMD GPUs: AMDGPU.jl with a working ROCm. Development uses ROCm 10.0 from
+  [TheRock](https://github.com/ROCm/TheRock) on a Radeon 8060S (gfx1151). Point
+  `ROCM_PATH` and `LD_LIBRARY_PATH` at the install.
+- For NVIDIA GPUs: CUDA.jl.
+- Metatheory.jl 3.0 (`ale/3.0` branch, pinned in the Manifest) for the rewrite layer.
+- `ffmpeg`, only to decode audio files for Whisper.
 
 ## Examples
 
-### 🦙 Llama Inference
-```bash
-julia --project=. examples/llama.jl
-```
-Simulates the generation loop of a small 4-layer Llama model using compiled graphs. 
-
-### 🤫 Whisper Inference
-```bash
-julia --project=. examples/whisper.jl
-```
-Runs the full Whisper speech-to-text pipeline (Audio Encoder + Text Decoder with KV Cache).
-
-### 📐 Phi-3 Inference
-```bash
-julia --project=. examples/phi3.jl
-```
-Simulates the Phi-3-mini-4k architecture with GQA and compiled loops.
-
-### 📈 Linear Regression (Training)
-```bash
-julia --project=. examples/linear_regression.jl
-```
-Demonstrates the **Training API**: Forward pass, Loss computation, Autograd (`backward`), and Optimizer (`Adam`) updates.
-
-## Features
-
-### ✅ Implemented
-
-#### Core Architecture
-- **RISC-style Ops**: 12 primitive operations:
-  - Unary: `Log2, Exp2, Sin, Sqrt, Recip`
-  - Binary: `Add, Mul, Mod, LessThan`
-  - Other: `SumReduce, MaxReduce, Contiguous`
-- **Graph-based Execution**: All operations build a static computation graph
-- **Shape Tracking**: Symbolic dimension tracking with broadcasting support
-
-#### Compilation & Optimization
-- **Ahead-of-Time Compilation**: `compile(graph)` creates an execution plan with
-  elementwise fusion, buffer reuse and zero-copy aliasing of movement ops,
-  common-subexpression elimination, and compile-time constant folding
-- **Float16 weights**: `weight_dtype=Float16` stores matmul weights in Float16 (compute stays Float32)
-- **HIP Graph Capture** (AMD): `capture=true` records a shape-static step once and replays it with one launch
-- **Search-Based Compilation**: `compile(graph; search=:static | :measured)` runs an
-  e-graph rewrite layer (**Metatheory.jl**) that explores equivalent graphs
-  (expand elimination, scale motion, merged projections, per-matmul precision)
-  and picks one by a DAG cost model or by timing verified candidates on the
-  device. See [docs/egraph_rewrite_layer.md](docs/egraph_rewrite_layer.md)
-
-#### Hardware Support
-- **CPU**: Fully supported via Julia's native array operations
-- **NVIDIA CUDA**: Full support via CUDA.jl
-- **AMD ROCm**: Partial support via AMDGPU.jl
-- **Automatic Device Detection**: `get_device()` selects best available hardware
-
-#### Neural Network Layers
-High-level API in `NN.jl`:
-- ✅ `Linear` - Fully connected layers (Verified)
-- ✅ `Embedding` - Token embeddings (Verified)
-- ✅ `LayerNorm` - Layer normalization (Verified)
-- ✅ `RMSNorm` - Root mean square normalization
-- ✅ `Attention` - Multi-head attention with KV cache
-- ✅ `RoPE` - Rotary positional embeddings
-
-#### Transformer Support
-- **Llama & Phi-3 Architecture**: Fully implemented
-  - MLP with SiLU/Swish activation
-  - **Grouped-Query Attention (GQA)**: Memory-efficient attention for Phi-3
-  - **Rotary Positional Embeddings (RoPE)**: Configurable base frequency for diverse models
-  - RMSNorm & layer normalization
-- **Flash Attention**: Custom CUDA kernel for efficient attention
-  - Causal and non-causal variants
-  - Online softmax algorithm
-  - CPU fallback
-
-#### Weight Loading & Data
-- **Safetensors Support**: Load weights directly from `.safetensors` files
-- **Weight Registry**: Automated mapping of HuggingFace keys to model parameters
-- **HuggingFace Integration**: `load_weights_hf!` for automatic model downloads
-- **Tokenizer**: Native SentencePiece BPE tokenizer for Llama/Phi-3 and Byte-level BPE for Whisper
-
-#### High-Level Operations
-Comprehensive operator library in `HighLevelOps.jl`:
-- Math: `+, -, *, /, ^, sqrt, exp, log, sin, cos`
-- Comparison: `<, >, <=, >=, ==, !=`
-- Tensor ops: `matmul, permute, reshape, expand, slice, pad`
-- Activations: `relu, sigmoid, swish, gelu, softmax`
-- Reductions: `sum, max, mean`
-
-#### Training & Autograd
-- **Reverse-Mode AD**: Full implementation of automatic differentiation
-- **Operator Gradients**: VJP rules for all 12 primitives and broadcasting
-- **Optimizers**: `SGD` and `Adam` implementation for model training
-- **Integrations**: `backward(loss)` and `step!(opt, loss)` for training loops
-
-### ⚠️ Missing Features
-
-The following features from the Rust version are **not yet implemented**:
-
-#### Distributed Computing
-- ❌ Data parallelism
-- ❌ Pipeline parallelism  
-- ❌ Tensor parallelism
-- ❌ Multi-GPU support
-
-Single-device execution only.
-
-#### Additional Models
-- ✅ Whisper (speech recognition) - Full inference with KV cache
-- ✅ Phi-3 (mini-4k-instruct) - Full architecture support
-- ❌ Yolo v8 (object detection)
-
-Llama and Phi-3 architectures are currently implemented.
-
-#### Advanced Optimizations
-- ❌ Tensor Core utilization on NVIDIA
-- ❌ Blackwell intrinsics (TMEM, TMA)
-- ❌ Quantization (INT8, FP16 support exists but not quantized inference)
-
-#### Tooling
-- ❌ Benchmarking suite
-- ❌ PyTorch validation tests
-- ❌ Model export/import
-
-## Architecture
-
-### Why Julia?
-
-The Julia port leverages Julia's strengths:
-- **Multiple Dispatch**: Natural fit for operator overloading and device-specific kernels
-- **Type System**: Strong typing helps catch errors at compile time
-- **CUDA/GPU Support**: First-class GPU support via CUDA.jl and AMDGPU.jl
-- **Scientific Computing**: Rich ecosystem for numerical computing
-
-### Compilation Strategy
-
-Like the Rust version, graph-level optimization is search over equivalent graphs:
-
-1. **Graph Construction**: Operations build a `Graph` of `Node` objects
-2. **Rewrite layer** (optional, `search=...`): Graph → **Metatheory.jl** e-graph → rewrite rules →
-   DAG extraction, by cost model or measured on the device → Graph
-3. **Compilation**: `compile()` builds the execution plan (fusion, buffer reuse, constant folding, capture)
-4. **Execution**: Device-specific kernels execute via multiple dispatch
-
-### Directory Structure
-
-```
-Julia/
-├── src/
-│   ├── Luminal.jl              # Main module
-│   ├── Ops.jl                  # Primitive operations
-│   ├── Graph.jl                # Graph data structures
-│   ├── ShapeTracker.jl         # Dimension tracking
-│   ├── HighLevelOps.jl         # High-level operator library
-│   ├── Compiler.jl             # Execution plan: fusion, buffers, folding, capture
-│   ├── EGraphRewrite.jl        # E-graph rewrite layer and measured search
-│   ├── Execution.jl            # Interpreter & kernels
-│   ├── Device.jl               # Hardware abstraction
-│   ├── NN.jl                   # Neural network layers
-│   ├── Autograd.jl             # Reverse-mode AD
-│   ├── Optimizer.jl            # SGD & Adam optimizers
-│   ├── Decoding.jl             # Greedy decode logic
-│   ├── Weights.jl              # Safetensors/HF weight loading
-│   ├── Whisper.jl              # Whisper architecture
-│   ├── WhisperTokenizer.jl     # Whisper BPE tokenizer
-│   └── LlamaTokenizer.jl       # Llama/Phi-3 SentencePiece tokenizer
-├── tests/                      # Comprehensive test suite
-└── docs/
-    └── porting_plan.md         # Detailed porting status
-```
-
-## Testing
-
-Run the full test suite:
-
-```bash
-cd Julia
-for f in tests/test_*.jl; do
-    echo "=== $f ==="
-    julia --project=. "$f"
-done
-```
-
-Individual tests:
-```bash
-julia --project=. tests/test_compilation.jl    # Graph compilation
-julia --project=. tests/test_fusion.jl          # Operator fusion
-julia --project=. tests/test_attention.jl       # Flash attention
-julia --project=. tests/test_llama.jl           # Llama model
-julia --project=. tests/test_autograd.jl        # Autograd verification
-julia --project=. tests/test_optimizer.jl       # Optimizer verification
-julia --project=. tests/test_greedy_decode.jl   # Whisper end-to-end
-```
-
-See [`tests/README.md`](tests/README.md) for detailed test documentation.
+| Example | What it does |
+|---------|--------------|
+| `examples/tinyllama_chat.jl` | Text generation from a Llama checkpoint: prefill, then KV-cached decode (`--int8`, `--search=static\|measured`, `--chat`) |
+| `examples/whisper.jl` | Speech-to-text with a Hugging Face Whisper checkpoint |
+| `examples/quant_eval.jl` | Perplexity of Float32, Float16 and int8 weights on a fixed passage |
+| `examples/prefill_search.jl` | Measured search over prefill graphs |
+| `examples/egraph_search.jl` | The e-graph rewrite layer on a small graph |
+| `examples/llama.jl` | Decode-step benchmark on a random-weight Llama |
+| `examples/phi3.jl` | Phi-3 architecture and weight mapping, random weights |
+| `examples/linear_regression.jl` | Training: autograd and the Adam optimizer |
+| `examples/whisper_reference.py` | Dumps Hugging Face Whisper reference tensors for validation |
 
 ## Performance
 
-Preliminary benchmarks on NVIDIA GTX 1070:
+TinyLlama 1.1B on a Radeon 8060S (Strix Halo iGPU, ROCm 10), batch 1:
 
-| Model | Device | Throughput |
-|-------|--------|------------|
-| TinyLlama 2L/1024H | CUDA | 131ms per forward pass |
-| TinyLlama 4L/512H (Generation)| CUDA | ~47 tok/s (21ms/token) |
-| Llama Attention (compiled) | CUDA | ~10x faster than interpreter |
-| Whisper Decoding | CPU | ~12 steps/s |
+| | Weights | Time | |
+|-|---------|------|-|
+| Decode | int8 (group-wise, weight-only) | **6.7 ms/token** | 149 tok/s |
+| Decode | Float16 | 11.0 ms/token | 91 tok/s |
+| Prefill, 16 tokens | Float16 GEMM (`search`, `:activations`) | 22 ms | |
+| Prefill, 16 tokens | Float32 | 45 ms | |
 
-> [!NOTE]
-> Performance is still being optimized. The Rust version achieves 15-25 tok/s on Llama 3 8B (M-series Macs).
+Perplexity on the evaluation passage: Float32 12.1229, Float16 12.1228, int8 12.1526.
 
-## Comparison to Rust Version
+Decode started this work at 893 ms/token. It is now bound by memory bandwidth:
+the int8 GEMVs run at ~213 GB/s. What remains on top of them is kernel launch
+overhead.
 
-| Feature | Rust Luminal | Julia Port | Notes |
-|---------|--------------|------------|-------|
-| **Core Ops** | ✅ 12 primitives | ✅ 12 primitives | Identical |
-| **Graph Execution** | ✅ Static graphs | ✅ Static graphs | Same approach |
-| **Compilation** | ✅ Search-based | ✅ Search-based | Both use E-Graphs |
-| **Operator Fusion** | ✅ Automatic | ✅ Automatic | Similar results |
-| **CUDA Support** | ✅ Native | ✅ Via CUDA.jl | Slightly slower |
-| **Metal Support** | ✅ Native | ❌ Not supported | Julia limitation |
-| **Flash Attention** | ✅ Auto-derived | ✅ Hand-written | Both optimized |
-| **Training** | ✅ Full support | ✅ SGD & Adam | Supported |
-| **Llama** | ✅ 3/3.1/3.2 | ✅ Architecture only | Working |
-| **Phi-3** | ✅ mini | ✅ Architecture only | Working |
-| **Other Models** | ✅ Whisper, Yolo | ✅ Whisper only | Ported |
-| **Distributed** | ✅ Planned | ❌ Not planned | Long-term |
+Whisper tiny transcribes a 5-second clip in 1.3 s end to end when warm. That
+figure includes weight loading and graph compilation.
 
-## Roadmap
+## Features
 
-### Short-term (Q1 2026)
-- ✅ Flash Attention
-- ✅ Graph compilation with fusion
-- ✅ CUDA graph capture
-- ✅ Search-based compilation (Metatheory.jl)
-- ✅ Phi-3 Support
-- ⏳ Full Llama 3 8B inference
-- ⏳ PyTorch numerical validation
+### Graph and compiler
+- **Primitive ops**: unary `Log2, Exp2, Sin, Sqrt, Recip, ReLU`; binary `Add, Mul,
+  Mod, Max, LessThan`; `SumReduce, MaxReduce`; movement ops (`Permute, Expand,
+  Reshape, Slice, Pad`); and `MatMul`. Everything else (softmax, norms, GELU,
+  attention) is built from these in `HighLevelOps.jl`.
+- **Symbolic shapes**: dimensions may be symbols, for example a decode position,
+  resolved at run time.
+- **`compile()`** performs:
+  - elementwise fusion into generated kernels
+  - buffer reuse
+  - zero-copy views for reshapes, size-1 permutes, contiguous and strided slices,
+    broadcasts, and concatenation
+  - common-subexpression elimination
+  - constant folding (`fold=true`)
+- **HIP graph capture** (`capture=true`): a shape-static step, such as the
+  decode step, is recorded once and replayed with a single launch.
+- **Weight storage** (`weight_dtype`): `Float16` (transposed, with a GEMV
+  kernel) or `Int8` (group-wise scales, GEMV kernel). Compute stays in Float32.
+- **Search** (`compile(g; search=:static | :measured)`): an e-graph rewrite layer
+  on Metatheory.jl explores equivalent graphs: expand elimination, scale motion,
+  merged Q/K/V and gate/up projections, transposed matmuls, and a precision per
+  matmul (Float16 or int8 GEMV, Float16 GEMM). It picks a candidate with a DAG
+  cost model or by timing verified candidates on the device. Measured results
+  are cached in `~/.cache/Luminal.jl/search`. See
+  [docs/egraph_rewrite_layer.md](docs/egraph_rewrite_layer.md).
+- **Fused kernels** for the decode hot path: `RotaryEmbed`, `DecodeAttention`
+  (single-token attention over the KV cache, GQA-aware), `RMSNormOp`.
 
-### Medium-term (Q2 2026)
-- ✅ Training support (autograd & optimizers)
-- ✅ Whisper implementation
-- ⏳ Gradient checkpointing
-- ⏳ Mixed precision (FP16/BF16)
+### Models and layers
+- Layers: `Linear`, `Conv1D`, `Embedding`, `LayerNorm`, `RMSNorm`, `Mlp`,
+  `SelfAttention` (GQA, RoPE), `TransformerBlock`.
+- **Llama / TinyLlama**: prefill plus a device-resident KV cache with one
+  compiled decode graph for every position (`llama_generate`).
+- **Phi-3**: architecture and weight mapping.
+- **Whisper**:
+  - log-mel frontend matching `WhisperFeatureExtractor`
+  - audio encoder and text decoder
+  - cached greedy decoding (`greedy_decode`, `transcribe`)
+- **Weights**: safetensors (F32/F16/BF16) mapped by Hugging Face key through a
+  `WeightRegistry`.
+- **Tokenizers**: SentencePiece BPE (Llama, Phi-3) and byte-level BPE (Whisper).
 
-### Long-term
-- ⏳ Multi-GPU support
-- ⏳ Model quantization (INT8, INT4)
-- ⏳ Advanced kernel auto-generation
-- ⏳ Distributed training
+### Training
+Reverse-mode autodiff over the primitives (`backward`) and `SGD`/`Adam` optimizers.
 
-## Documentation
+### Devices
+- **AMD ROCm** (AMDGPU.jl) is the primary, tested target.
+- **CPU** runs everything, with plain-loop fallbacks for the fused kernels.
+- **CUDA** (CUDA.jl) has backends for the generic paths but has not been
+  exercised in recent work.
 
-- [Porting Plan](docs/porting_plan.md) - Detailed implementation status and roadmap
-- [Test Suite](tests/README.md) - Test documentation and coverage
-- [Rust Luminal Docs](https://docs.luminalai.com) - Original library documentation
+### Not yet implemented
+- Batched decode (batch > 1 in the decode loops)
+- Multi-GPU or distributed execution
+- Tensor-core or matrix-core kernels, and generated (rather than hand-written) kernels
+- Other upstream models (for example YOLO)
 
-## Contributing
+## Testing
 
-This is an active port of the Rust Luminal library. Contributions welcome!
+```bash
+julia --project=. tests/runtests.jl                  # every tests/test_*.jl
+julia --project=. tests/runtests.jl whisper kv_cache # files whose name contains a pattern
+julia --project=. tests/test_llama.jl                # a single file
+```
 
-**Priority areas**:
-- Training/autograd implementation
-- PyTorch validation tests
-- Performance benchmarking
-- Additional model implementations
+GPU tests run when `get_device()` finds a GPU. `test_greedy_decode.jl` also
+checks a real transcription against Hugging Face when `whisper_tiny/`
+(openai/whisper-tiny) and its reference are present. To produce the reference
+(requires `transformers`), run:
+
+```bash
+python3 examples/whisper_reference.py whisper_tiny whisper_tiny/ref/audio.f32 whisper_tiny/ref
+```
+
+See [tests/README.md](tests/README.md).
+
+## Layout
+
+```
+src/
+├── Luminal.jl          # module, exports
+├── Ops.jl              # primitive and fused op types
+├── Graph.jl            # graph, tensors, CSE
+├── ShapeTracker.jl     # symbolic shapes and views
+├── HighLevelOps.jl     # op library built from the primitives
+├── Compiler.jl         # compile(): fusion, buffers, views, folding, capture
+├── EGraphRewrite.jl    # e-graph rewrite layer and measured search
+├── Execution.jl        # interpreter and kernels (GEMV, attention, norms, …)
+├── Device.jl           # devices, transfers, HIP graph capture
+├── NN.jl               # layers, Llama, Phi-3, KV-cached decode
+├── Whisper.jl          # audio frontend, encoder, decoder, cached decode
+├── Decoding.jl         # llama_generate, greedy_decode, transcribe
+├── Weights.jl          # safetensors loading, WeightRegistry
+├── Autograd.jl, Optimizer.jl
+└── LlamaTokenizer.jl, WhisperTokenizer.jl
+```
 
 ## License
 
-Licensed under the Apache License, Version 2.0 http://www.apache.org/licenses/LICENSE-2.0 or the MIT license http://opensource.org/licenses/MIT, at your option.
+Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+or the MIT license (http://opensource.org/licenses/MIT), at your option.

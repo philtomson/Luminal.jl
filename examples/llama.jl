@@ -1,103 +1,44 @@
-# Llama Compilation and Execution Example
-# 
-# This example demonstrates how to set up the Llama model architecture,
-# compile the execution graph ahead-of-time, and simulate a token generation loop
-# to measure the inference performance.
-
+# Llama decode benchmark with random weights.
+#
+# Builds a small Llama, compiles the position-independent single-token decode
+# graph (HIP-graph captured on AMD GPUs) and times it against a device-resident
+# KV cache. For real checkpoints and text, see examples/tinyllama_chat.jl.
+#
+#   julia --project=. examples/llama.jl [cpu|gpu]
 using Luminal
 using Luminal.NN
 using Printf
 
-function main()
-    println("=========================================")
-    println("   Luminal.jl - Llama Compiled Example   ")
-    println("=========================================")
-    
-    # 1. Initialize the computation Graph
-    graph = Graph()
-    
-    # 2. Setup Model Configuration
-    # We use a scaled-down architecture (TinyLlama-like) for demonstration purposes
-    vocab_size = 32000
-    hidden_dim = 512
-    n_layers = 4
-    n_heads = 8
-    n_kv_heads = 8
-    intermediate = 1024
-    
-    println("\n[1/4] Constructing Llama Architecture...")
-    println("Config: Layers=$n_layers, Hidden=$hidden_dim, Heads=$n_heads")
-    
-    llama = NN.Llama(graph; 
-                     vocab_size=vocab_size, 
-                     hidden=hidden_dim, 
-                     n_layers=n_layers, 
-                     n_heads=n_heads, 
-                     n_kv_heads=n_kv_heads, 
-                     intermediate=intermediate)
-    
-    # Define input tensor placeholder (Batch=1, SeqLen=1 for decoding simulation)
-    batch_size = 1
-    seq_len = 1
-    input_tensor = tensor(graph, [batch_size, seq_len])
-    
-    # Build the forward pass through the network
-    # Note: 0 is the starting positional offset for RoPE embeddings
-    out = llama(input_tensor, 0)
-    
-    device = get_device()
-    println("\n[2/4] Hardware Detected: $device")
-    
-    # 3. Compile Graph
-    # This phase runs the SymbolicUtils.jl optimizations (Operator Fusion, etc.)
-    # and pre-allocates all necessary buffers perfectly sized for the execution.
-    println("\n[3/4] Compiling Execution Graph ahead-of-time...")
-    exec_fn = compile(graph)
-    println("Compilation complete. Fused graph has $(length(graph.nodes)) nodes.")
-    
-    # 4. Simulate generation loop
-    gen_tokens = 100
-    println("\n[4/4] Simulating generation of $gen_tokens tokens...")
-    
-    # Prepare initial dummy tokens
-    input_ids = Float32.(rand(0:(vocab_size-1), batch_size, seq_len))
-    inputs = Dict{Int, Any}(input_tensor.id => input_ids)
-    
-    # Warmup kernel (compiles CUDA kernels if using GPU)
-    print("Running Warmup...")
-    _ = exec_fn(inputs, device)
-    println(" Done.")
-    
-    # Benchmarking Loop
-    start_time = time()
-    for i in 1:gen_tokens
-        # In a real generation loop, you would sample the next token by inspecting logits
-        # For simulation, we simply inject a randomly generated dummy token IDs.
-        inputs[input_tensor.id] = Float32.(rand(0:(vocab_size-1), batch_size, seq_len))
-        
-        # Execute the compiled function. Return value is the evaluation of all graph nodes.
-        results = exec_fn(inputs, device)
-        
-        # Access the final output logits via the output node ID: `out.id`
-        logits = results[out.id]
-        
-        if i % 25 == 0
-            print(".")
-        end
-    end
-    println()
-    
-    end_time = time()
-    
-    # 5. Performance Metrics
-    total_time = end_time - start_time
-    ms_per_token = (total_time / gen_tokens) * 1000
-    tok_per_sec = gen_tokens / total_time
-    
-    println("\n--- Performance Summary ---")
-    @printf("Generated %d tokens in %.2fs\n", gen_tokens, total_time)
-    @printf("Speed: %.2f ms/token (%.2f tok/s)\n", ms_per_token, tok_per_sec)
-    println("=========================================")
-end
+device = "cpu" in ARGS ? CPUDevice() : get_device()
+cfg = (vocab_size=32000, hidden=512, n_layers=4, n_heads=8, n_kv_heads=4, intermediate=1408)
+max_seq = 256
+println("Llama $(cfg) on $(device)")
 
-main()
+graph = Graph(); reg = WeightRegistry()
+llama = Llama(graph, reg; cfg..., rope_base=10000f0)
+weights = Dict{String,Any}(k => 0.02f0 .* randn(Float32, Tuple(Luminal.realized_dims(graph.shapes[id]))...)
+                           for (k, id) in reg.mapping)
+idg = build_llama_decode_step!(llama, graph, Luminal.Sym{Int}(:pos); max_seq=max_seq, rope_base=10000f0)
+load_weights!(graph, reg, weights; device=device)
+
+retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids, idg.token_input_id,
+              idg.pos_input_id, idg.self_k_ids, idg.self_v_ids)
+t = @elapsed exec = compile(graph; device=device, retain=retain, free_intermediates=false,
+                            capture=device isa Luminal.AMDDevice)
+@printf("compiled in %.1f s\n", t)
+
+head_dim = cfg.hidden ÷ cfg.n_heads
+cache = LlamaKVCacheState(cfg.n_layers, cfg.n_kv_heads, head_dim; max_seq=max_seq, device=device)
+token = 1
+times = Float64[]
+for step in 1:100
+    global token
+    dt = @elapsed begin
+        logits = llama_decode_step!(exec, idg, cache, token;
+                                    sym_vals=Dict(:pos => cache.step_pos), device=device)
+        token = argmax(view(Array{Float32}(logits), :, 1, 1)) - 1
+    end
+    push!(times, dt)
+end
+med = sort(times[3:end])[length(times[3:end]) ÷ 2] * 1000
+@printf("median decode step: %.2f ms (%.0f tok/s)\n", med, 1000 / med)

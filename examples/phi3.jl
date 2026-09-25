@@ -1,84 +1,29 @@
-# Phi-3 End-to-End Inference Example
-# 
-# This example demonstrates:
-# 1. Loading the Llama/Phi-3 Tokenizer
-# 2. Constructing the Phi-3 architecture with Weight Registration
-# 3. Compiling the execution graph
-# 4. Running greedy decoding (simulation)
-
+# Phi-3 architecture demo with random weights: builds a scaled-down Phi-3
+# (grouped-query attention, RoPE), shows the Hugging Face weight mapping, and runs
+# a compiled prefill. Real checkpoints load with `load_weights!(graph, reg, dir)`.
+#
+#   julia --project=. examples/phi3.jl [cpu|gpu]
 using Luminal
 using Luminal.NN
 using Printf
 
-function main()
-    println("=========================================")
-    println("   Luminal.jl - Phi-3 Inference Demo     ")
-    println("=========================================")
-    
-    # 1. Initialize Graph and Registry
-    graph = Graph()
-    reg = WeightRegistry()
-    
-    # 2. Setup Configuration
-    # (Using Phi-3 mini defaults, but with 2 layers for demo speed)
-    println("\n[1/5] Constructing Phi-3 Architecture...")
-    phi3 = NN.Phi3(graph, reg; n_layers=2)
-    
-    # 3. Tokenizer
-    println("\n[2/5] Loading Llama Tokenizer...")
-    # In a real scenario, you'd provide the path to the model directory
-    # containing tokenizer.json and model.safetensors.
-    # For this demo, we'll simulate the presence of a tokenizer.
-    # tok = LlamaTokenizer("path/to/phi3/model")
-    println("Note: LlamaTokenizer is ready for use with .safetensors checkpoints.")
-    
-    # 4. Compile Graph
-    println("\n[3/5] Compiling Execution Graph ahead-of-time...")
-    
-    batch_size = 1
-    seq_len = 1
-    input_tensor = tensor(graph, [batch_size, seq_len])
-    
-    # Forward pass node
-    out = phi3(input_tensor, 0)
-    
-    device = get_device()
-    println("Hardware Detected: $device")
-    
-    # Compile
-    exec_fn = compile(graph)
-    println("Compilation complete. Graph has $(length(graph.nodes)) nodes.")
-    
-    # 5. Simulate Weight Loading
-    println("\n[4/5] Load Weights Mapping Status...")
-    n_params = length(reg.mapping)
-    println("Registry has $n_params parameters mapped to HuggingFace keys.")
-    # Example key check:
-    if haskey(reg.mapping, "model.layers.0.self_attn.q_proj.weight")
-        println("  Found: model.layers.0.self_attn.q_proj.weight -> node $(reg.mapping["model.layers.0.self_attn.q_proj.weight"])")
-    end
-    
-    # 6. Run Inference Simulation
-    println("\n[5/5] Running Inference Step...")
-    
-    # Prepare dummy input (e.g. "The meaning of life is")
-    # input_ids = encode(tok, "The meaning of life is")
-    input_ids = Float32[1234.0] # Dummy token ID
-    inputs = Dict{Int, Any}(input_tensor.id => Base.reshape(input_ids, 1, 1))
-    
-    # Execute
-    start_time = time()
-    results = exec_fn(inputs, device)
-    logits = results[out.id]
-    end_time = time()
-    
-    println("Inference execution successful.")
-    @printf("Step time: %.2f ms\n", (end_time - start_time) * 1000)
-    println("Logits shape: ", size(logits))
-    
-    println("\n=========================================")
-    println("   Phi-3 Support Verified Successfully   ")
-    println("=========================================")
-end
+device = "cpu" in ARGS ? CPUDevice() : get_device()
+graph = Graph(); reg = WeightRegistry()
+phi3 = Phi3(graph, reg; vocab_size=32064, hidden=768, n_layers=4, n_heads=12, n_kv_heads=4,
+            intermediate=2048)
+println("Registry maps $(length(reg.mapping)) Hugging Face keys, e.g. ",
+        "model.layers.0.self_attn.q_proj.weight => node ",
+        reg.mapping["model.layers.0.self_attn.q_proj.weight"])
 
-main()
+seq_len = 16
+input = tensor(graph, [seq_len, 1])            # (tokens, batch)
+logits = phi3(input, 0)                        # (vocab, tokens, batch)
+weights = Dict{String,Any}(k => 0.02f0 .* randn(Float32, Tuple(Luminal.realized_dims(graph.shapes[id]))...)
+                           for (k, id) in reg.mapping)
+load_weights!(graph, reg, weights; device=device)
+exec = compile(graph; device=device, retain=[logits.id])
+
+ids = Float32.(rand(0:32063, seq_len, 1))
+exec(Dict{Int,Any}(input.id => ids); device=device)          # warm up
+t = @elapsed out = Array(exec(Dict{Int,Any}(input.id => ids); device=device)[logits.id])
+@printf("prefill of %d tokens: %.2f ms, logits %s\n", seq_len, t * 1000, size(out))

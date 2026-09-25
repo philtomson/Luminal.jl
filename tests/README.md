@@ -1,64 +1,67 @@
-# Julia Test Suite
-
-## Running Tests
-
-Run all tests from the project root (each test must run in a separate Julia process due to Julia JIT compilation and graph cleanup requirements):
+# Test Suite
 
 ```bash
-for f in tests/test_*.jl tests/test.jl; do
-    echo "=== $f ==="
-    julia --project=. "$f"
-    echo
-done
+julia --project=. tests/runtests.jl                  # every test_*.jl, each in its own module
+julia --project=. tests/runtests.jl whisper kv_cache # files whose name contains a pattern
+julia --project=. tests/test_rotary.jl               # a single file
 ```
 
-Or run individual tests:
+Tests that have GPU variants run them when `get_device()` finds a GPU, next to the CPU run.
 
-```bash
-julia --project=. tests/test_egraph_rewrite.jl
-```
+## Core
 
-## Test Inventory
+| Test | Covers |
+|------|--------|
+| `test_symbolic.jl` | Symbolic expressions |
+| `test_shape_tracker.jl` | ShapeTracker views and dimensions |
+| `test_symbolic_slice.jl` | Slices with symbolic bounds, CPU and GPU |
+| `test_lazy.jl` | Graphs compute nothing until compiled and run |
+| `test_end_to_end.jl` | Build, compile and run a small graph |
 
-### Core Architecture
-| Test | Description |
-|------|-------------|
-| `test_symbolic.jl` | Symbolic expression construction and evaluation |
-| `test_shape_tracker.jl` | ShapeTracker dimension operations |
-| `test.jl` | End-to-end graph build + execution (matmul) |
-| `test_lazy.jl` | Building a graph computes nothing until it is compiled and run |
-| `test_symbolic_slice.jl` | Slices with symbolic bounds (KV-cache update) on CPU and GPU |
+## Compiler
 
-### Compilation & Fusion
-| Test | Description |
-|------|-------------|
-| `test_compilation.jl` | End-to-end graph compilation to optimized execution plan |
-| `test_fusion.jl` | Fusion of element-wise operators into single kernels |
-| `test_half_weights.jl` | Float16 matmul weights match Float32 |
+| Test | Covers |
+|------|--------|
+| `test_compilation.jl` | `compile()` against the interpreter |
+| `test_fusion.jl` | Elementwise fusion |
+| `test_concat_views.jl` | Concatenation and strided-slice views |
+| `test_half_weights.jl` | Float16 and int8 weight storage, the weight cache |
+| `test_egraph_rewrite.jl` | Graph ⇄ e-graph, rewrite rules, kernel and precision variants, `compile(...; search=...)` |
 
-### E-Graph Rewrite Layer (Search-Based)
-| Test | Description |
-|------|-------------|
-| `test_egraph_rewrite.jl` | Graph ⇄ e-graph round trip, rewrite rules, merged projections with constant folding, and `compile(...; search=...)` |
+## Kernels and devices
 
-### Hardware & Devices
-| Test | Description |
-|------|-------------|
-| `test_gpu_detection.jl` | Hardware discovery (CUDA/ROCm/AMDGPU) |
-| `test_gpu_execution.jl` | End-to-end kernel execution on NVIDIA GPUs |
+| Test | Covers |
+|------|--------|
+| `test_gpu_detection.jl` | Device detection and transfers |
+| `test_gpu_execution.jl` | Graph execution on the GPU |
+| `test_attention.jl` | Flash attention against a reference, CPU and GPU |
+| `test_rotary.jl` | Fused `RotaryEmbed` |
+| `test_decode_attention.jl` | Fused single-token `DecodeAttention` |
+| `test_rmsnorm.jl` | Fused `RMSNormOp` |
 
-### Neural Networks & Models
-| Test | Description |
-|------|-------------|
-| `test_nn_layers.jl` | Verification of Linear, LayerNorm, and RMSNorm layers |
-| `test_attention.jl` | Multi-head attention mechanism verification |
-| `test_flash_attention_verification.jl` | Numerical validation of Flash Attention vs standard attention |
-| `test_llama.jl` | 2-layer Llama model inference (interpreted) |
-| `test_llama_compiled.jl` | Full Llama model inference with compilation and fusion |
+## Layers and models
 
-## Requirements
+| Test | Covers |
+|------|--------|
+| `test_nn_layers.jl` | `Linear`, `Embedding`, `LayerNorm` values |
+| `test_llama.jl` | Llama components against reference values |
+| `test_llama_compiled.jl` | Llama through `compile()` |
+| `test_phi3_loading.jl` | Phi-3 weight mapping |
+| `test_weight_loading.jl` | `WeightRegistry` and safetensors; Whisper keys and shapes equal openai/whisper-tiny's |
 
-- **Julia 1.12.5+**
-- **Metatheory.jl** v3.0+
-- **SymbolicUtils.jl** v3.31.0
-- **CUDA.jl** (for GPU tests)
+## Whisper
+
+| Test | Covers |
+|------|--------|
+| `test_mel_spectrogram.jl` | Slaney mel filterbank (against `WhisperFeatureExtractor` values), STFT, log-mel |
+| `test_whisper_components.jl` | `Conv1D` against a direct convolution, exact GELU, encoder and decoder shapes |
+| `test_whisper_tokenizer.jl` | Byte-level BPE, special tokens |
+| `test_kv_cache.jl` | Cached decoding reproduces the full decoder's logits, CPU and GPU |
+| `test_greedy_decode.jl` | `greedy_decode` with mock weights. If `whisper_tiny/ref` exists, also checks that `transcribe` matches Hugging Face token for token (see `examples/whisper_reference.py`) |
+
+## Training
+
+| Test | Covers |
+|------|--------|
+| `test_autograd.jl` | Gradients of arithmetic, broadcasting, matmul, unary ops |
+| `test_optimizer.jl` | SGD and Adam |
