@@ -21,6 +21,7 @@ function main()
     max_tokens   = length(args) >= 3 ? parse(Int, args[3]) : 100
     rope_base    = length(args) >= 4 ? parse(Float32, args[4]) : 10000.0f0
     chat_mode    = "--chat" in ARGS
+    decode_weights = "--int8" in ARGS ? Int8 : nothing
     search_arg   = findfirst(a -> startswith(a, "--search="), ARGS)
     search       = search_arg === nothing ? :none : Symbol(split(ARGS[search_arg], "=")[2])
 
@@ -77,7 +78,8 @@ function main()
                                max_seq=256,
                                device=device,
                                rope_base=rope_base,  # Decided by command-line or default
-                               search=search)
+                               search=search,
+                               decode_weights=decode_weights)
     t1 = time()
 
     println(response)

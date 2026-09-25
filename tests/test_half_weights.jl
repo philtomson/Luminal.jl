@@ -63,12 +63,17 @@ if get_device() isa Luminal.AbstractGPUDevice
     @testset "int8 weights (QuantWeight / MatMulQ8)" begin
         dev = get_device()
         W = randn(Float32, 96, 64)
-        qw = Luminal.QuantWeight(Luminal.to_device(W, dev))
+        # per-row scales (group = In) and per-group scales (group 32)
+        for grp in (64, 32)
+            qg = Luminal.QuantWeight(Luminal.to_device(W, dev); group=grp)
+            @test qg.group == grp && size(qg.scale) == (64 ÷ grp, 96)
+            sc = repeat(Array(qg.scale), inner=(grp, 1))           # (In, Out)
+            dq = permutedims(Float32.(Array(qg.q)) .* sc)
+            @test all(abs.(dq .- W) .<= permutedims(sc) ./ 2 .+ 1f-6)   # within half a step
+        end
+        qw = Luminal.QuantWeight(Luminal.to_device(W, dev); group=32)
         @test size(qw) == (96, 64)
-        # dequantized weights are within half a quantization step of the original
-        scale = Array(qw.scale)
-        deq = Float32.(permutedims(Array(qw.q))) .* scale
-        @test all(abs.(deq .- W) .<= scale ./ 2 .+ 1f-6)
+        deq = permutedims(Float32.(Array(qw.q)) .* repeat(Array(qw.scale), inner=(32, 1)))
 
         x = randn(Float32, 64, 5)
         for grp in (64, 128, 256)
@@ -85,6 +90,8 @@ if get_device() isa Luminal.AbstractGPUDevice
         g.tensors[(lin.weight.id, 1)] = Luminal.to_device(W, dev)
         ex = compile(g; device=dev, retain=[y.id], weight_dtype=Int8)
         @test ex.results[lin.weight.id] isa Luminal.QuantWeight
+        qd = ex.results[lin.weight.id]                              # default group
+        deq = permutedims(Float32.(Array(qd.q)) .* repeat(Array(qd.scale), inner=(qd.group, 1)))
         xv = randn(Float32, 64, 3, 1)
         @test Array(ex(Dict{Int,Any}(xin.id => xv); device=dev)[y.id]) ≈
               Base.reshape(deq * Base.reshape(xv, 64, 3), 96, 3, 1) rtol = 1e-5

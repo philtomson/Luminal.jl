@@ -161,6 +161,24 @@ with `search_tolerance` set accordingly:
 
 Top-1 prediction agreed with Float32 at every prompt position at all three lengths.
 
+**Int8 weights for decode** (`MatMulQ8`, `QuantWeight`; `compile(...; weight_dtype=Int8)`,
+`precision=:int8`, `llama_generate(...; decode_weights=Int8)`): weight-only int8
+with one symmetric scale per 128 inputs of each row, Float32 activations.
+
+| Decode weights | ms/token | perplexity (153-token passage) | top-1 vs Float32 |
+|---|---|---|---|
+| Float32 | ~26 | 12.123 | - |
+| Float16 | 15.0 | 12.123 | 153/153 |
+| int8, one scale per row | 11.6* | 12.244 (+1.0%) | 148/153 |
+| int8, one scale per 128 inputs | **10.8** | **12.153 (+0.25%)** | 149/153 |
+
+(*one-row kernel.) The first int8 kernel reached only ~135 GB/s: it was limited
+by activation loads (32 bytes of x per 16 bytes of weights), not by weight
+bandwidth. Computing two output rows per workgroup, so each x slice is loaded
+once for both, took it to ~205 GB/s (1.7-1.9x the Float16 GEMV per matrix; four
+rows was slower). Group-wise scales cost almost nothing over per-row ones once
+that was fixed. 100 generated tokens differ from Float16 in one word.
+
 Latest full search (kernel variants, group size 256 default, merges): **14.54
 ms/token** with Float16, vs 14.9 for the plain Float16 path.
 
@@ -224,8 +242,8 @@ folding and slice aliasing); `compile(...; search=...)`; old paths deleted.
 Next:
 1. **Kernel alternatives as rules:** GEMV vs GEMM, HalfWeight workgroup size,
    transpose flags. These are where the measurable wins are for decode.
-2. **Int8 weights for decode** (`MatMulQ8`, `precision=:int8`): in progress;
-   accuracy is measured by `examples/quant_eval.jl`.
+2. **Int8 for prefill:** int8 weights only help bandwidth-bound decode; prefill
+   would need int8 activations (W8A8) for a speedup.
 3. **Faster search:** extraction (~8 s on 3,100 e-classes) and per-candidate
    compiles dominate; incremental re-extraction and reusing compiled subgraphs.
 4. **Search strategy:** coordinate descent is enough for ~18 decisions. Upstream

@@ -94,65 +94,92 @@ HalfWeightN(W::AbstractMatrix) = (w = similar(W, Float16, size(W)...); w .= W; H
 Base.size(w::HalfWeightN) = size(w.w)
 Base.getindex(w::HalfWeightN, i::Int, j::Int) = w.w[i, j]
 
-# A matmul weight quantized to int8 with one symmetric Float32 scale per output row
-# (scale = max|row| / 127), transposed to (In, Out) so each row is contiguous and
-# read as 16-byte vectors of 16 int8. Weight-only: activations stay Float32. Half
-# the bytes of Float16, for bandwidth-bound decode.
+# A matmul weight quantized to int8 with symmetric Float32 scales, one per group of
+# `group` consecutive inputs of each output row (scale = max|group| / 127; a
+# group equal to In means one scale per row). Transposed to (In, Out) so each row
+# is contiguous and read as 16-byte vectors of 16 int8. Weight-only: activations
+# stay Float32. Half the bytes of Float16, for bandwidth-bound decode. Smaller
+# groups track the weights' range more closely (a single large weight no longer
+# coarsens a whole 2048- or 5632-element row) for ~4 bytes per group.
+const DEFAULT_Q8_GROUP = 128     # inputs per int8 scale
+const DEFAULT_Q8_THREADS = 128   # int8 GEMV threads per workgroup
 struct QuantWeight{Q, V, S} <: AbstractMatrix{Float32}
-    q::Q       # (In, Out) Int8
-    v::V       # (In/16, Out) NTuple{16, Int8} view of `q`
-    scale::S   # (Out,) Float32
+    q::Q         # (In, Out) Int8
+    v::V         # (In/16, Out) NTuple{16, Int8} view of `q`
+    scale::S     # (In/group, Out) Float32
+    group::Int
 end
-function QuantWeight(W::AbstractMatrix)
-    scale = vec(maximum(abs, W; dims=2)) ./ 127f0
+function QuantWeight(W::AbstractMatrix; group::Int = DEFAULT_Q8_GROUP)
+    M, K = size(W)
+    (group % 16 == 0 && K % group == 0) || (group = K)       # fall back to one scale per row
+    K ÷ group <= 512 || (group = K)                           # the kernel stages <= 512 scales
+    Wt = permutedims(W, (2, 1))                              # (In, Out)
+    Wg = Base.reshape(Wt, group, K ÷ group, M)
+    scale = Base.reshape(maximum(abs, Wg; dims=1), K ÷ group, M) ./ 127f0
     scale .= max.(scale, floatmin(Float32))
-    qf = permutedims(W ./ scale, (2, 1))                     # (In, Out) Float32, in [-127, 127]
-    q = similar(W, Int8, size(W, 2), size(W, 1))
-    q .= unsafe_trunc.(Int8, round.(qf))
-    v = Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), size(q, 1) ÷ 16, size(q, 2))
-    return QuantWeight(q, v, scale)
+    q = similar(W, Int8, K, M)
+    Base.reshape(q, group, K ÷ group, M) .= unsafe_trunc.(Int8, round.(Wg ./ Base.reshape(scale, 1, K ÷ group, M)))
+    v = Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), K ÷ 16, M)
+    return QuantWeight(q, v, scale, group)
 end
 Base.size(w::QuantWeight) = (size(w.q, 2), size(w.q, 1))
-Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[i]
+Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j - 1) ÷ w.group + 1, i]
 
-# Y[:, c] = scale .* (Wq * X[:, c]): like the Float16 GEMV, one workgroup per output
-# row, 16 int8 weights per load, Float32 accumulation, scaled once per row.
-@kernel function _q8_matmul_kernel!(Y, @Const(Wv), @Const(scale), @Const(Xv), K16, N)
-    row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
-    s = @localmem Float32 (256,)
+# Y[:, c] = Wq * X[:, c] with per-group scales. Each workgroup computes R output
+# rows (R = 2 when the row count is even): a thread loads its 16-element slice of
+# x once and reuses it for both rows. With one row per workgroup the kernel was
+# limited by activation loads (32 bytes of x per 16 bytes of weights) at ~135
+# GB/s; with two it reaches ~205 GB/s on a Radeon 8060S (R = 4 was slower).
+# 16 int8 weights per load, Float32 accumulation, scaled once per load.
+# `shift` >= 0: loads per scale group is 2^shift (index by bit shift).
+@kernel function _q8_matmul_kernel!(Y, @Const(Wv), @Const(scale), @Const(Xv), K16, N,
+                                    loads_per_group, shift, ::Val{R}) where {R}
+    grp = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256, 2)
+    acc = @private Float32 (2,)
+    row0 = (grp - 1) * R
     for c in 1:N
-        acc = 0f0
+        for r in 1:R; @inbounds acc[r] = 0f0; end
         k = lid
         while k <= K16
-            @inbounds w = Wv[k, row]
             @inbounds xa = Xv[2k - 1, c]
             @inbounds xb = Xv[2k, c]
-            acc += Float32(w[1]) * xa[1] + Float32(w[2]) * xa[2] + Float32(w[3]) * xa[3] + Float32(w[4]) * xa[4] +
-                   Float32(w[5]) * xa[5] + Float32(w[6]) * xa[6] + Float32(w[7]) * xa[7] + Float32(w[8]) * xa[8] +
-                   Float32(w[9]) * xb[1] + Float32(w[10]) * xb[2] + Float32(w[11]) * xb[3] + Float32(w[12]) * xb[4] +
-                   Float32(w[13]) * xb[5] + Float32(w[14]) * xb[6] + Float32(w[15]) * xb[7] + Float32(w[16]) * xb[8]
+            gi = shift >= 0 ? ((k - 1) >> shift) + 1 : (k - 1) ÷ loads_per_group + 1
+            for r in 1:R
+                @inbounds w = Wv[k, row0 + r]
+                d = Float32(w[1]) * xa[1] + Float32(w[2]) * xa[2] + Float32(w[3]) * xa[3] + Float32(w[4]) * xa[4] +
+                    Float32(w[5]) * xa[5] + Float32(w[6]) * xa[6] + Float32(w[7]) * xa[7] + Float32(w[8]) * xa[8] +
+                    Float32(w[9]) * xb[1] + Float32(w[10]) * xb[2] + Float32(w[11]) * xb[3] + Float32(w[12]) * xb[4] +
+                    Float32(w[13]) * xb[5] + Float32(w[14]) * xb[6] + Float32(w[15]) * xb[7] + Float32(w[16]) * xb[8]
+                @inbounds acc[r] += d * scale[gi, row0 + r]
+            end
             k += G
         end
-        @inbounds s[lid] = acc
+        for r in 1:R; @inbounds s[lid, r] = acc[r]; end
         @synchronize
         stride = G ÷ 2
         while stride > 0
-            lid <= stride && (@inbounds s[lid] += s[lid + stride])
+            if lid <= stride
+                for r in 1:R; @inbounds s[lid, r] += s[lid + stride, r]; end
+            end
             @synchronize
             stride ÷= 2
         end
-        lid == 1 && (@inbounds Y[row, c] = s[1] * scale[row])
+        lid <= R && (@inbounds Y[row0 + lid, c] = s[1, lid])
         @synchronize
     end
 end
 
-function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_HALF_GROUP)
+function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
     K, M = size(W.q)
     N = length(B) ÷ K
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
+    R = iseven(M) ? 2 : 1
+    lpg = W.group ÷ 16
     _q8_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
-        Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N; ndrange = M * group)
+        Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N, lpg,
+        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R); ndrange = (M ÷ R) * group)
     return C
 end
 

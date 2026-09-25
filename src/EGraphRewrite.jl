@@ -278,10 +278,10 @@ end
 
 # precision=:int8 offers weight-only int8 (one scale per output row) for weight
 # matmuls: half the bytes of Float16 for decode, lossy (see docs).
-const INT8_VARIANTS = ((256,),)
+const INT8_VARIANTS = ((128,),)
 const INT8_RULES = @theory q w x begin
     xMatMul(q::Tuple, w, x) => (_half_ok(_egraph, w) && w.data.dims[2] % 16 == 0) ?
-                                :(xMatMulQ8($((256,)), $w, $x)) : nothing
+                                :(xMatMulQ8($((128,)), $w, $x)) : nothing
 end
 
 # `precision` enables reduced-precision alternatives: false (exact rewrites only);
@@ -366,7 +366,7 @@ function static_cost(g, n::VecExpr)
         N = max(1, ins[2] ÷ max(1, wd[2]))
         if h === :xMatMulQ8
             # int8 GEMV: 1 byte per weight, same column scaling as the Float16 GEMV
-            tie = _lit(g, ch[1])[1] == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
+            tie = _lit(g, ch[1])[1] == 128 ? 0.0 : 1.0
             return 1.0 * ins[1] * (1 + N / 12) + 4.0 * ins[2] + LAUNCH_BYTES + tie
         end
         if h === :xMatMulF16

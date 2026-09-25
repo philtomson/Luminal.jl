@@ -108,7 +108,7 @@ MatMulF16(group::Int) = MatMulF16(group, :gemv)
 struct MatMulQ8 <: Op
     group::Int
 end
-MatMulQ8() = MatMulQ8(DEFAULT_HALF_GROUP)
+MatMulQ8() = MatMulQ8(128)
 
 # op(A) * op(B), where op transposes the first two dims when its flag is set:
 # a matmul that reads a permuted operand through BLAS transpose flags instead of

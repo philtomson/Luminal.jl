@@ -40,6 +40,9 @@ End-to-end greedy text generation for Llama-style (decoder-only) models.
                     through the e-graph rewrite layer (see `compile`). On GPU the
                     search also chooses Float16 weights per matmul. `:measured`
                     results are cached per model and device.
+- `decode_weights`: storage for decode's matmul weights (default `Float16` on GPU,
+                    `Float32` on CPU). `Int8` (group-wise int8, weight-only) is ~1.4x
+                    faster decode on TinyLlama at ~+0.25% perplexity.
 """
 function llama_generate(model,
                          tokenizer::LlamaTokenizer,
@@ -49,7 +52,8 @@ function llama_generate(model,
                          max_seq::Int=2048,
                          rope_base::Float32=500000f0,
                          device=nothing,
-                         search::Symbol=:none)
+                         search::Symbol=:none,
+                         decode_weights::Union{Nothing,Type}=nothing)
 
     target_device = (device === nothing ? get_device() : device)
 
@@ -95,7 +99,7 @@ function llama_generate(model,
     # the Float16 kernel is a GEMV looping over the prompt's columns, while rocBLAS's
     # Float32 GEMM stays bandwidth-bound. Measured on TinyLlama: f16 is ~1x f32 at 16
     # tokens and ~3x slower at 64+, so prefill uses Float16 only for very short prompts.
-    wdtype = on_gpu ? Float16 : Float32
+    wdtype = decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
     pfx_wdtype = (on_gpu && plen <= 8) ? Float16 : Float32
     ids = zeros(Float32, slen, 1)
     ids[1:plen, 1] .= prompt_ids
@@ -178,7 +182,8 @@ function llama_generate(model,
     else
         @info "Searching equivalent decode graphs ($search)..."
         compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
-                capture=capture, search=search, precision=wdtype === Float16)
+                capture=capture, search=search,
+                precision=wdtype === Int8 ? (:weights, :int8) : wdtype === Float16 ? :weights : false)
     end
 
     for step in 0:(max_new_tokens - 2)
