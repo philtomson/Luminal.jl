@@ -93,6 +93,54 @@ function execute_op!(out, op::RotaryEmbed, x, c, s)
     return out
 end
 
+# --- RMS normalization --------------------------------------------------------
+# One workgroup per column (all dims after the first): sum of squares over dim 1
+# with a tree reduction, then the normalized, weighted write.
+@kernel function _rmsnorm_kernel!(out, @Const(x), @Const(w), eps)
+    col = @index(Group, Linear); lid = @index(Local, Linear)
+    T = @uniform @groupsize()[1]
+    H = @uniform size(x, 1)
+    red = @localmem Float32 (256,)
+    acc = 0f0
+    i = lid
+    while i <= H
+        @inbounds v = x[i, col]
+        acc += v * v
+        i += T
+    end
+    @inbounds red[lid] = acc
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        lid <= stride && (@inbounds red[lid] += red[lid + stride])
+        @synchronize
+        stride ÷= 2
+    end
+    @inbounds r = 1f0 / sqrt(red[1] / H + eps)
+    i = lid
+    while i <= H
+        @inbounds out[i, col] = x[i, col] * r * w[i]
+        i += T
+    end
+end
+
+function execute_op!(out, op::RMSNormOp, x, w)
+    H = size(x, 1)
+    xc = x isa DenseArray ? x : copy(x)
+    x2 = Base.reshape(xc, H, :)
+    o2 = Base.reshape(out, H, :)
+    wv = vec(w)
+    if !(out isa AnyGPUArray)          # CPU: plain loops (the kernel's reduction is GPU-shaped)
+        for c in axes(x2, 2)
+            r = 1f0 / sqrt(sum(abs2, view(x2, :, c)) / H + op.epsilon)
+            o2[:, c] .= view(x2, :, c) .* r .* wv
+        end
+        return out
+    end
+    _rmsnorm_kernel!(KernelAbstractions.get_backend(o2), 256)(o2, x2, wv, op.epsilon; ndrange = size(x2, 2) * 256)
+    return out
+end
+
 # --- Decode attention ---------------------------------------------------------
 # One workgroup per (query head, batch). Scores for the n = pos + 1 positions
 # (cache slots 1..pos, then the new token) live in local memory: dot products,

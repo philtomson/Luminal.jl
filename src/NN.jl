@@ -151,6 +151,12 @@ end
 function (ln::LayerNorm)(x::Luminal.GraphTensor)
     # x is (Hidden, Seq..., Batch)
     # normalize over dimension 1 (Hidden)
+    # RMS norm with a weight and no bias (Llama, Phi-3): one fused kernel
+    if !ln.mean_norm && ln.weight !== nothing && ln.bias === nothing
+        return Luminal.add_op!(x.graph_ref, Luminal.RMSNormOp(ln.epsilon),
+                               [(x.id, 0, x.shape), (ln.weight.id, 0, ln.weight.shape)],
+                               Luminal.ShapeTracker(Luminal.realized_dims(x.shape)))
+    end
     # Use layer_norm (with mean subtraction) or std_norm (RMS) based on flag
     out = ln.mean_norm ? Luminal.layer_norm(x, 1, ln.epsilon) : Luminal.std_norm(x, 1, ln.epsilon)
     

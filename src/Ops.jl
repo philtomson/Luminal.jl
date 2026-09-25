@@ -117,6 +117,13 @@ MatMulQ8() = MatMulQ8(128)
 # copies on the decode path) -- one launch instead.
 struct RotaryEmbed <: Op end
 
+# RMS normalization over dim 1 with a weight, in one kernel:
+#   out = x / sqrt(mean(x .^ 2, dims=1) + epsilon) .* w,   x (H, ...), w (H,)
+# (the composite form is a reduction plus ~3 elementwise kernels).
+struct RMSNormOp <: Op
+    epsilon::Float32
+end
+
 # Single-token (decode) attention over a KV cache, in one kernel. Inputs:
 #   q (D, 1, H, B), past_k and past_v (D, max_seq, KVH, B), k_new and v_new
 #   (D, 1, KVH, B), pos (1,) -- the number of valid cache slots (slots >= pos are
