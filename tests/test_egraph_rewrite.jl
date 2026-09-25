@@ -84,3 +84,51 @@ end
     end
     @test length(readdir(cache)) == 1
 end
+
+@testset "kernel variants" begin
+    for dev in unique([CPUDevice(), get_device()])
+        @testset "MatMulT on $(nameof(typeof(dev)))" begin
+            for (ta, tb) in ((true, false), (false, true), (true, true)), dims in ((5, 7, 3), (5, 7, 3, 4, 2))
+                M, K, N = dims[1:3]
+                batch = dims[4:end]
+                A = randn(Float32, (ta ? (K, M) : (M, K))..., batch...)
+                B = randn(Float32, (tb ? (N, K) : (K, N))..., batch...)
+                sw(X, t) = t ? permutedims(X, (2, 1, 3:ndims(X)...)) : X
+                ref = zeros(Float32, M, N, batch...)
+                Luminal.batch_matmul!(ref, sw(A, ta), sw(B, tb))
+                out = Luminal.zero_tensor(dev, Float32, M, N, batch...)
+                Luminal.execute_op!(out, Luminal.MatMulT(ta, tb), Luminal.to_device(A, dev), Luminal.to_device(B, dev))
+                @test Array(out) ≈ ref rtol = 1e-5
+            end
+        end
+    end
+
+    @testset "Permute + MatMul -> MatMulT rewrite" begin
+        g = Graph()
+        q = Luminal.tensor(g, [64, 1, 4, 1]); k = Luminal.tensor(g, [64, 16, 4, 1])
+        s = Luminal.matmul(Luminal.permute(q, [2, 1, 3, 4]), k)          # (1, 16, 4, 1)
+        inputs = Dict{Int,Any}(q.id => randn(Float32, 64, 1, 4, 1), k.id => randn(Float32, 64, 16, 4, 1))
+        ref, _ = run(g, [s.id], inputs, CPUDevice())
+        rw = to_egraph(g, [s.id]); saturate_graph!(rw)
+        d = only(d for d in decisions(rw) if any(o -> any(occursin("MatMulT", v) for v in values(o)), d[2]))
+        opt = only(o for o in d[2] if !isempty(o) && occursin("MatMulT", first(values(o))))
+        ng, m = extract_graph(rw; choices=opt)
+        @test any(n -> n.op isa Luminal.MatMulT, ng.nodes)
+        @test !any(n -> n.op isa Luminal.Permute, ng.nodes)
+        @test run(ng, [m[s.id]], remap_inputs(inputs, m), CPUDevice())[1][1] ≈ ref[1] rtol = 1e-5
+    end
+
+    dev = get_device()
+    if dev isa Luminal.AbstractGPUDevice
+        @testset "MatMulF16 group sizes" begin
+            W = Float32.(Float16.(randn(Float32, 96, 64)))
+            hw = Luminal.half_weight(Luminal.to_device(W, dev))
+            x = randn(Float32, 64, 3)
+            for grp in (64, 128, 256)
+                out = Luminal.zero_tensor(dev, Float32, 96, 3)
+                Luminal.execute_op!(out, Luminal.MatMulF16(grp), hw, Luminal.to_device(x, dev))
+                @test Array(out) ≈ W * x rtol = 1e-5
+            end
+        end
+    end
+end

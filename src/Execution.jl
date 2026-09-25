@@ -111,28 +111,38 @@ Base.getindex(w::HalfWeight, i::Int, j::Int) = w.t[j, i]
 end
 
 # C (Out, N) = W (Out, In) * B (In, N), with any trailing dims of B/C flattened into N.
-function _half_matmul!(C, W::HalfWeight, B)
+function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP)
     K, M = size(W.t)
     N = length(B) ÷ K
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
-    _half_matmul_kernel!(KernelAbstractions.get_backend(C), 128)(
-        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N; ndrange = M * 128)
+    _half_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
+        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N; ndrange = M * group)
     return C
 end
 
 # Convert each Float32 weight at most once, so graphs sharing weights (e.g.
 # prefill and decode) share one Float16 copy. Keyed by identity without holding
-# the source array; its entry is dropped when the source is garbage collected.
-const _HALF_WEIGHTS = Dict{UInt, Any}()
+# the source array. An objectid can be reused once its array is collected (and
+# the finalizer that drops the entry runs asynchronously), so each entry keeps a
+# WeakRef to its source and only counts as a hit if it still points to `W`.
+const _HALF_WEIGHTS = Dict{UInt, Tuple{WeakRef, Any}}()
 const _HALF_WEIGHTS_LOCK = ReentrantLock()
 function half_weight(W)
     key = objectid(W)
     lock(_HALF_WEIGHTS_LOCK) do
-        get!(_HALF_WEIGHTS, key) do
-            finalizer(_ -> @async(lock(() -> delete!(_HALF_WEIGHTS, key), _HALF_WEIGHTS_LOCK)), W)
-            HalfWeight(W)
+        entry = get(_HALF_WEIGHTS, key, nothing)
+        entry !== nothing && entry[1].value === W && return entry[2]
+        hw = HalfWeight(W)
+        _HALF_WEIGHTS[key] = (WeakRef(W), hw)
+        finalizer(W) do _
+            @async lock(_HALF_WEIGHTS_LOCK) do
+                e = get(_HALF_WEIGHTS, key, nothing)
+                # only drop the entry if it still belongs to this (now dead) array
+                e !== nothing && e[1].value === nothing && delete!(_HALF_WEIGHTS, key)
+            end
         end
+        return hw
     end
 end
 
@@ -142,6 +152,30 @@ _batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}) where {T<:U
 _batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}) where {T<:Union{Float32,Float64}} =
     CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
 _batched_gemm!(C, A, B) = nothing
+_batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}, ta::Char, tb::Char) where {T<:Union{Float32,Float64}} =
+    AMDGPU.rocBLAS.gemm_strided_batched!(ta, tb, one(T), A, B, zero(T), C)
+_batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}, ta::Char, tb::Char) where {T<:Union{Float32,Float64}} =
+    CUDA.CUBLAS.gemm_strided_batched!(ta, tb, one(T), A, B, zero(T), C)
+_batched_gemm!(C, A, B, ta, tb) = nothing
+
+_swap12(X) = ndims(X) == 2 ? permutedims(X, (2, 1)) : permutedims(X, (2, 1, 3:ndims(X)...))
+
+# op(A) * op(B) with transpose flags on the first two dims (see MatMulT). Dense
+# operands with matching batch dims use BLAS flags directly; anything else
+# materializes the transpose and takes the regular path.
+function batch_matmul_t!(C, A, B, ta::Bool, tb::Bool)
+    if A isa DenseArray && B isa DenseArray && C isa DenseArray && ndims(A) == ndims(B) == ndims(C)
+        if ndims(A) == 2
+            mul!(C, ta ? transpose(A) : A, tb ? transpose(B) : B)
+            return C
+        elseif size(A)[3:end] == size(B)[3:end]
+            nb = prod(size(A)[3:end])
+            r3(X) = Base.reshape(X, size(X, 1), size(X, 2), nb)
+            _batched_gemm!(r3(C), r3(A), r3(B), ta ? 'T' : 'N', tb ? 'T' : 'N') === nothing || return C
+        end
+    end
+    return batch_matmul!(C, ta ? _swap12(A) : A, tb ? _swap12(B) : B)
+end
 
 # (M, K) * (K, N): a single-column right-hand side (e.g. one decode token) runs as
 # GEMV, which is ~1.5-2x faster than an n=1 GEMM for large weight matrices.
@@ -450,7 +484,9 @@ end
 
 execute_op!(out, op::Contiguous, a) = copyto!(out, a)
 execute_op!(out, op::MatMul, a, b) = batch_matmul!(out, a, b)
-execute_op!(out, op::MatMulF16, a, b) = batch_matmul!(out, a, b)  # `a` is a HalfWeight once compiled
+execute_op!(out, op::MatMulF16, a, b) =   # `a` is a HalfWeight once compiled
+    a isa HalfWeight ? _half_matmul!(out, a, b; group=op.group) : batch_matmul!(out, a, b)
+execute_op!(out, op::MatMulT, a, b) = batch_matmul_t!(out, a, b, op.ta, op.tb)
 
 # Reduce `a` over dimension `dim` into `out` (which has that dim dropped or 1).
 # GPU: one workgroup per output element, strided accumulation, tree reduction in

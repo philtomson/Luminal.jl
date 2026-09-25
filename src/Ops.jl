@@ -86,7 +86,22 @@ end
 struct MatMul <: Op end
 # Same product as MatMul, with the (weight) left operand stored as Float16 on GPU.
 # A precision choice the rewrite layer can select per matmul; compute stays Float32.
-struct MatMulF16 <: Op end
+# `group` is the GEMV kernel's threads per output row (64, 128 or 256). 256 is the
+# default: the measured search picked it for every TinyLlama projection shape on
+# a Radeon 8060S.
+struct MatMulF16 <: Op
+    group::Int
+end
+const DEFAULT_HALF_GROUP = 256
+MatMulF16() = MatMulF16(DEFAULT_HALF_GROUP)
+
+# op(A) * op(B), where op transposes the first two dims when its flag is set:
+# a matmul that reads a permuted operand through BLAS transpose flags instead of
+# materializing the Permute.
+struct MatMulT <: Op
+    ta::Bool
+    tb::Bool
+end
 struct Constant <: Op
     value::Any # Corresponds to ConstantValue in Rust
 end

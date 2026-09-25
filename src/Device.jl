@@ -165,6 +165,22 @@ synchronize_device(::AMDDevice) = AMDGPU.synchronize()
 # normally (warm-up: buffers allocated, kernels compiled); the next run with
 # the same key is captured into a HIP graph; later runs with that key replay
 # the graph with a single launch instead of issuing every kernel from Julia.
+# Graphs whose owner was garbage collected. They are destroyed at the next safe
+# point (outside any capture), not from the finalizer: finalizers run at
+# arbitrary allocation points, which may be inside another graph's capture.
+const _DEAD_GRAPHS = Tuple{AMDGPU.HIP.hipGraph_t, AMDGPU.HIP.hipGraphExec_t}[]
+const _DEAD_GRAPHS_LOCK = ReentrantLock()
+
+function _destroy_dead_graphs()
+    dead = lock(_DEAD_GRAPHS_LOCK) do
+        d = copy(_DEAD_GRAPHS); empty!(_DEAD_GRAPHS); d
+    end
+    for (graph, exec) in dead
+        AMDGPU.HIP.hipGraphExecDestroy(exec)
+        AMDGPU.HIP.hipGraphDestroy(graph)
+    end
+end
+
 mutable struct HIPGraphReplay
     graph::AMDGPU.HIP.hipGraph_t
     exec::AMDGPU.HIP.hipGraphExec_t
@@ -173,21 +189,31 @@ end
 function _capture_hip_graph(f)
     HIP = AMDGPU.HIP
     s = AMDGPU.stream().stream
+    # No GC inside the capture: collected GPU arrays are freed with stream-ordered
+    # frees, which would be recorded into the graph and replayed. Collect first so
+    # pending finalizers run now, outside the capture.
+    GC.gc()
+    _destroy_dead_graphs()
+    AMDGPU.synchronize()
+    gc_was_enabled = GC.enable(false)
     HIP.hipStreamBeginCapture(s, HIP.hipStreamCaptureModeThreadLocal)
     graph = Ref{HIP.hipGraph_t}()
     try
         f()
     catch
         try HIP.hipStreamEndCapture(s, graph) catch end
+        GC.enable(gc_was_enabled)
         rethrow()
     end
     HIP.hipStreamEndCapture(s, graph)
+    GC.enable(gc_was_enabled)
     exec = Ref{HIP.hipGraphExec_t}()
     HIP.hipGraphInstantiateWithFlags(exec, graph[], 0)
     r = HIPGraphReplay(graph[], exec[])
     finalizer(r) do r
-        HIP.hipGraphExecDestroy(r.exec)
-        HIP.hipGraphDestroy(r.graph)
+        lock(_DEAD_GRAPHS_LOCK) do
+            push!(_DEAD_GRAPHS, (r.graph, r.exec))
+        end
     end
     return r
 end
@@ -197,6 +223,7 @@ _launch_hip_graph(r::HIPGraphReplay) = AMDGPU.HIP.hipGraphLaunch(r.exec, AMDGPU.
 function execute_with_capture(::AMDDevice, f, cache::Dict)
     key = get(cache, :key, nothing)
     key === nothing && return f()
+    isempty(_DEAD_GRAPHS) || _destroy_dead_graphs()
     g = get(cache, :graph, nothing)
     if g !== nothing && isequal(cache[:graph_key], key)
         _launch_hip_graph(g)

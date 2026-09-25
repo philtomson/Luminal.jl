@@ -384,7 +384,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         if !(node_id in retain) && all(folded[c] for (c, _) in consumers[node_id])
             results[node_id] = nothing          # only fed other folded nodes
         elseif _is_matmul_weight(graph, node_id, results[node_id], consumers, retain, weight_dtype)
-            results[node_id] = Luminal.half_weight(results[node_id])
+            # Folded values belong to this compile only: convert directly, no shared cache
+            results[node_id] = Luminal.HalfWeight(results[node_id])
         end
     end
 

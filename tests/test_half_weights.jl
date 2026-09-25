@@ -39,3 +39,22 @@ if dev isa Luminal.AbstractGPUDevice
 else
     @info "No GPU; HalfWeight is GPU-only, skipping"
 end
+
+if get_device() isa Luminal.AbstractGPUDevice
+    @testset "HalfWeight cache never returns another array's weight" begin
+        # Regression: a freed array's objectid can be reused by a new array while
+        # its cache entry is still present (seen in a measured search: a merged
+        # gate/up weight got the merged q/k/v HalfWeight). Plant such a stale
+        # entry and check it is not returned.
+        dev = get_device()
+        other = Luminal.to_device(randn(Float32, 40, 64), dev)
+        W = Luminal.to_device(randn(Float32, 96, 64), dev)
+        lock(Luminal._HALF_WEIGHTS_LOCK) do
+            Luminal._HALF_WEIGHTS[objectid(W)] = (WeakRef(other), Luminal.HalfWeight(other))
+        end
+        hw = Luminal.half_weight(W)
+        @test size(hw) == (96, 64)
+        @test Array(Float32.(hw.t)) ≈ permutedims(Array(W)) rtol = 1e-3
+        @test Luminal.half_weight(W) === hw          # and the entry is now W's
+    end
+end

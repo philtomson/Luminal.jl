@@ -12,7 +12,7 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, Function, Slice, Pad, FlashAttentionOp, Unfold
+export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulT, Function, Slice, Pad, FlashAttentionOp, Unfold
 
 
 include("Graph.jl")

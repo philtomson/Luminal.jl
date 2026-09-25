@@ -75,9 +75,14 @@ Metatheory 3.0 notes:
   which `compile()` constant-folds at compile time, and a row slice of the
   result aliases instead of copying.
 
-Rules that should come next: permute∘permute, transpose-aware matmul (fold a
-Permute into the GEMM flags), softmax/RMSNorm as recognized fused ops, and
-choosing between kernel implementations (GEMV/GEMM/HalfWeight, workgroup sizes).
+- **Kernel alternatives:** `MatMulF16(group)` is offered at 64, 128 and 256 threads
+  per output row (precision rule), and `MatMul(Permute(a), b)` with a
+  swap-first-two-dims permute becomes `MatMulT(ta, tb)`, which uses BLAS transpose
+  flags instead of copying. Choice signatures include op parameters, so these
+  are distinct options.
+
+Rules that should come next: permute∘permute, softmax/RMSNorm as recognized
+fused ops, a split-K GEMV variant for short-and-wide weights.
 
 ## Extraction and search
 
@@ -110,7 +115,33 @@ choosing between kernel implementations (GEMV/GEMM/HalfWeight, workgroup sizes).
 
 ## Findings (TinyLlama 1.1B decode, Radeon 8060S)
 
-Latest (merged projections, refined extraction, measured search):
+Kernel alternatives (latest): the measured search picked **GEMV group size 256**
+for every projection shape (5/5 rounds each), 14.77 ms/token. That fed back
+into the default: `MatMulF16()` and the plain `weight_dtype=Float16` path now use
+256, which alone takes the non-search path from 16.7 to **15.1 ms/token**.
+`MatMulT` and the merges were within noise once group sizes were right.
+One lesson: variants the cost model can't tell apart must tie-break toward the
+known-good default. Extraction by rule order picked group 64 and started the
+search at 17.8 ms.
+
+Latest full search (kernel variants, group size 256 default, merges): **14.54
+ms/token** with Float16, vs 14.9 for the plain Float16 path.
+
+**Search crash (fixed):** a measured search crashed with a `DimensionMismatch`
+(a merged gate/up matmul given the merged q/k/v Float16 weight). An
+instrumented rerun caught the cause. The `HalfWeight` cache was keyed by
+`objectid`, and the search's churn of folded, concatenated weights let a new
+array take a dead array's objectid before the dead array's entry was removed:
+`STALE HIT: cached HalfWeight (2560, 2048) for array (11264, 2048)`. Entries
+now keep a `WeakRef` to their source and only hit for the same array, and
+folded weights (per-compile) bypass the cache. A same-shape stale hit would
+have silently used another layer's weights, so verification protects the
+search as well. A separate segfault inside `hipGraphLaunch` was seen once and
+not reproduced (no GC or graph destruction during capture in the instrumented
+run). As hardening, captures now run a full GC first and disable GC during
+capture, and HIP graphs are destroyed at safe points rather than in finalizers.
+
+Merged projections, refined extraction, measured search:
 
 | Graph | ms/token |
 |---|---|

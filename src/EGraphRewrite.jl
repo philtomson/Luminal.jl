@@ -108,9 +108,14 @@ function _make_dims(g, h, ch)
         (a === nothing || b === nothing) && return nothing
         r = _broadcast(a, b)
         return r === nothing ? nothing : Shp(r)
-    elseif h === :xMatMul || h === :xMatMulF16
+    elseif h === :xMatMul || h === :xMatMulF16 || h === :xMatMulT
         a, b = _dims(g, ch[2]), _dims(g, ch[3])
         (a === nothing || b === nothing) && return nothing
+        if h === :xMatMulT
+            ta, tb = _lit(g, ch[1])
+            ta && (a = (a[2], a[1], a[3:end]...))
+            tb && (b = (b[2], b[1], b[3:end]...))
+        end
         batch = _broadcast(a[3:end], b[3:end])
         return batch === nothing ? nothing : Shp((a[1], b[2], batch...))
     end
@@ -169,8 +174,8 @@ function to_egraph(graph::Graph, roots::Vector{Int})
     ctx = BridgeCtx(ShapeTracker[], Dict{Any,Int}(), Dict{Symbol,DataType}(),
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
-    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.Expand,
-              Luminal.Pad, Luminal.Slice)
+    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulT,
+              Luminal.Expand, Luminal.Pad, Luminal.Slice)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
@@ -253,10 +258,26 @@ const ALGEBRAIC_RULES = @theory p q a b s begin
 end
 
 # Precision choice (not exact: rounds weights to Float16): a weight matmul may run
-# with Float16 weights. Opt-in.
+# with Float16 weights, with the GEMV kernel at any of its workgroup sizes (the
+# best one depends on the matrix shape). Opt-in.
+const HALF_GROUPS = (64, 128, 256)
+_half_ok(g, w) = _is_weight(g, w) && w.data !== nothing && length(w.data.dims) == 2
 const PRECISION_RULES = @theory q w x begin
-    xMatMul(q::Tuple, w, x) => (_is_weight(_egraph, w) && w.data !== nothing && length(w.data.dims) == 2) ?
-                                :(xMatMulF16($q, $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((64,)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((128,)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256,)), $w, $x)) : nothing
+end
+
+# Kernel choice: a matmul whose operand is a Permute swapping the first two dims can
+# read the unpermuted tensor through a BLAS transpose flag instead of copying it.
+_is_swap12(p) = (d = p[1]; length(d) >= 2 && d[1] == 2 && d[2] == 1 && all(d[i] == i for i in 3:length(d)))
+const KERNEL_RULES = @theory q p r a b begin
+    xMatMul(q::Tuple, xPermute(p::Tuple, a), b) =>
+        _is_swap12(p) ? :(xMatMulT($((true, false)), $a, $b)) : nothing
+    xMatMul(q::Tuple, a, xPermute(p::Tuple, b)) =>
+        _is_swap12(p) ? :(xMatMulT($((false, true)), $a, $b)) : nothing
+    xMatMul(q::Tuple, xPermute(p::Tuple, a), xPermute(r::Tuple, b)) =>
+        (_is_swap12(p) && _is_swap12(r)) ? :(xMatMulT($((true, true)), $a, $b)) : nothing
 end
 
 """
@@ -264,9 +285,9 @@ end
 
 Apply the rule sets until saturation (or the iteration/size limits).
 """
-function saturate_graph!(rw::Rewriter; precision::Bool=false, iterations::Int=8)
+function saturate_graph!(rw::Rewriter; precision::Bool=false, iterations::Int=16)
     CTX[] = rw.ctx
-    theory = vcat(CANONICAL_RULES, ALGEBRAIC_RULES, precision ? PRECISION_RULES : RewriteRule[])
+    theory = vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES, precision ? PRECISION_RULES : RewriteRule[])
     params = SaturationParams(timeout=iterations, eclasslimit=0, enodelimit=0)
     return saturate!(rw.g, theory, params)
 end
@@ -300,9 +321,11 @@ function static_cost(g, n::VecExpr)
     end
     ins = [_numel(_dims(g, c)) for c in ch[2:end]]
     if h === :xMatMulF16
-        return 2.0 * ins[1] + 4.0 * sum(ins[2:end]) + LAUNCH_BYTES
-    elseif h === :xMatMul || h === :xMul || h === :xAdd
-        a = h === :xMatMul ? 0 : maximum(ins; init=0)   # elementwise output ~ largest input
+        # Group sizes cost the same to the model; prefer the default on ties.
+        tie = _lit(g, ch[1])[1] == Luminal.DEFAULT_HALF_GROUP ? 0.0 : 1.0
+        return 2.0 * ins[1] + 4.0 * sum(ins[2:end]) + LAUNCH_BYTES + tie
+    elseif h === :xMatMul || h === :xMatMulT || h === :xMul || h === :xAdd
+        a = (h === :xMatMul || h === :xMatMulT) ? 0 : maximum(ins; init=0)   # elementwise output ~ largest input
         return 4.0 * (sum(ins) + a) + LAUNCH_BYTES
     end
     return 4.0 * (sum(ins; init=0) + maximum(ins; init=0)) + LAUNCH_BYTES
@@ -312,9 +335,12 @@ end
 # e.g. "xMul(xExpand|xReshape)" -- stable across layers, unlike e-class ids.
 function signature(g, n::VecExpr)
     v_isexpr(n) || return "lit"
+    ch = v_children(n)
     kids = [join(sort!(unique([string(v_isexpr(c) ? get_constant(g, v_head(c)) : "lit") for c in g[k].nodes])), "|")
-            for k in v_children(n)[2:end]]
-    return string(get_constant(g, v_head(n)), "(", join(kids, ","), ")")
+            for k in ch[2:end]]
+    params = isempty(ch) ? () : _lit(g, ch[1])
+    ps = (params === () || params isa Tuple && length(repr(params)) > 24) ? "" : repr(params)
+    return string(get_constant(g, v_head(n)), ps, "(", join(kids, ","), ")")
 end
 
 """
@@ -568,7 +594,11 @@ function merge_projections!(rw::Rewriter; precision::Bool=false)
         end
         wc = addexpr!(g, wcat)
         y = addexpr!(g, Expr(:call, :xMatMul, (), g[wc], g[x]))
-        precision && union!(g, y, addexpr!(g, Expr(:call, :xMatMulF16, (), g[wc], g[x])))
+        if precision
+            for grp in HALF_GROUPS
+                union!(g, y, addexpr!(g, Expr(:call, :xMatMulF16, (grp,), g[wc], g[x])))
+            end
+        end
         rebuild!(g)
         rank = length(_dims(g, y))
         off = 0
