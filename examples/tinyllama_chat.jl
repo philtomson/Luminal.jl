@@ -1,7 +1,10 @@
 # TinyLlama End-to-End Text Generation
 #
 # Usage:
-#   julia --project=. examples/tinyllama_chat.jl [model_dir] [prompt]
+#   julia --project=. examples/tinyllama_chat.jl [model_dir] [prompt] [max_tokens] [rope_base]
+#       [--chat] [--int8] [--search=static|measured] [--prompt=another --prompt=...]
+#
+# Extra `--prompt=` flags are generated together with `prompt` as one batch.
 #
 # Defaults:
 #   model_dir = /devel/phil/Llama-3.2
@@ -25,10 +28,13 @@ function main()
     search_arg   = findfirst(a -> startswith(a, "--search="), ARGS)
     search       = search_arg === nothing ? :none : Symbol(split(ARGS[search_arg], "=")[2])
 
+    prompts = [prompt; [a[length("--prompt=")+1:end] for a in ARGS if startswith(a, "--prompt=")]]
+
     # Apply chat template if requested
     if chat_mode
-        prompt = "<|user|>\n$prompt</s>\n<|assistant|>\n"
+        prompts = ["<|user|>\n$p</s>\n<|assistant|>\n" for p in prompts]
     end
+    prompt = prompts[1]
 
     println("=========================================")
     println("   Luminal.jl - TinyLlama Text Generation")
@@ -70,10 +76,9 @@ function main()
     # ── Generate ──────────────────────────────────────────────────────────────
     println("\n[3/3] Generating …")
     println("-" ^ 40)
-    print(">> PROMPT: $prompt\n>> RESPONSE: ")
 
     t0 = time()
-    response = llama_generate(model, tok, prompt, model_dir;
+    responses = llama_generate(model, tok, prompts, model_dir;
                                max_new_tokens=max_tokens,
                                max_seq=256,
                                device=device,
@@ -82,12 +87,14 @@ function main()
                                decode_weights=decode_weights)
     t1 = time()
 
-    println(response)
-    println("-" ^ 40)
+    for (p, r) in zip(prompts, responses)
+        println(">> PROMPT: $p\n>> RESPONSE: $r")
+        println("-" ^ 40)
+    end
 
-    n_gen = length(Luminal.encode(tok, response))
+    n_gen = sum(r -> length(Luminal.encode(tok, r)), responses)
     elapsed = t1 - t0
-    @printf "\n[Stats] %d tokens in %.1fs  (%.1f tok/s)\n" n_gen elapsed (n_gen / elapsed)
+    @printf "\n[Stats] %d tokens in %.1fs, including weight loading and compilation\n" n_gen elapsed
     println("=========================================")
 end
 

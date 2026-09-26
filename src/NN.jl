@@ -242,6 +242,17 @@ function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=1000
     # Using exp2(-x) to avoid overflow in intermediate exp2(x) when base=500k
     inv_freqs = Luminal.exp2(-freqs * log2(Float32(base)))
     
+    if prev_seq isa Luminal.GraphTensor && batch isa Int && batch > 1 &&
+       Luminal.realized_dims(prev_seq.shape) == [batch]
+        # One start position per sequence (batched decode): tables (half, seq, batch)
+        pos = Luminal.expand(Luminal.arange(graph, seq), 2, batch) + Luminal.expand(prev_seq, 1, seq)
+        emb = Luminal.expand(Luminal.expand(inv_freqs, 2, seq), 3, batch) * Luminal.expand(pos, 1, half_dim)
+        cos_b, sin_b = Luminal.cos(emb), Luminal.sin(emb)
+        return Luminal.add_op!(graph, Luminal.RotaryEmbed(),
+                               [(input.id, 0, input.shape), (cos_b.id, 0, cos_b.shape), (sin_b.id, 0, sin_b.shape)],
+                               Luminal.ShapeTracker(collect(dims)))
+    end
+
     pos_seq = Luminal.arange(graph, seq) # shape (seq)
     if prev_seq isa Int
         pos = pos_seq + Float32(prev_seq)
@@ -535,13 +546,31 @@ end
 Device-resident storage for past K/V tensors for one decode session.
 - `self_cache[i]` = `(K, V)` arrays for layer i, shape (head_dim, max_seq, n_kv_heads, batch),
   allocated once on the decode device and updated in place one slot per step
-- `step_pos`: current 0-indexed decode position
+- `positions[b]`: 0-indexed position of sequence b's next token. Sequences in a
+  batch advance independently (prompts of different lengths, finished sequences).
+- `step_pos`: the common position, for batch 1 (or when all sequences agree);
+  assigning it sets every sequence's position.
 """
-mutable struct LlamaKVCacheState{A<:AbstractArray{Float32,4}}
-    step_pos::Int
+mutable struct LlamaKVCacheState{A<:AbstractArray{Float32,4}, P<:AbstractVector{Int32}}
+    positions::Vector{Int}
     max_seq::Int
     self_cache::Vector{Tuple{A, A}}
+    positions_dev::P            # `positions` on the cache's device, for the slot writes
 end
+
+function Base.getproperty(c::LlamaKVCacheState, name::Symbol)
+    if name === :step_pos
+        pos = getfield(c, :positions)
+        all(==(pos[1]), pos) || error("sequences are at different positions; use `positions`")
+        return pos[1]
+    end
+    return getfield(c, name)
+end
+function Base.setproperty!(c::LlamaKVCacheState, name::Symbol, v)
+    name === :step_pos ? fill!(getfield(c, :positions), v) : setfield!(c, name, v)
+    return v
+end
+Base.propertynames(::LlamaKVCacheState) = (fieldnames(LlamaKVCacheState)..., :step_pos)
 
 """
     LlamaKVCacheState(n_layers, n_kv_heads, head_dim; batch=1, max_seq=2048, device=CPUDevice())
@@ -552,7 +581,8 @@ function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
     self = [(Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch),
              Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch))
             for _ in 1:n_layers]
-    return LlamaKVCacheState(0, max_seq, self)
+    pos_dev = Luminal.to_device(zeros(Int32, batch), device)
+    return LlamaKVCacheState(zeros(Int, batch), max_seq, self, pos_dev)
 end
 
 
@@ -643,7 +673,7 @@ function build_llama_decode_step!(model,
 
     # ── Inputs ────────────────────────────────────────────────────────────────
     token_in = Luminal.tensor(graph, [1, batch])
-    pos_tensor = Luminal.tensor(graph, [1])
+    pos_tensor = Luminal.tensor(graph, [batch])   # each sequence's position
 
     self_k_tensors = [Luminal.tensor(graph, [head_dim, max_seq, n_kv_heads, batch])
                       for _ in 1:n_layers]
@@ -688,25 +718,33 @@ end
 
 
 """
-    llama_decode_step!(exec_fn, idg, cache, token_id; device=get_device())
+    llama_decode_step!(exec_fn, idg, cache, tokens; device=get_device())
 
 Execute one cached decode step.
-- `exec_fn`: compiled execution function
-- `idg`: LlamaDecodeGraph for this step_pos
+- `exec_fn`: compiled decode graph
+- `idg`: its LlamaDecodeGraph
 - `cache`: LlamaKVCacheState (mutated in place)
-- `token_id`: scalar Int (0-indexed vocab index)
+- `tokens`: one 0-indexed token per sequence (a scalar for batch 1)
+- `advance`: which sequences move to the next position (default: all). A
+  sequence that does not advance is recomputed at the same position next step,
+  e.g. once it has finished.
 
-Returns `logits::Array{Float32,3}` of shape (batch, 1, vocab_size).
+Each sequence's token is processed at its own `cache.positions[b]`. Returns the
+(vocab, 1, batch) logits.
 """
 function llama_decode_step!(exec_fn,
                              idg::LlamaDecodeGraph,
                              cache::LlamaKVCacheState,
-                             token_id::Int;
+                             tokens::AbstractVector{<:Integer};
+                             advance::AbstractVector{Bool}=trues(length(tokens)),
                              sym_vals::Dict{Symbol, Int}=Dict{Symbol, Int}(),
                              device=Luminal.get_device())
+    pos = cache.positions
+    length(tokens) == length(pos) || error("expected $(length(pos)) tokens, got $(length(tokens))")
+    maximum(pos) < cache.max_seq || error("KV cache full ($(cache.max_seq) positions)")
     inputs = Dict{Int, Any}()
-    inputs[idg.token_input_id] = Float32[token_id;;]  # (1,1)
-    inputs[idg.pos_input_id] = Float32[cache.step_pos] # (1,)
+    inputs[idg.token_input_id] = Float32.(Base.reshape(tokens, 1, :))   # (1, B)
+    inputs[idg.pos_input_id] = Float32.(pos)                            # (B,)
 
     # The cache arrays already live on `device`; the compiled graph aliases them.
     for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
@@ -717,17 +755,21 @@ function llama_decode_step!(exec_fn,
     results = exec_fn(inputs; sym_vals=sym_vals, device=device)
     logits  = results[idg.logits_id]
 
-    # Write this step's K/V into slot step_pos of the cache, in place on device.
-    slot = cache.step_pos + 1
+    # Write each sequence's K/V into its slot, in place on device: one kernel per
+    # cache tensor for the whole batch.
+    copyto!(cache.positions_dev, Int32.(pos))
     for (i, (nk_id, nv_id)) in enumerate(zip(idg.new_self_k_ids, idg.new_self_v_ids))
         k_cache, v_cache = cache.self_cache[i]
-        view(k_cache, :, slot:slot, :, :) .= results[nk_id]
-        view(v_cache, :, slot:slot, :, :) .= results[nv_id]
+        Luminal.write_cache_slots!(k_cache, results[nk_id], cache.positions_dev)
+        Luminal.write_cache_slots!(v_cache, results[nv_id], cache.positions_dev)
     end
 
-    cache.step_pos += 1
+    pos .+= advance
     return logits
 end
+
+llama_decode_step!(exec_fn, idg::LlamaDecodeGraph, cache::LlamaKVCacheState, token_id::Integer; kw...) =
+    llama_decode_step!(exec_fn, idg, cache, [token_id]; kw...)
 
 export LlamaKVCacheState, LlamaDecodeGraph, build_llama_decode_step!, llama_decode_step!, llama_self_attn_cached
 

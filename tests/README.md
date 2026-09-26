@@ -46,6 +46,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 | `test_nn_layers.jl` | `Linear`, `Embedding`, `LayerNorm` values |
 | `test_llama.jl` | Llama components against reference values |
 | `test_llama_compiled.jl` | Llama through `compile()` |
+| `test_batched_decode.jl` | Batched decode at different positions per sequence equals batch-1 decode, including with HIP capture; right-padded batched prefill equals individual prefills |
 | `test_phi3_loading.jl` | Phi-3 weight mapping |
 | `test_weight_loading.jl` | `WeightRegistry` and safetensors; Whisper keys and shapes equal openai/whisper-tiny's |
 

@@ -7,6 +7,7 @@ using AMDGPU
 using LinearAlgebra
 using GPUArrays
 using KernelAbstractions
+using KernelAbstractions.Extras: @unroll
 
 
 export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight
@@ -73,23 +74,27 @@ Base.size(b::BroadcastView) = size(b.a)
 Base.length(b::BroadcastView) = length(b.a)
 
 # --- Rotary embedding ---------------------------------------------------------
+# x, out: (D, S, H, B). Tables c, s: (half, S) shared by the batch, or
+# (half, S, B) with one set of positions per sequence (batched decode).
 @kernel function _rotary_kernel!(out, @Const(x), @Const(c), @Const(s), half)
     I = @index(Global, Cartesian)
     i = I[1]; t = I[2]
+    b = size(c, 3) == 1 ? 1 : I[4]
     @inbounds if i <= half
-        out[I] = x[I] * c[i, t] - x[i + half, t, I[3], I[4]] * s[i, t]
+        out[I] = x[I] * c[i, t, b] - x[i + half, t, I[3], I[4]] * s[i, t, b]
     else
         j = i - half
-        out[I] = x[I] * c[j, t] + x[j, t, I[3], I[4]] * s[j, t]
+        out[I] = x[I] * c[j, t, b] + x[j, t, I[3], I[4]] * s[j, t, b]
     end
 end
 
 function execute_op!(out, op::RotaryEmbed, x, c, s)
     x4 = ndims(x) == 4 ? x : Base.reshape(x, size(x)..., ntuple(_ -> 1, 4 - ndims(x))...)
     o4 = ndims(out) == 4 ? out : Base.reshape(out, size(x4))
-    c2 = Base.reshape(c, size(c, 1), :)
-    s2 = Base.reshape(s, size(s, 1), :)
-    _rotary_kernel!(KernelAbstractions.get_backend(o4), 256)(o4, x4, c2, s2, size(x4, 1) ÷ 2; ndrange = size(o4))
+    S = size(x4, 2)
+    c3 = Base.reshape(c, size(c, 1), S, :)
+    s3 = Base.reshape(s, size(s, 1), S, :)
+    _rotary_kernel!(KernelAbstractions.get_backend(o4), 256)(o4, x4, c3, s3, size(x4, 1) ÷ 2; ndrange = size(o4))
     return out
 end
 
@@ -141,6 +146,22 @@ function execute_op!(out, op::RMSNormOp, x, w)
     return out
 end
 
+# --- KV-cache slot writes -----------------------------------------------------
+# cache (D, max_seq, H, B)[:, pos[b] + 1, :, b] = new (D, 1, H, B)[:, 1, :, b], for
+# every sequence of the batch in one launch; `pos` holds 0-indexed positions.
+@kernel function _cache_slot_kernel!(cache, @Const(new), @Const(pos))
+    d, h, b = @index(Global, NTuple)
+    @inbounds cache[d, pos[b] + 1, h, b] = new[d, 1, h, b]
+end
+
+function write_cache_slots!(cache, new, pos)
+    D, _, H, B = size(cache)
+    src = new isa DenseArray ? new : copy(new)
+    src = ndims(src) == 4 ? src : Base.reshape(src, D, 1, H, B)
+    _cache_slot_kernel!(KernelAbstractions.get_backend(cache), 256)(cache, src, pos; ndrange = (D, H, B))
+    return cache
+end
+
 # --- Decode attention ---------------------------------------------------------
 # One workgroup per (query head, batch). Scores for the n = pos + 1 positions
 # (cache slots 1..pos, then the new token) live in local memory: dot products,
@@ -159,7 +180,7 @@ const DECODE_ATTN_MAX_CTX = 8192
     h = @uniform (@index(Group, Linear) - 1) % size(q, 3) + 1
     b = @uniform (@index(Group, Linear) - 1) ÷ size(q, 3) + 1
     kv = @uniform (h - 1) ÷ Gq + 1
-    pos = @uniform unsafe_trunc(Int, @inbounds posv[1])
+    pos = @uniform unsafe_trunc(Int, @inbounds posv[length(posv) == 1 ? 1 : b])
     n = @uniform pos + 1
     sc = @localmem Float32 (DECODE_ATTN_MAX_CTX,)
     red = @localmem Float32 (256,)
@@ -248,9 +269,10 @@ function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
     D, H, B = size(q, 1), size(q, 3), size(q, 4)
     KVH = size(pk, 3)
     if !(out isa AnyGPUArray)          # CPU: plain loops (the kernel's reductions are GPU-shaped)
-        pos = Int(posv[1]); G = H ÷ KVH
+        G = H ÷ KVH
         o3 = Base.reshape(out, D, H, B)
         for b in 1:B, h in 1:H
+            pos = Int(posv[length(posv) == 1 ? 1 : b])
             kv = (h - 1) ÷ G + 1
             s = Float32[op.scale * sum(q[d, 1, h, b] * (j <= pos ? pk[d, j, kv, b] : kn[d, 1, kv, b]) for d in 1:D)
                         for j in 1:pos+1]
@@ -338,43 +360,70 @@ Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j 
 # GB/s; with two it reaches ~205 GB/s on a Radeon 8060S (R = 4 was slower).
 # 16 int8 weights per load, Float32 accumulation, scaled once per load.
 # `shift` >= 0: loads per scale group is 2^shift (index by bit shift).
+# Columns are processed in chunks of up to C (C = N for N <= 8, so batched decode
+# reads each weight vector once for the whole batch). Accumulators are tuples, so
+# they stay in registers: a thread holds R x C partial sums, reduced together once
+# per chunk. Weights are converted to Float32 once per load, not per column.
+@inline _dot16(w, xa, xb) =
+    w[1] * xa[1] + w[2] * xa[2] + w[3] * xa[3] + w[4] * xa[4] + w[5] * xa[5] + w[6] * xa[6] +
+    w[7] * xa[7] + w[8] * xa[8] + w[9] * xb[1] + w[10] * xb[2] + w[11] * xb[3] + w[12] * xb[4] +
+    w[13] * xb[5] + w[14] * xb[6] + w[15] * xb[7] + w[16] * xb[8]
+
 @kernel function _q8_matmul_kernel!(Y, @Const(Wv), @Const(scale), @Const(Xv), K16, N,
-                                    loads_per_group, shift, ::Val{R}) where {R}
+                                    loads_per_group, shift, ::Val{R}, ::Val{C}) where {R, C}
     grp = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
-    s = @localmem Float32 (256, 2)
-    acc = @private Float32 (2,)
+    s = @localmem Float32 (256, 2 * C)
     row0 = (grp - 1) * R
-    for c in 1:N
-        for r in 1:R; @inbounds acc[r] = 0f0; end
+    c0 = 0
+    while c0 < N
+        acc1 = ntuple(_ -> 0f0, Val(C))
+        acc2 = ntuple(_ -> 0f0, Val(C))
         k = lid
         while k <= K16
-            @inbounds xa = Xv[2k - 1, c]
-            @inbounds xb = Xv[2k, c]
             gi = shift >= 0 ? ((k - 1) >> shift) + 1 : (k - 1) ÷ loads_per_group + 1
-            for r in 1:R
-                @inbounds w = Wv[k, row0 + r]
-                d = Float32(w[1]) * xa[1] + Float32(w[2]) * xa[2] + Float32(w[3]) * xa[3] + Float32(w[4]) * xa[4] +
-                    Float32(w[5]) * xa[5] + Float32(w[6]) * xa[6] + Float32(w[7]) * xa[7] + Float32(w[8]) * xa[8] +
-                    Float32(w[9]) * xb[1] + Float32(w[10]) * xb[2] + Float32(w[11]) * xb[3] + Float32(w[12]) * xb[4] +
-                    Float32(w[13]) * xb[5] + Float32(w[14]) * xb[6] + Float32(w[15]) * xb[7] + Float32(w[16]) * xb[8]
-                @inbounds acc[r] += d * scale[gi, row0 + r]
+            @inbounds w1 = Wv[k, row0 + 1]
+            @inbounds w2 = Wv[k, row0 + R]
+            f1 = ntuple(i -> Float32(w1[i]), Val(16))
+            f2 = ntuple(i -> Float32(w2[i]), Val(16))
+            @inbounds sc1 = scale[gi, row0 + 1]
+            @inbounds sc2 = scale[gi, row0 + R]
+            # Each column's 16 activations are loaded once for both rows. Columns past N
+            # (a partial last chunk) repeat column c0 + 1: computed, never written.
+            # (Kept inline: as an @inline helper this was ~2 ms/token slower at batch 1.)
+            ks = 2k; cb = c0   # fresh bindings: closures must not capture reassigned variables
+            acc1, acc2 = let a1 = acc1, a2 = acc2
+                xs = ntuple(j -> cb + j <= N ? (@inbounds (Xv[ks - 1, cb + j], Xv[ks, cb + j])) :
+                                              (@inbounds (Xv[ks - 1, cb + 1], Xv[ks, cb + 1])), Val(C))
+                (ntuple(j -> a1[j] + _dot16(f1, xs[j][1], xs[j][2]) * sc1, Val(C)),
+                 R == 2 ? ntuple(j -> a2[j] + _dot16(f2, xs[j][1], xs[j][2]) * sc2, Val(C)) : a2)
             end
             k += G
         end
-        for r in 1:R; @inbounds s[lid, r] = acc[r]; end
+        @unroll for j in 1:C
+            @inbounds s[lid, (j - 1) * R + 1] = acc1[j]
+            R == 2 && (@inbounds s[lid, (j - 1) * R + R] = acc2[j])
+        end
         @synchronize
         stride = G ÷ 2
         while stride > 0
             if lid <= stride
-                for r in 1:R; @inbounds s[lid, r] += s[lid + stride, r]; end
+                @unroll for i in 1:R*C
+                    @inbounds s[lid, i] += s[lid + stride, i]
+                end
             end
             @synchronize
             stride ÷= 2
         end
-        lid <= R && (@inbounds Y[row0 + lid, c] = s[1, lid])
+        if lid <= R * C
+            r = (lid - 1) % R + 1; j = (lid - 1) ÷ R + 1
+            c0 + j <= N && (@inbounds Y[row0 + r, c0 + j] = s[1, lid])
+        end
         @synchronize
+        c0 += C
     end
 end
+
+const GEMV_MAX_COLS = 8   # columns accumulated per pass in the GEMV kernels
 
 function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
     K, M = size(W.q)
@@ -383,9 +432,10 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R = iseven(M) ? 2 : 1
     lpg = W.group ÷ 16
+    group <= 256 || error("int8 GEMV: at most 256 threads per workgroup")
     _q8_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
         Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N, lpg,
-        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R); ndrange = (M ÷ R) * group)
+        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, GEMV_MAX_COLS)); ndrange = (M ÷ R) * group)
     return C
 end
 
@@ -412,31 +462,48 @@ function _gemm_ex_f16!(C, W::HalfWeightN, B)
     return C
 end
 
-# Y[:, c] = W * X[:, c]. One workgroup per output row; the row stays in cache
-# while the workgroup loops over the columns of X, so weights are read once.
-@kernel function _half_matmul_kernel!(Y, @Const(Wv), @Const(Xv), K8, N)
+# Y[:, c] = W * X[:, c]. One workgroup per output row; each weight vector is
+# loaded (and converted to Float32) once per chunk of up to C columns (C = N for
+# N <= 8), whose partial sums stay in registers and are reduced together.
+@inline _dot8(w, x) = w[1] * x[1] + w[2] * x[2] + w[3] * x[3] + w[4] * x[4] +
+                      w[5] * x[5] + w[6] * x[6] + w[7] * x[7] + w[8] * x[8]
+
+# acc[j] += w · X[k, c0 + j] for the chunk's columns. Columns past N (a partial last
+# chunk) repeat column N: computed without a branch, never written.
+@inline function _half_acc(acc::NTuple{C, Float32}, f, Xv, k, c0, N) where {C}
+    return ntuple(j -> acc[j] + _dot8(f, @inbounds Xv[k, min(c0 + j, N)]), Val(C))
+end
+
+@kernel function _half_matmul_kernel!(Y, @Const(Wv), @Const(Xv), K8, N, ::Val{C}) where {C}
     row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
-    s = @localmem Float32 (256,)
-    for c in 1:N
-        acc = 0f0
+    s = @localmem Float32 (256, C)
+    c0 = 0
+    while c0 < N
+        acc = ntuple(_ -> 0f0, Val(C))
         k = lid
         while k <= K8
             @inbounds w = Wv[k, row]
-            @inbounds x = Xv[k, c]
-            acc += Float32(w[1]) * x[1] + Float32(w[2]) * x[2] + Float32(w[3]) * x[3] + Float32(w[4]) * x[4] +
-                   Float32(w[5]) * x[5] + Float32(w[6]) * x[6] + Float32(w[7]) * x[7] + Float32(w[8]) * x[8]
+            f = ntuple(i -> Float32(w[i]), Val(8))
+            acc = _half_acc(acc, f, Xv, k, c0, N)
             k += G
         end
-        @inbounds s[lid] = acc
+        @unroll for j in 1:C
+            @inbounds s[lid, j] = acc[j]
+        end
         @synchronize
         stride = G ÷ 2
         while stride > 0
-            lid <= stride && (@inbounds s[lid] += s[lid + stride])
+            if lid <= stride
+                @unroll for j in 1:C
+                    @inbounds s[lid, j] += s[lid + stride, j]
+                end
+            end
             @synchronize
             stride ÷= 2
         end
-        lid == 1 && (@inbounds Y[row, c] = s[1])
+        lid <= C && c0 + lid <= N && (@inbounds Y[row, c0 + lid] = s[1, lid])
         @synchronize
+        c0 += C
     end
 end
 
@@ -446,8 +513,9 @@ function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP)
     N = length(B) ÷ K
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
+    group <= 256 || error("Float16 GEMV: at most 256 threads per workgroup")
     _half_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
-        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N; ndrange = M * group)
+        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N, Val(min(N, GEMV_MAX_COLS)); ndrange = M * group)
     return C
 end
 

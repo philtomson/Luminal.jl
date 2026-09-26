@@ -49,6 +49,7 @@ text, tokens = transcribe("whisper-tiny", "speech.wav")   # ≤ 30 s, decoded wi
 ```bash
 julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "Why is the sky blue?"
 julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --int8 --search=measured "..."
+julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "First?" "--prompt=Second?"   # one batch
 ```
 
 ## Installation
@@ -70,7 +71,8 @@ Requirements:
 
 | Example | What it does |
 |---------|--------------|
-| `examples/tinyllama_chat.jl` | Text generation from a Llama checkpoint: prefill, then KV-cached decode (`--int8`, `--search=static\|measured`, `--chat`) |
+| `examples/tinyllama_chat.jl` | Text generation from a Llama checkpoint: prefill, then KV-cached decode (`--int8`, `--search=static\|measured`, `--chat`, extra `--prompt=` flags for a batch) |
+| `examples/batched_decode.jl` | Decode throughput against batch size |
 | `examples/whisper.jl` | Speech-to-text with a Hugging Face Whisper checkpoint |
 | `examples/quant_eval.jl` | Perplexity of Float32, Float16 and int8 weights on a fixed passage |
 | `examples/prefill_search.jl` | Measured search over prefill graphs |
@@ -90,6 +92,18 @@ TinyLlama 1.1B on a Radeon 8060S (Strix Halo iGPU, ROCm 10), batch 1:
 | Decode | Float16 | 11.0 ms/token | 91 tok/s |
 | Prefill, 16 tokens | Float16 GEMM (`search`, `:activations`) | 22 ms | |
 | Prefill, 16 tokens | Float32 | 45 ms | |
+
+Batched decode: B sequences share one step, and each weight is read once per step:
+
+| Batch | int8 ms/step | int8 tok/s | Float16 ms/step | Float16 tok/s |
+|------:|-------------:|-----------:|----------------:|--------------:|
+| 1 | 6.9 | 146 | 11.2 | 89 |
+| 2 | 8.2 | 243 | 12.0 | 167 |
+| 4 | 9.8 | 408 | 13.7 | 292 |
+| 8 | 17.5 | 458 | 20.3 | 394 |
+
+(`examples/batched_decode.jl`; sequences at ~128 tokens of context. The
+batch-1 times here include copying the logits to the host for the argmax.)
 
 Perplexity on the evaluation passage: Float32 12.1229, Float16 12.1228, int8 12.1526.
 
@@ -135,6 +149,10 @@ figure includes weight loading and graph compilation.
   `SelfAttention` (GQA, RoPE), `TransformerBlock`.
 - **Llama / TinyLlama**: prefill plus a device-resident KV cache with one
   compiled decode graph for every position (`llama_generate`).
+- **Batched generation**: `llama_generate(model, tok, prompts::Vector{String}, dir)`
+  runs one right-padded prefill for all prompts. It then decodes them together,
+  each sequence at its own position, and stops each one independently. Its
+  output is identical to generating each prompt alone.
 - **Phi-3**: architecture and weight mapping.
 - **Whisper**:
   - log-mel frontend matching `WhisperFeatureExtractor`
@@ -154,7 +172,7 @@ Reverse-mode autodiff over the primitives (`backward`) and `SGD`/`Adam` optimize
   exercised in recent work.
 
 ### Not yet implemented
-- Batched decode (batch > 1 in the decode loops)
+- Batched Whisper decoding (batched decode is Llama-only)
 - Multi-GPU or distributed execution
 - Tensor-core or matrix-core kernels, and generated (rather than hand-written) kernels
 - Other upstream models (for example YOLO)
