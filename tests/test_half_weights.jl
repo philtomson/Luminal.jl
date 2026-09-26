@@ -97,3 +97,23 @@ if get_device() isa Luminal.AbstractGPUDevice
               Base.reshape(deq * Base.reshape(xv, 64, 3), 96, 3, 1) rtol = 1e-5
     end
 end
+
+# A residual add of a GEMV-stored weight matmul (r + W * x) runs as one fused step
+# (the kernel adds r in its final write); results match the unfused Float32 graph.
+if Luminal.get_device() isa Luminal.AMDDevice
+    @testset "residual add fused into the int8 / Float16 GEMV" begin
+        dev = Luminal.get_device()
+        for wd in (Int8, Float16), N in (1, 5)
+            g = Luminal.Graph()
+            W = Luminal.tensor(g, [96, 128]); x = Luminal.tensor(g, [128, N]); r = Luminal.tensor(g, [96, N])
+            out = r + Luminal.matmul(W, x)
+            Wv = randn(Float32, 96, 128); xv = randn(Float32, 128, N); rv = randn(Float32, 96, N)
+            g.tensors[(W.id, 1)] = Luminal.to_device(Wv, dev)
+            ins = Dict{Int,Any}(x.id => xv, r.id => rv)
+            fused = Array(compile(g; device=dev, retain=[out.id], weight_dtype=wd)(ins; device=dev)[out.id])
+            unfused = Array(compile(g; device=dev, retain=[out.id], weight_dtype=wd, fuse=false)(ins; device=dev)[out.id])
+            @test fused ≈ unfused rtol=1e-5
+            @test fused ≈ rv .+ Wv * xv rtol=2e-2       # int8/Float16 weights
+        end
+    end
+end

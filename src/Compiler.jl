@@ -460,8 +460,40 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         _is_trivial_view(st, graph.shapes[node_id]) && push!(fusible_intermediates, node_id)
     end
 
+    # 5. Residual connections into GEMV weights. An Add of a weight matmul's output
+    # (W * x, W stored as HalfWeight/QuantWeight, the output used only here) and
+    # another tensor r of the same shape runs as one step: the GEMV kernel adds r
+    # in its final write (W * x + r), and the matmul gets no step of its own.
+    matmul_adds = Dict{Int, Any}()   # Add => (matmul id, (W, view), (x, view), (r, view))
+    fused_matmuls = falses(length(graph.nodes))
+    for (node_id, node) in enumerate(graph.nodes)
+        fuse || break
+        (node.op isa Luminal.Add && length(node.inputs) == 2) || continue
+        (persistent[node_id] || haskey(concats, node_id) || node_id in fusible_intermediates) && continue
+        any(id in fusible_intermediates for (id, _, _) in node.inputs) && continue
+        dims = try [eval_dim(d) for d in realized_dims(graph.shapes[node_id])] catch; continue end
+        for k in 1:2
+            (mid, _, mst) = node.inputs[k]
+            (rid, _, rst) = node.inputs[3 - k]
+            m = graph.nodes[mid]
+            (m.op isa Luminal.MatMul || m.op isa Luminal.MatMulQ8 ||
+             (m.op isa Luminal.MatMulF16 && m.op.impl === :gemv)) || continue
+            (persistent[mid] || processed_pads[mid] || mid in retain) && continue
+            consumer_count[mid] == 1 && length(consumers[mid]) == 1 || continue
+            _is_trivial_view(mst, graph.shapes[mid]) && _is_trivial_view(rst, graph.shapes[rid]) || continue
+            (wid, _, wst) = m.inputs[1]
+            (persistent[wid] && (results[wid] isa Luminal.HalfWeight || results[wid] isa Luminal.QuantWeight)) || continue
+            rdims = try [eval_dim(d) for d in realized_dims(graph.shapes[rid])] catch; continue end
+            isequal(rdims, dims) || continue
+            (xid, _, xst) = m.inputs[2]
+            matmul_adds[node_id] = (mid, (wid, wst), (xid, xst), (rid, rst))
+            fused_matmuls[mid] = true
+            break
+        end
+    end
+
     steps = Base.Function[]
-    processed = folded .| processed_pads   # folded nodes and concatenated Pads need no step
+    processed = folded .| processed_pads .| fused_matmuls   # these nodes need no step of their own
     owned = fill(false, length(graph.nodes))  # buffers allocated by this graph's own steps
     dynamic = false  # true if any shape depends on symbolic dims (sym_vals)
 
@@ -488,6 +520,29 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     live[src] -= 1
                     if free_intermediates && live[src] == 0 && !persistent[src]
                         _release!(res, src, owned)
+                    end
+                end
+            end)
+            processed[node_id] = true
+            continue
+        end
+
+        if haskey(matmul_adds, node_id)
+            mid, (wid, wst), (xid, xst), (rid, rst) = matmul_adds[node_id]
+            mop = graph.nodes[mid].op
+            dims = Tuple(eval_dim(d) for d in realized_dims(graph.shapes[node_id]))
+            sts = [evaluate_shapes(st, Dict{Symbol,Int}()) for st in (xst, rst)]
+            owned[node_id] = true
+            backing = Ref{Any}(nothing)
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates)
+                x = realize_view(res[xid], sts[1])
+                r = realize_view(res[rid], sts[2])
+                Luminal.matmul_residual!(res[node_id], mop, res[wid], x, r)
+                for id in (wid, xid, rid)
+                    live[id] -= 1
+                    if free_intermediates && live[id] == 0 && !persistent[id]
+                        _release!(res, id, owned)
                     end
                 end
             end)

@@ -116,7 +116,7 @@ system memory through GTT):
 |----------------|---------|---------|---------|
 | Float32 | 149 ms/token (6.7 tok/s) | | |
 | Float16 | 67 ms/token (14.9 tok/s) | 52 tok/s | 77 tok/s |
-| int8 | 38.5 ms/token (26 tok/s) | 75 tok/s | 110 tok/s |
+| int8 | 38.3 ms/token (26 tok/s) | 76 tok/s | 109 tok/s |
 
 For comparison, upstream Luminal reports 229 ms/token for the same checkpoint
 on an NVIDIA H200 with Float32 weights (batch 1; `examples/llm_chat`, September
@@ -126,7 +126,7 @@ TinyLlama 1.1B on the same GPU, batch 1:
 
 | | Weights | Time | |
 |-|---------|------|-|
-| Decode | int8 (group-wise, weight-only) | **6.5 ms/token** | 154 tok/s |
+| Decode | int8 (group-wise, weight-only) | **6.4 ms/token** | 157 tok/s |
 | Decode | Float16 | 11.0 ms/token | 91 tok/s |
 | Prefill, 16 tokens | Float16 GEMM (`search`, `:activations`) | 22 ms | |
 | Prefill, 16 tokens | Float32 | 45 ms | |
@@ -184,7 +184,9 @@ batch of 4 clips decodes in about the time of 2.
   merged Q/K/V and gate/up projections, transposed matmuls, and a precision per
   matmul (Float16 or int8 GEMV, Float16 GEMM). It picks a candidate with a DAG
   cost model or by timing verified candidates on the device. Measured results
-  are cached in `~/.cache/Luminal.jl/search`. See
+  are cached in `~/.cache/Luminal.jl/search`. (Fusions applied in `compile()` itself,
+  such as residual adds folded into GEMV epilogues, are fixed rules the search does
+  not yet weigh.) See
   [docs/egraph_rewrite_layer.md](docs/egraph_rewrite_layer.md).
 - **Fused kernels** for the decode hot path: `RotaryEmbed`, `DecodeAttention`
   (single-token attention over the KV cache, GQA-aware), `RMSNormOp`.

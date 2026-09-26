@@ -440,8 +440,18 @@ Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j 
     w[7] * xa[7] + w[8] * xa[8] + w[9] * xb[1] + w[10] * xb[2] + w[11] * xb[3] + w[12] * xb[4] +
     w[13] * xb[5] + w[14] * xb[6] + w[15] * xb[7] + w[16] * xb[8]
 
+# The (residual, Val(has_residual)) kernel arguments; without a residual the
+# output array stands in (never read).
+function _residual_arg(residual, C, M, N)
+    residual === nothing && return (Base.reshape(C, M, N), Val(false))
+    length(residual) == M * N || error("residual has $(length(residual)) elements, expected $(M * N)")
+    r = residual isa DenseArray ? residual : copy(residual)
+    return (Base.reshape(r, M, N), Val(true))
+end
+
 @kernel function _q8_matmul_kernel!(Y, @Const(Wv), @Const(scale), @Const(Xv), K16, N,
-                                    loads_per_group, shift, ::Val{R}, ::Val{C}) where {R, C}
+                                    loads_per_group, shift, ::Val{R}, ::Val{C},
+                                    @Const(Res), ::Val{RES}) where {R, C, RES}
     grp = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
     s = @localmem Float32 (256, 2 * C)
     row0 = (grp - 1) * R
@@ -487,7 +497,9 @@ Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j 
         end
         if lid <= R * C
             r = (lid - 1) % R + 1; j = (lid - 1) ÷ R + 1
-            c0 + j <= N && (@inbounds Y[row0 + r, c0 + j] = s[1, lid])
+            if c0 + j <= N
+                @inbounds Y[row0 + r, c0 + j] = RES ? s[1, lid] + Res[row0 + r, c0 + j] : s[1, lid]
+            end
         end
         @synchronize
         c0 += C
@@ -501,7 +513,9 @@ const GEMV_MAX_COLS = 8   # columns accumulated per pass in the GEMV kernels
 # Llama-3-8B shapes).
 const Q8_MAX_COLS = 4
 
-function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
+# `residual` (same size as C, optional): C = W * B + residual, added in the kernel's
+# final write (a fused residual connection).
+function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, residual = nothing)
     K, M = size(W.q)
     N = length(B) ÷ K
     Bc = B isa DenseArray ? B : copy(B)
@@ -512,7 +526,8 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
     group <= 256 || error("int8 GEMV: at most 256 threads per workgroup")
     _q8_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
         Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N, lpg,
-        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, Q8_MAX_COLS)); ndrange = (M ÷ R) * group)
+        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, Q8_MAX_COLS)),
+        _residual_arg(residual, C, M, N)...; ndrange = (M ÷ R) * group)
     return C
 end
 
@@ -551,7 +566,8 @@ end
     return ntuple(j -> acc[j] + _dot8(f, @inbounds Xv[k, min(c0 + j, N)]), Val(C))
 end
 
-@kernel function _half_matmul_kernel!(Y, @Const(Wv), @Const(Xv), K8, N, ::Val{C}) where {C}
+@kernel function _half_matmul_kernel!(Y, @Const(Wv), @Const(Xv), K8, N, ::Val{C},
+                                      @Const(Res), ::Val{RES}) where {C, RES}
     row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
     s = @localmem Float32 (256, C)
     c0 = 0
@@ -578,22 +594,34 @@ end
             @synchronize
             stride ÷= 2
         end
-        lid <= C && c0 + lid <= N && (@inbounds Y[row, c0 + lid] = s[1, lid])
+        if lid <= C && c0 + lid <= N
+            @inbounds Y[row, c0 + lid] = RES ? s[1, lid] + Res[row, c0 + lid] : s[1, lid]
+        end
         @synchronize
         c0 += C
     end
 end
 
 # C (Out, N) = W (Out, In) * B (In, N), with any trailing dims of B/C flattened into N.
-function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP)
+function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP, residual = nothing)
     K, M = size(W.t)
     N = length(B) ÷ K
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     group <= 256 || error("Float16 GEMV: at most 256 threads per workgroup")
     _half_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
-        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N, Val(min(N, GEMV_MAX_COLS)); ndrange = M * group)
+        Base.reshape(C, M, N), W.v, Xv, K ÷ 8, N, Val(min(N, GEMV_MAX_COLS)),
+        _residual_arg(residual, C, M, N)...; ndrange = M * group)
     return C
+end
+
+# out = W * x + r for a GEMV-stored weight (see the fused residual step in compile).
+function matmul_residual!(out, op, W, x, r)
+    W isa QuantWeight && return _q8_matmul!(out, W, x; residual = r,
+                                             group = op isa MatMulQ8 ? op.group : DEFAULT_Q8_THREADS)
+    W isa HalfWeight && return _half_matmul!(out, W, x; residual = r,
+                                              group = op isa MatMulF16 ? op.group : DEFAULT_HALF_GROUP)
+    error("matmul_residual!: unsupported weight storage $(typeof(W))")
 end
 
 # Convert each Float32 weight at most once, so graphs sharing weights (e.g.
