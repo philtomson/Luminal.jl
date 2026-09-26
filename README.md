@@ -184,9 +184,12 @@ batch of 4 clips decodes in about the time of 2.
   merged Q/K/V and gate/up projections, transposed matmuls, and a precision per
   matmul (Float16 or int8 GEMV, Float16 GEMM). It picks a candidate with a DAG
   cost model or by timing verified candidates on the device. Measured results
-  are cached in `~/.cache/Luminal.jl/search`. (Fusions applied in `compile()` itself,
-  such as residual adds folded into GEMV epilogues, are fixed rules the search does
-  not yet weigh.) See
+  are cached in `~/.cache/Luminal.jl/search`. The fusions and zero-copy views
+  `compile()` applies on its own (elementwise fusion, views, concatenation, residual
+  adds in GEMV epilogues) are named lowering sites the measured search also times
+  turning off, and int8 GEMV kernel parameters (threads, columns per pass) are search
+  variants. The search skips candidates that would not fit in free device memory
+  and frees rejected ones immediately. See
   [docs/egraph_rewrite_layer.md](docs/egraph_rewrite_layer.md).
 - **Fused kernels** for the decode hot path: `RotaryEmbed`, `DecodeAttention`
   (single-token attention over the KV cache, GQA-aware), `RMSNormOp`.

@@ -307,6 +307,83 @@ function evaluate_op_shapes(op::Luminal.Op, sym_vals::Dict{Symbol, Int})
     end
 end
 
+# --- Memory -------------------------------------------------------------------
+
+_storage_bytes(T, n) = T === Luminal.QuantWeight ? n + 4 * cld(n, Luminal.DEFAULT_Q8_GROUP) :
+                       (T === Luminal.HalfWeight || T === Luminal.HalfWeightN) ? 2n : 4n
+
+"""
+    estimate_compile_bytes(graph; retain=Int[], weight_dtype=Float32, fold=true) -> Int
+
+Upper estimate of the device memory `compile(graph; ...)` would newly allocate:
+reduced-precision copies of weights not already converted (the conversion cache
+shares them between graphs), constant-folded tensors (e.g. concatenated
+weights) and their conversions, and every intermediate. Lets a search skip a
+candidate that would not fit instead of running the machine out of memory.
+"""
+function estimate_compile_bytes(graph::Luminal.Graph; retain::Vector{Int}=Int[],
+                                weight_dtype::Type=Float32, fold::Bool=true)
+    n = length(graph.nodes)
+    consumers = [Tuple{Int, ShapeTracker}[] for _ in 1:n]
+    for (cid, node) in enumerate(graph.nodes), (id, _, st) in node.inputs
+        push!(consumers[id], (cid, st))
+    end
+    numel(id) = try prod(Int(eval_dim(d)) for d in realized_dims(graph.shapes[id]); init=1) catch; -1 end
+    persistent = falses(n)
+    bytes = 0
+    for (id, node) in enumerate(graph.nodes)
+        haskey(graph.tensors, (id, 1)) || continue
+        persistent[id] = true
+        data = graph.tensors[(id, 1)]
+        T = _weight_storage(graph, id, data, consumers, retain, weight_dtype)
+        T === nothing && continue
+        entry = get(Luminal._HALF_WEIGHTS, hash(T, objectid(data)), nothing)
+        (entry !== nothing && entry[1].value === data) || (bytes += _storage_bytes(T, length(data)))
+    end
+    for (id, node) in enumerate(graph.nodes)
+        persistent[id] && continue
+        k = numel(id)
+        k < 0 && continue                     # symbolic shape: sized at run time
+        if fold && !isempty(node.inputs) && all(persistent[i] for (i, _, _) in node.inputs)
+            persistent[id] = true             # folded: Float32 value, plus a converted copy
+            bytes += 4k
+            any(c -> graph.nodes[c].op isa Union{Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8},
+                first.(consumers[id])) && (bytes += 2k)
+        else
+            bytes += 4k                       # an intermediate (or input) buffer
+        end
+    end
+    return bytes
+end
+
+"""
+    release!(cg::CompiledGraph)
+
+Free the device memory a compiled graph owns -- its intermediates, constant-folded
+tensors (and their converted copies) and captured HIP graph -- without waiting
+for the garbage collector. Weights it shares with other graphs are untouched.
+The compiled graph must not be run afterwards.
+"""
+function release!(cg::CompiledGraph)
+    free!(x) = x isa AnyGPUArray && (try GPUArrays.unsafe_free!(x) catch end)
+    for id in get(cg.cache, :freeable, Int[])
+        isassigned(cg.results, id) || continue
+        x = cg.results[id]
+        if x isa Luminal.HalfWeight
+            free!(x.t)
+        elseif x isa Luminal.HalfWeightN
+            free!(x.w)
+        elseif x isa Luminal.QuantWeight
+            free!(x.q); free!(x.scale)
+        else
+            free!(x)
+        end
+        cg.results[id] = nothing
+    end
+    delete!(cg.cache, :graph)                 # a captured HIP graph is destroyed when collected
+    return nothing
+end
+
 # --- Main Compile Function ---
 
 """
@@ -343,15 +420,25 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                  weight_dtype::Type=Float32, capture::Bool=false, fold::Bool=true,
                  search::Symbol=:none, precision=false, search_inputs=nothing,
                  search_tolerance::Real=1e-3,
-                 search_cache::Union{Nothing,String}=joinpath(homedir(), ".cache", "Luminal.jl", "search"))
+                 search_cache::Union{Nothing,String}=joinpath(homedir(), ".cache", "Luminal.jl", "search"),
+                 lowering::AbstractDict=Dict{String,Bool}())
     capture && free_intermediates && error("capture=true requires free_intermediates=false")
     if search !== :none
         return Luminal.EGraphRewrite.compile_searched(graph; search=search, precision=precision,
             search_inputs=search_inputs, search_cache=search_cache, search_tolerance=search_tolerance,
             device=device, retain=retain,
             free_intermediates=free_intermediates, fuse=fuse, weight_dtype=weight_dtype,
-            capture=capture, fold=fold)
+            capture=capture, fold=fold, lowering=lowering)
     end
+    # Lowering sites: fusions and zero-copy views this compiler would apply on its
+    # own. Each is named by a stable key (kind, ops, shape) shared by every node
+    # with the same pattern -- e.g. all layers' residual adds -- so a measured
+    # search can time turning it off (`lowering[key] = false`). The keys seen are
+    # recorded on the compiled graph (`cache[:lowering_sites]`).
+    sites = Set{String}()
+    allow(key::String) = (push!(sites, key); get(lowering, key, true))
+    _opname(op) = op isa Luminal.Function ? op.name : string(nameof(typeof(op)))
+    _dimstr(id) = string(Tuple(realized_dims(graph.shapes[id])))
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -439,6 +526,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         # the two ranges must tile the axis exactly
         rs = sort([(lo, dims[axis] - hi) for (_, _, (lo, hi), _) in parts])
         (rs[1][1] == 0 && rs[1][2] == rs[2][1] && rs[2][2] == dims[axis]) || continue
+        allow("concat $(_dimstr(node_id))") || continue
         concats[node_id] = (axis, [(src, sst, lo) for (_, _, (lo, _), (src, _, sst)) in parts])
         for (pid, _, _, _) in parts; processed_pads[pid] = true; end
     end
@@ -457,7 +545,9 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         haskey(concats, cid) && continue
         c_op = graph.nodes[cid].op
         (is_elementwise(c_op) && !(c_op isa Luminal.Constant)) || continue
-        _is_trivial_view(st, graph.shapes[node_id]) && push!(fusible_intermediates, node_id)
+        _is_trivial_view(st, graph.shapes[node_id]) || continue
+        allow("fuse $(_opname(node.op)) -> $(_opname(c_op)) $(_dimstr(node_id))") &&
+            push!(fusible_intermediates, node_id)
     end
 
     # 5. Residual connections into GEMV weights. An Add of a weight matmul's output
@@ -485,6 +575,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             (persistent[wid] && (results[wid] isa Luminal.HalfWeight || results[wid] isa Luminal.QuantWeight)) || continue
             rdims = try [eval_dim(d) for d in realized_dims(graph.shapes[rid])] catch; continue end
             isequal(rdims, dims) || continue
+            allow("residual $(nameof(typeof(results[wid]))) $(_dimstr(node_id))") || continue
             (xid, _, xst) = m.inputs[2]
             matmul_adds[node_id] = (mid, (wid, wst), (xid, xst), (rid, rst))
             fused_matmuls[mid] = true
@@ -597,6 +688,19 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             strided_ok = !free_intermediates && op isa Luminal.Slice && !isempty(consumers[node_id]) &&
                          all(is_elementwise(graph.nodes[c].op) for (c, _) in consumers[node_id]) &&
                          !(node_id in retain)
+            # Zero-copy views of movement ops are a lowering site too (a Permute
+            # only where it can alias: it moves size-1 dims only).
+            view_ok = true
+            if length(node.inputs) == 1 && !is_persistent &&
+               (op isa Luminal.Reshape || op isa Luminal.Expand || op isa Luminal.Slice ||
+                (op isa Luminal.Permute && begin
+                    ind = realized_dims(node.inputs[1][3])
+                    !all(d -> d isa Integer, ind) || issorted([d for d in op.dims if ind[d] != 1])
+                end))
+                view_ok = allow("view $(_opname(op)) $(_dimstr(node_id))")
+            end
+            bcast_ok &= view_ok
+            strided_ok &= view_ok
 
             # Shapes free of symbolic dims are evaluated once here instead of every run.
             static = try
@@ -620,7 +724,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 if !is_persistent
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
                     sz = Tuple(dims_int)
-                    alias = length(step_args) == 1 ? _alias_view(run_op, step_args[1], sz; strided_ok=strided_ok) : nothing
+                    alias = (view_ok && length(step_args) == 1) ?
+                            _alias_view(run_op, step_args[1], sz; strided_ok=strided_ok) : nothing
                     if alias === nothing && bcast_ok && step_args[1] isa AbstractArray
                         a = step_args[1]
                         alias = Luminal.BroadcastView(Base.reshape(a,
@@ -693,5 +798,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
-    return CompiledGraph(graph, steps, results, Dict{Symbol, Any}(:capture => capture, :dynamic => dynamic), consumer_count)
+    return CompiledGraph(graph, steps, results,
+                         Dict{Symbol, Any}(:capture => capture, :dynamic => dynamic, :lowering_sites => sites,
+                                           :freeable => findall(owned .| folded)),
+                         consumer_count)
 end

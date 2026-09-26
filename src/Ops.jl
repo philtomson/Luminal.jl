@@ -106,10 +106,15 @@ MatMulF16(group::Int) = MatMulF16(group, :gemv)
 # Float32 scale per output row (weight-only quantization; activations and
 # accumulation stay Float32). `group` is the GEMV's threads per workgroup
 # (0: chosen per call from the shape, see `_q8_threads`).
+# `cols`: columns (batched-decode sequences) accumulated per pass (0: Q8_MAX_COLS).
+# Both are kernel choices with no effect on the result beyond rounding; the
+# e-graph search offers several (INT8_VARIANTS) and a measured search times them.
 struct MatMulQ8 <: Op
     group::Int
+    cols::Int
 end
-MatMulQ8() = MatMulQ8(DEFAULT_Q8_THREADS)
+MatMulQ8(group::Integer) = MatMulQ8(group, 0)
+MatMulQ8() = MatMulQ8(DEFAULT_Q8_THREADS, 0)
 
 # Rotary position embedding ("rotate half") in one kernel. Inputs: x (D, S, H, B),
 # cos and sin tables (D/2, S). For i <= D/2:

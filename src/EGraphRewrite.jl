@@ -276,13 +276,26 @@ const ACTIVATION_RULES = @theory q w x begin
     xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256, :gemm_ex)), $w, $x)) : nothing
 end
 
-# precision=:int8 offers weight-only int8 (one scale per output row) for weight
-# matmuls: half the bytes of Float16 for decode, lossy (see docs).
-const INT8_VARIANTS = ((Luminal.DEFAULT_Q8_THREADS,),)
+# precision=:int8 offers weight-only int8 (group-wise scales) for weight matmuls:
+# half the bytes of Float16 for decode, lossy (see docs). Each variant is
+# (threads per workgroup, columns per pass), 0 meaning the shape heuristic
+# (`_q8_threads`, `Q8_MAX_COLS`); which is fastest depends on the matrix shape,
+# the number of columns and the GPU, so a measured search times them.
+const INT8_VARIANTS = ((0, 0), (128, 0), (256, 0), (0, 8))
+_int8_ok(g, w) = _half_ok(g, w) && w.data.dims[2] % 16 == 0
 const INT8_RULES = @theory q w x begin
-    xMatMul(q::Tuple, w, x) => (_half_ok(_egraph, w) && w.data.dims[2] % 16 == 0) ?
-                                :(xMatMulQ8($((Luminal.DEFAULT_Q8_THREADS,)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((0, 0)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((128, 0)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((256, 0)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((0, 8)), $w, $x)) : nothing
 end
+
+# Verification tolerance floor with int8 weights. Against the Float32 reference,
+# int8 logits differ by ~2% on real inputs and ~12% on the default all-zero
+# search inputs (TinyLlama), so the check can only catch broken candidates
+# (layout or indexing errors are O(1)), not quantization quality: that is the
+# user's opt-in, measured by perplexity (examples/quant_eval.jl).
+const INT8_SEARCH_TOLERANCE = 0.25
 
 # `precision` enables reduced-precision alternatives: false (exact rewrites only);
 # true or :weights (Float16 weights, Float32 activations); :activations (also
@@ -366,7 +379,7 @@ function static_cost(g, n::VecExpr)
         N = max(1, ins[2] ÷ max(1, wd[2]))
         if h === :xMatMulQ8
             # int8 GEMV: 1 byte per weight, same column scaling as the Float16 GEMV
-            tie = _lit(g, ch[1])[1] == 128 ? 0.0 : 1.0
+            tie = _lit(g, ch[1]) == (0, 0) ? 0.0 : 1.0     # the model can't tell variants apart
             return 1.0 * ins[1] * (1 + N / 12) + 4.0 * ins[2] + LAUNCH_BYTES + tie
         end
         if h === :xMatMulF16
@@ -733,16 +746,24 @@ function that runs one synchronized step -- or `nothing` to reject it.
 
 A candidate replaces the incumbent only if, timed in `rounds` interleaved
 rounds of `steps` steps each, its median per-step time is lower by more than
-`margin` and it wins at least 80% of the rounds; single timings on a GPU vary
-by a few percent. Returns `(choices, per-step time of the incumbent)`.
+`margin` and it wins at least 80% of the rounds -- twice, in two independent
+contests; single timings on a GPU vary by a few percent. Returns `(choices, per-step time of the incumbent)`.
 
 With `cache_dir`, the winning option per decision is stored in a file keyed by
 the decision set and `cache_tag` (e.g. the device); a later search of the same
 graph applies those choices after one verification instead of timing again.
+
+`extra(choices)`, if given, returns further decisions to try after those of the
+e-graph, given the choices made so far (compile_searched's lowering sites: they
+depend on the extracted graph). Their options may use keys other than e-class ids.
+`release(run)` is called on every runner the search discards -- a rejected
+candidate, a replaced incumbent -- so its device memory is freed at once rather
+than when the garbage collector gets to it.
 """
 function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10,
                          round_budget::Float64=0.3, margin::Float64=0.01, log::Bool=true,
-                         cache_dir::Union{Nothing,String}=nothing, cache_tag::AbstractString="")
+                         cache_dir::Union{Nothing,String}=nothing, cache_tag::AbstractString="",
+                         extra = nothing, release = (run -> nothing))
     # Steps per timing round: `steps`, reduced so a round takes about `round_budget`
     # seconds (a prefill graph can take ~0.5 s per run).
     nsteps = Ref(steps)
@@ -764,21 +785,28 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
             parts = split(line, '\t')
             length(parts) == 2 && (kept[parts[2]] = parts[1])
         end
-        cached = Dict{Id, String}()
+        cached = Dict{Any, String}()
         for (label, opts) in ds, o in opts
             get(kept, label, nothing) == _option_name(o) && merge!(cached, o)
+        end
+        if extra !== nothing
+            for (label, opts) in extra(cached), o in opts
+                get(kept, label, nothing) == _option_name(o) && merge!(cached, o)
+            end
         end
         run = make_runner(cached)
         if run !== nothing
             log && println("  using cached search result ", cache_file)
             run(); t1 = (t = time(); run(); time() - t)
             nsteps[] = clamp(round(Int, round_budget / max(t1, 1e-6)), 1, steps)
-            return cached, median_([(run(); timed(run)) for _ in 1:rounds])
+            t = median_([(run(); timed(run)) for _ in 1:rounds])
+            release(run)
+            return cached, t
         end
         log && println("  cached choices failed verification; searching again")
     end
 
-    current = Dict{Id, String}()
+    current = Dict{Any, String}()
     kept_labels = Tuple{String, String}[]
     incumbent = make_runner(current)
     incumbent === nothing && error("measured_search: the static extraction failed verification " *
@@ -786,7 +814,7 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
     for _ in 1:3; incumbent(); end
     t1 = (t = time(); incumbent(); time() - t)
     nsteps[] = clamp(round(Int, round_budget / max(t1, 1e-6)), 1, steps)
-    for (label, opts) in ds
+    function try_decision(label, opts)
         for opt in opts[2:end]
             trial = merge(current, opt)
             cand = make_runner(trial)
@@ -795,22 +823,42 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
                 continue
             end
             for _ in 1:3; cand(); end
-            ti, tc = Float64[], Float64[]
-            for _ in 1:rounds
-                push!(ti, timed(incumbent)); push!(tc, timed(cand))
+            function contest()
+                ti, tc = Float64[], Float64[]
+                for _ in 1:rounds
+                    push!(ti, timed(incumbent)); push!(tc, timed(cand))
+                end
+                wins = count(tc .< ti)
+                mi, mc = median_(ti), median_(tc)
+                return mc < mi * (1 - margin) && wins >= ceil(Int, 0.8 * rounds), mi, mc, wins
             end
-            wins = count(tc .< ti)
-            mi, mc = median_(ti), median_(tc)
-            keep = mc < mi * (1 - margin) && wins >= ceil(Int, 0.8 * rounds)
+            keep, mi, mc, wins = contest()
+            # A pass must repeat in a second, independent contest: with dozens of
+            # decisions and a few percent of timing noise, single contests admit
+            # false positives (seen: a 32-element fusion "saving" 2%).
+            keep && (keep = first(contest()))
             log && println(string("  ", keep ? "KEEP  " : "      ", rpad(label, 48)[1:min(end, 48)],
                                   " -> ", rpad(_option_name(opt), 34), round(1e3mi, digits=2), " -> ",
                                   round(1e3mc, digits=2), " ms  (", wins, "/", rounds, " rounds)"))
             if keep
+                release(incumbent)
                 current, incumbent = trial, cand
                 filter!(kl -> kl[2] != label, kept_labels)
                 push!(kept_labels, (_option_name(opt), label))
+            else
+                release(cand)
             end
             GC.gc()
+        end
+    end
+    for (label, opts) in ds
+        try_decision(label, opts)
+    end
+    if extra !== nothing
+        more = extra(current)
+        log && !isempty(more) && println("  lowering choices: ", length(more))
+        for (label, opts) in more
+            try_decision(label, opts)
         end
     end
     if cache_file !== nothing
@@ -819,7 +867,9 @@ function measured_search(rw::Rewriter, make_runner; rounds::Int=5, steps::Int=10
             for (opt, label) in kept_labels; println(io, opt, '\t', label); end
         end
     end
-    return current, median_([timed(incumbent) for _ in 1:rounds])
+    t = median_([timed(incumbent) for _ in 1:rounds])
+    release(incumbent)
+    return current, t
 end
 
 # ---------------------------------------------------------------------------
@@ -852,20 +902,58 @@ end
 _input_ids(graph) = [nid for (nid, n) in enumerate(graph.nodes)
                      if n.op isa Luminal.Function && n.op.name == "InputTensor" && !haskey(graph.tensors, (nid, 1))]
 
+# A measured-search candidate: runs one synchronized step of its compiled graph.
+struct _Runner
+    r::RewrittenGraph
+    inputs::Dict{Int, Any}
+    device::Any
+end
+(x::_Runner)() = (x.r(x.inputs; device=x.device); Luminal.synchronize_device(x.device); nothing)
+
+# Device memory kept free when deciding whether a candidate fits (the estimate is
+# rough, and the rest of the system needs memory too).
+const SEARCH_MEMORY_HEADROOM = 4 * 2^30
+
 function compile_searched(graph::Graph; search::Symbol, precision, search_inputs, search_cache,
                           search_tolerance::Real=1e-3,
                           device, retain::Vector{Int}, kwargs...)
     search in (:static, :measured) || error("search must be :none, :static or :measured")
     isempty(retain) && error("compile(...; search=$search) needs `retain`: the node ids to keep")
+    :int8 in _precision_features(precision) && (search_tolerance = max(search_tolerance, INT8_SEARCH_TOLERANCE))
     rw = to_egraph(graph, retain)
     saturate_graph!(rw; precision=precision)
     merge_projections!(rw; precision=precision)
-    function build(choices)
-        ng, m = extract_graph(rw; choices=choices)
-        cg = Luminal.compile(ng; device=device, retain=[m[r] for r in retain if haskey(m, r)], kwargs...)
+    # A candidate's choices: e-class id => alternative signature, and lowering-site
+    # key (a String, see compile) => "off" to disable that fusion or view.
+    user_lowering = get(kwargs, :lowering, Dict{String,Bool}())
+    compile_kwargs = Base.structdiff(values(kwargs), NamedTuple{(:lowering,)})
+    # With `budget`, a candidate whose estimated new allocations would not fit in the
+    # device's free memory (less SEARCH_MEMORY_HEADROOM) is not compiled: `nothing`.
+    function build(choices; budget::Bool=false)
+        ng, m = extract_graph(rw; choices=Dict{Any,String}(k => v for (k, v) in choices if !(k isa String)))
+        if budget
+            GC.gc()
+            avail = Luminal.available_memory(device)
+            if avail >= 0
+                need = Luminal.estimate_compile_bytes(ng; retain=[m[r] for r in retain if haskey(m, r)],
+                                                      weight_dtype=get(kwargs, :weight_dtype, Float32),
+                                                      fold=get(kwargs, :fold, true))
+                if need > avail * 2^20 - SEARCH_MEMORY_HEADROOM
+                    println("  skipped (memory): needs ~", round(need / 2^30, digits=1), " GB, ",
+                            round(avail / 2^10, digits=1), " GB free")
+                    return nothing
+                end
+            end
+        end
+        lowering = Dict{String,Bool}(user_lowering)
+        for (k, v) in choices
+            k isa String && (lowering[k] = v != "off")
+        end
+        cg = Luminal.compile(ng; device=device, retain=[m[r] for r in retain if haskey(m, r)],
+                             lowering=lowering, compile_kwargs...)
         return RewrittenGraph(cg, m)
     end
-    search === :static && return build(Dict{Id, String}())
+    search === :static && return build(Dict{Any, String}())
 
     # Default inputs: zeros, placed on the device once (host inputs would be copied
     # in on every timed run).
@@ -873,20 +961,36 @@ function compile_searched(graph::Graph; search::Symbol, precision, search_inputs
         id => Luminal.to_device(zeros(Float32, (Int(Luminal.eval_dim(d)) for d in realized_dims(graph.shapes[id]))...), device)
         for id in _input_ids(graph))
     outs = [r for r in retain if !(r in _input_ids(graph))]
-    ref = Luminal.compile(graph; device=device, retain=retain, kwargs...)(inputs; device=device)
+    refcg = Luminal.compile(graph; device=device, retain=retain, kwargs...)
+    ref = refcg(inputs; device=device)
     reference = Dict(o => Array{Float32}(ref[o]) for o in outs)
-    ref = nothing; GC.gc()
+    Luminal.release!(refcg); ref = refcg = nothing; GC.gc()
     function make_runner(choices)
-        r = build(choices)
+        r = build(choices; budget=true)
+        r === nothing && return nothing
         res = r(inputs; device=device)
         for o in outs
             got = Array{Float32}(res[o])
             scale = max(maximum(abs, reference[o]; init=0f0), 1f-6)
-            maximum(abs.(got .- reference[o]); init=0f0) / scale < search_tolerance || return nothing
+            if !(maximum(abs.(got .- reference[o]); init=0f0) / scale < search_tolerance)
+                Luminal.release!(r.cg)
+                return nothing
+            end
         end
-        return () -> (r(inputs; device=device); Luminal.synchronize_device(device); nothing)
+        return _Runner(r, inputs, device)
     end
-    choices, _ = measured_search(rw, make_runner; cache_dir=search_cache,
+    # After the e-graph decisions: each fusion / view the compiler applies to the
+    # chosen graph, as a decision to turn it off (sites shared across layers).
+    function lowering_decisions(choices)
+        r = build(choices; budget=true)
+        r === nothing && return Tuple{String, Vector{Dict{Any,String}}}[]
+        sites = r.cg.cache[:lowering_sites]
+        Luminal.release!(r.cg)
+        return [("lowering: " * k, [Dict{Any,String}(), Dict{Any,String}(k => "off")])
+                for k in sort!(collect(sites)) if get(user_lowering, k, true)]
+    end
+    choices, _ = measured_search(rw, make_runner; cache_dir=search_cache, extra=lowering_decisions,
+                                 release=run -> run isa _Runner && Luminal.release!(run.r.cg),
                                  cache_tag=string(nameof(typeof(device)), precision, search_tolerance, kwargs))
     return build(choices)
 end

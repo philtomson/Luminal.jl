@@ -365,7 +365,7 @@ struct HalfWeight{A, V} <: AbstractMatrix{Float16}
 end
 function HalfWeight(W::AbstractMatrix)
     t = similar(W, Float16, size(W, 2), size(W, 1))
-    t .= permutedims(W, (2, 1))
+    permutedims!(t, W, (2, 1))                     # converts in place, no Float32 temporary
     v = Base.reshape(reinterpret(NTuple{8, Float16}, vec(t)), size(t, 1) ÷ 8, size(t, 2))
     return HalfWeight(t, v)
 end
@@ -383,6 +383,8 @@ end
 HalfWeightN(W::AbstractMatrix) = (w = similar(W, Float16, size(W)...); w .= W; HalfWeightN{typeof(w)}(w))
 Base.size(w::HalfWeightN) = size(w.w)
 Base.getindex(w::HalfWeightN, i::Int, j::Int) = w.w[i, j]
+
+_free_now!(x) = (x isa AnyGPUArray && GPUArrays.unsafe_free!(x); nothing)
 
 # A matmul weight quantized to int8 with symmetric Float32 scales, one per group of
 # `group` consecutive inputs of each output row (scale = max|group| / 127; a
@@ -412,13 +414,23 @@ function QuantWeight(W::AbstractMatrix; group::Int = DEFAULT_Q8_GROUP)
     M, K = size(W)
     (group % 16 == 0 && K % group == 0) || (group = K)       # fall back to one scale per row
     K ÷ group <= 512 || (group = K)                           # the kernel stages <= 512 scales
-    Wt = permutedims(W, (2, 1))                              # (In, Out)
+    Wt = similar(W, K, M)
+    permutedims!(Wt, W, (2, 1))                              # (In, Out)
     Wg = Base.reshape(Wt, group, K ÷ group, M)
-    scale = Base.reshape(maximum(abs, Wg; dims=1), K ÷ group, M) ./ 127f0
+    mx = maximum(abs, Wg; dims=1)
+    mxr = Base.reshape(mx, K ÷ group, M)
+    scale = mxr ./ 127f0
     scale .= max.(scale, floatmin(Float32))
     q = similar(W, Int8, K, M)
-    Base.reshape(q, group, K ÷ group, M) .= unsafe_trunc.(Int8, round.(Wg ./ Base.reshape(scale, 1, K ÷ group, M)))
+    qg = Base.reshape(q, group, K ÷ group, M)
+    sg = Base.reshape(scale, 1, K ÷ group, M)
+    qg .= unsafe_trunc.(Int8, round.(Wg ./ sg))
     v = Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), K ÷ 16, M)
+    # Free the Float32 temporaries now. Left to the GC, GPU buffers are released
+    # only when it gets to them, and converting a whole model piles them up (~4x
+    # the int8 size held on TinyLlama; on an APU that is system RAM). A buffer is
+    # shared by its reshapes, so every one of them has to be freed.
+    foreach(_free_now!, (Wg, Wt, mxr, mx))
     return QuantWeight(q, v, scale, group)
 end
 Base.size(w::QuantWeight) = (size(w.q, 2), size(w.q, 1))
@@ -515,7 +527,8 @@ const Q8_MAX_COLS = 4
 
 # `residual` (same size as C, optional): C = W * B + residual, added in the kernel's
 # final write (a fused residual connection).
-function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, residual = nothing)
+function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, cols::Int = 0,
+                     residual = nothing)
     K, M = size(W.q)
     N = length(B) ÷ K
     Bc = B isa DenseArray ? B : copy(B)
@@ -526,7 +539,7 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, resi
     group <= 256 || error("int8 GEMV: at most 256 threads per workgroup")
     _q8_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
         Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N, lpg,
-        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, Q8_MAX_COLS)),
+        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, cols == 0 ? Q8_MAX_COLS : cols)),
         _residual_arg(residual, C, M, N)...; ndrange = (M ÷ R) * group)
     return C
 end
@@ -618,7 +631,8 @@ end
 # out = W * x + r for a GEMV-stored weight (see the fused residual step in compile).
 function matmul_residual!(out, op, W, x, r)
     W isa QuantWeight && return _q8_matmul!(out, W, x; residual = r,
-                                             group = op isa MatMulQ8 ? op.group : DEFAULT_Q8_THREADS)
+                                             group = op isa MatMulQ8 ? op.group : DEFAULT_Q8_THREADS,
+                                             cols = op isa MatMulQ8 ? op.cols : 0)
     W isa HalfWeight && return _half_matmul!(out, W, x; residual = r,
                                               group = op isa MatMulF16 ? op.group : DEFAULT_HALF_GROUP)
     error("matmul_residual!: unsupported weight storage $(typeof(W))")
@@ -1002,7 +1016,7 @@ function execute_op!(out, op::MatMulF16, a, b)   # `a` is a HalfWeight(N) once c
     return batch_matmul!(out, a, b)
 end
 execute_op!(out, op::MatMulQ8, a, b) =   # `a` is a QuantWeight once compiled
-    a isa QuantWeight ? _q8_matmul!(out, a, b; group=op.group) : batch_matmul!(out, a, b)
+    a isa QuantWeight ? _q8_matmul!(out, a, b; group=op.group, cols=op.cols) : batch_matmul!(out, a, b)
 execute_op!(out, op::MatMulT, a, b) = batch_matmul_t!(out, a, b, op.ta, op.tb)
 
 # Reduce `a` over dimension `dim` into `out` (which has that dim dropped or 1).

@@ -115,7 +115,10 @@ Explicitly reclaim unused GPU memory if the backend supports it.
 """
 reclaim!(::AbstractDevice) = nothing
 reclaim!(::CUDADevice) = CUDA.reclaim()
-reclaim!(::AMDDevice) = nothing # ROCm memory management handles this differently
+# AMDGPU.jl keeps freed buffers in HIP's stream-ordered memory pool (up to a high
+# release threshold); on an APU that is system RAM the rest of the machine can't
+# use. Collect garbage, then trim the pool.
+reclaim!(::AMDDevice) = (GC.gc(); AMDGPU.HIP.reclaim(); nothing)
  
 """
     available_memory(device)
@@ -124,7 +127,39 @@ Get available GPU memory in MiB. Returns -1 if unknown.
 """
 available_memory(::AbstractDevice) = -1.0
 available_memory(::CUDADevice) = CUDA.available_memory() / (1024 * 1024)
-available_memory(::AMDDevice) = -1.0 # TODO: Implement via AMDGPU.info()
+# Free memory the AMD GPU can still allocate, in MB (-1 if unknown). On an APU
+# (little dedicated VRAM, e.g. Strix Halo) GPU buffers live in system RAM through
+# the GTT pool, so the limit is the smaller of the pool's free space and the
+# kernel's MemAvailable -- exceeding it invokes the OOM killer, not an HIP error.
+function available_memory(::AMDDevice)
+    try
+        for dev in readdir("/sys/class/drm"; join=true)
+            f(n) = joinpath(dev, "device", n)
+            isfile(f("mem_info_vram_total")) || continue
+            rd(n) = parse(Int, strip(read(f(n), String)))
+            vram_total = rd("mem_info_vram_total")
+            vram_total >= 4 * 2^30 && return (vram_total - rd("mem_info_vram_used") + _pool_free_bytes()) / 2^20
+            gtt_free = rd("mem_info_gtt_total") - rd("mem_info_gtt_used")
+            return (min(gtt_free, _mem_available_bytes()) + _pool_free_bytes()) / 2^20
+        end
+    catch
+    end
+    return -1.0
+end
+
+# Memory HIP's pool holds for this process but has not handed out: it counts as
+# used system-wide, yet our allocations reuse it (it may be too fragmented to trim).
+function _pool_free_bytes()
+    pool = AMDGPU.HIP.memory_pool(AMDGPU.device())
+    return Int(AMDGPU.HIP.reserved_memory(pool)) - Int(AMDGPU.HIP.used_memory(pool))
+end
+
+function _mem_available_bytes()
+    for line in eachline("/proc/meminfo")
+        startswith(line, "MemAvailable:") && return parse(Int, split(line)[2]) * 1024
+    end
+    return typemax(Int)
+end
  
 """
     zero_tensor(device, dtype, dims...)

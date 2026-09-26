@@ -117,10 +117,13 @@ function _decode_graph(s::LlamaSession, B::Int)
             compile(g; device=s.device, retain=retain, free_intermediates=false,
                     weight_dtype=wd, capture=capture)
         else
+            # One reduced precision per search: offering Float16 variants to an int8
+            # search would hold a Float16 copy of every weight as well (on an 8B model,
+            # 16 GB more) for choices int8 already beats in decode.
             @info "Searching equivalent decode graphs ($(s.search), batch $B)..."
             compile(g; device=s.device, retain=retain, free_intermediates=false,
                     capture=capture, search=s.search,
-                    precision=wd === Int8 ? (:weights, :int8) : wd === Float16 ? :weights : false)
+                    precision=wd === Int8 ? :int8 : wd === Float16 ? :weights : false)
         end
         attn = s.model.layers[1].attention
         cache = LlamaKVCacheState(length(s.model.layers), attn.n_kv_heads, attn.head_dim;

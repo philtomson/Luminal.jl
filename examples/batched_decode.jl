@@ -29,7 +29,7 @@ for B in batches
                 weight_dtype=wdtype, capture=device isa Luminal.AMDDevice) :
         compile(g; device=device, retain=retain, free_intermediates=false,
                 capture=device isa Luminal.AMDDevice, search=search,
-                precision=wdtype === Int8 ? (:weights, :int8) : wdtype === Float16 ? :weights : false)
+                precision=wdtype === Int8 ? :int8 : wdtype === Float16 ? :weights : false)
     cache = LlamaKVCacheState(cfg.n_layers, cfg.n_kv_heads, cfg.hidden ÷ cfg.n_heads;
                               batch=B, max_seq=max_seq, device=device)
     cache.positions .= ctx .+ (0:B-1)          # different positions per sequence
