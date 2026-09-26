@@ -65,6 +65,8 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
                     A function of the Hugging Face weight name chooses per tensor, e.g.
                     `name -> occursin("down_proj", name) ? Int8 : Luminal.Int4`, and
                     a Symbol names a preset (`weight_preset`: `:int4_mixed`, ...).
+- `awq`           : AWQ scales from `awq_scales`, folded into the weights at load
+                    (improves 4-bit accuracy; Float32 results are unchanged).
 """
 mutable struct LlamaSession{M, D}
     model::M
@@ -81,13 +83,14 @@ end
 
 function LlamaSession(model, tokenizer::LlamaTokenizer, model_dir::String;
                       max_seq::Int=2048, rope_base::Real=model.rope_base, device=nothing,
-                      search::Symbol=:none, decode_weights=nothing)
+                      search::Symbol=:none, decode_weights=nothing, awq=nothing)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
     wdtype = decode_weights isa Symbol ? weight_preset(decode_weights) :
              decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
     @info "Loading weights..." model_dir
     weights = load_weights_to_dict(model_dir; device=dev)
+    awq === nothing || awq_apply!(weights, awq, model)
     return LlamaSession(model, tokenizer, weights, dev, max_seq, Float32(rope_base), search, wdtype,
                         Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}())
 end
@@ -472,5 +475,7 @@ function _whisper_config(model_dir::String)
 end
 
 export transcribe, WhisperSession
+
+include("AWQ.jl")
 
 end # module Decoding

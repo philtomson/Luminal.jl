@@ -64,7 +64,7 @@ export LlamaTokenizer, encode, decode, chat_prompt
 # Decoding & Inference
 include("Decoding.jl")
 using .Decoding
-export greedy_decode, transcribe, WhisperSession, llama_generate, LlamaSession, generate, weight_preset
+export greedy_decode, transcribe, WhisperSession, llama_generate, LlamaSession, generate, weight_preset, awq_scales, awq_apply!
 
 # Training & Optimizers
 include("Optimizer.jl")
