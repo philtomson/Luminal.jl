@@ -121,6 +121,11 @@ struct RotaryEmbed <: Op end
 # RMS normalization over dim 1 with a weight, in one kernel:
 #   out = x / sqrt(mean(x .^ 2, dims=1) + epsilon) .* w,   x (H, ...), w (H,)
 # (the composite form is a reduction plus ~3 elementwise kernels).
+# Softmax over dim 1, in one kernel (max, sum of exponentials and the normalized
+# write, one workgroup per column). Attention with the scores laid out as
+# (keys, queries, ...) normalizes along this contiguous dimension.
+struct SoftmaxOp <: Op end
+
 struct RMSNormOp <: Op
     epsilon::Float32
 end

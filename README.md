@@ -44,7 +44,11 @@ trailing dimensions: (M, K, …) × (K, N, …).
 ```julia
 using Luminal
 # git clone https://huggingface.co/openai/whisper-tiny
-text, tokens = transcribe("whisper-tiny", "speech.wav")   # ≤ 30 s, decoded with ffmpeg
+text, tokens = transcribe("whisper-tiny", "speech.wav")   # one-shot; ≤ 30 s, decoded with ffmpeg
+
+session = WhisperSession("whisper-tiny")                  # load once, reuse compiled graphs
+transcribe(session, "a.wav")
+transcribe(session, ["a.wav", "b.wav", "c.wav"])          # one batch
 ```
 
 ### Generate text (Llama)
@@ -151,8 +155,9 @@ the int8 GEMVs read weights at ~215-220 GB/s. On the 8B model they are ~34 of
 the ~38.5 ms per token; the rest is small kernels and launch gaps inside the
 HIP graph (~5.5 µs per kernel).
 
-Whisper tiny transcribes a 5-second clip in 1.3 s end to end when warm. That
-figure includes weight loading and graph compilation.
+Whisper tiny, with a warm `WhisperSession`, spends ~17 ms computing the log-mel
+spectrogram (CPU) and ~35 ms in the encoder per clip, then ~2.5 ms per token. A
+batch of 4 clips decodes in about the time of 2.
 
 ## Features
 
@@ -199,7 +204,8 @@ figure includes weight loading and graph compilation.
 - **Whisper**:
   - log-mel frontend matching `WhisperFeatureExtractor`
   - audio encoder and text decoder
-  - cached greedy decoding (`greedy_decode`, `transcribe`)
+  - cached greedy decoding (`greedy_decode`, `transcribe`), batched over clips,
+    with `WhisperSession` keeping weights and compiled graphs between calls
 - **Weights**: safetensors (F32/F16/BF16) mapped by Hugging Face key through a
   `WeightRegistry`. They are converted to Float32 and transposed on the device.
 - **Tokenizers**: SentencePiece-style BPE (Llama-2, TinyLlama, Phi-3), byte-level BPE
@@ -216,7 +222,6 @@ Reverse-mode autodiff over the primitives (`backward`) and `SGD`/`Adam` optimize
   exercised in recent work.
 
 ### Not yet implemented
-- Batched Whisper decoding (batched decode is Llama-only)
 - Multi-GPU or distributed execution
 - Tensor-core or matrix-core kernels, and generated (rather than hand-written) kernels
 - Other upstream models (for example YOLO)

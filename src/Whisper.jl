@@ -196,7 +196,7 @@ Returns a Vector{Float32} with values in [-1, 1].
 function load_audio_file(path::String)
     cmd = `ffmpeg -nostdin -loglevel error -threads 0 -i $path -f f32le -ac 1 -ar $(SAMPLE_RATE) -`
     out = read(cmd)
-    return reinterpret(Float32, out)
+    return collect(reinterpret(Float32, out))
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,19 +261,22 @@ function _split_heads(x::Luminal.GraphTensor, n_heads::Int)
     return Luminal.permute(Luminal.reshape(x, [hidden ÷ n_heads, n_heads, s, b]), [1, 3, 2, 4])
 end
 
-# Scaled dot-product attention over (D, S, H, B) heads -> (D*H, Sq, B).
+# Scaled dot-product attention over (D, S, H, B) heads -> (D*H, Sq, B). The scores
+# are laid out (Sk, Sq, H, B), so the softmax runs along the contiguous first dim as
+# one fused kernel, and V * probs comes out directly as (D, Sq, H, B).
 function _attend(q::Luminal.GraphTensor, k::Luminal.GraphTensor, v::Luminal.GraphTensor;
                  causal::Bool=false)
     d, sq, h, b = Luminal.realized_dims(q.shape)
     scale = 1.0f0 / sqrt(Float32(d))
-    weights = Luminal.matmul(Luminal.permute(q, [2, 1, 3, 4]), k) * scale   # (Sq, Sk, H, B)
+    scores = Luminal.matmul(Luminal.permute(k, [2, 1, 3, 4]), q) * scale      # (Sk, Sq, H, B)
     if causal && sq > 1
-        mask = Luminal.triu(q.graph_ref, sq, 1) * -1f9
-        weights = weights + Luminal.expand(Luminal.expand(mask, 3, h), 4, b)
+        # key j > query i is masked: triu marks col > row, so transpose it
+        mask = Luminal.permute(Luminal.triu(q.graph_ref, sq, 1), [2, 1]) * -1f9
+        scores = scores + Luminal.expand(Luminal.expand(mask, 3, h), 4, b)
     end
-    probs = Luminal.softmax(weights, 2)
-    out = Luminal.matmul(probs, Luminal.permute(v, [2, 1, 3, 4]))           # (Sq, D, H, B)
-    return Luminal.reshape(Luminal.permute(out, [2, 3, 1, 4]), [d * h, sq, b])
+    probs = Luminal.softmax1(scores)
+    out = Luminal.matmul(v, probs)                                            # (D, Sq, H, B)
+    return Luminal.reshape(Luminal.permute(out, [1, 3, 2, 4]), [d * h, sq, b])
 end
 
 """

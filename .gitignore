@@ -1,0 +1,7 @@
+# Downloaded model checkpoints (and reference dumps inside them)
+/tinyllama_chat/
+/whisper_tiny/
+/llama3_8b_instruct/
+
+# Run logs
+/*.log

@@ -335,6 +335,12 @@ function softmax(a::GraphTensor, dim::Int)
     return e / expand(sum(e, dim), dim, realized_dims(a.shape)[dim])
 end
 
+# Softmax over dim 1 as one fused op (see SoftmaxOp). Unlike `softmax`, it is a
+# single node without autograd rules; use it where speed matters (inference).
+function softmax1(a::GraphTensor)
+    return add_op!(a.graph_ref, SoftmaxOp(), [(a.id, 0, a.shape)], ShapeTracker(realized_dims(a.shape)))
+end
+
 function max_reduce(a::GraphTensor, dim::Int)
     output_dims = deepcopy(realized_dims(a.shape))
     deleteat!(output_dims, dim)

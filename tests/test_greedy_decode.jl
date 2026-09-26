@@ -102,6 +102,17 @@ if isfile(joinpath(WHISPER_DIR, "ref", "index.json"))
         @test ids == Int.(idx[Symbol("tokens.exact")])
         @test text == idx[Symbol("text.exact")]
     end
+    @testset "WhisperSession: batched == single, graphs reused" begin
+        idx = JSON3.read(read(joinpath(WHISPER_DIR, "ref", "index.json"), String))
+        s = WhisperSession(WHISPER_DIR)
+        audio = collect(reinterpret(Float32, read(joinpath(WHISPER_DIR, "ref", "audio.f32"))))
+        clips = [audio, audio[1:length(audio) ÷ 2]]
+        single = [transcribe(s, c) for c in clips]
+        @test single[1][2] == Int.(idx[Symbol("tokens.exact")])
+        @test transcribe(s, clips) == single
+        @test transcribe(s, clips) == single          # reused graphs and cache
+        @test sort!(collect(keys(s.decoders))) == [1, 2]
+    end
 else
     @info "Skipping real-checkpoint transcription test (no $WHISPER_DIR/ref)"
 end

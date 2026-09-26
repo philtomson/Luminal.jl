@@ -146,6 +146,71 @@ function execute_op!(out, op::RMSNormOp, x, w)
     return out
 end
 
+# --- Softmax over dim 1 --------------------------------------------------------
+# One workgroup per column (all dims after the first): the column max and the
+# sum of exponentials with tree reductions, then the normalized write.
+@kernel function _softmax_kernel!(out, @Const(x))
+    col = @index(Group, Linear); lid = @index(Local, Linear)
+    T = @uniform @groupsize()[1]
+    L = @uniform size(x, 1)
+    red = @localmem Float32 (256,)
+    stats = @localmem Float32 (2,)
+    m = -Inf32
+    i = lid
+    while i <= L
+        @inbounds m = max(m, x[i, col])
+        i += T
+    end
+    @inbounds red[lid] = m
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        lid <= stride && (@inbounds red[lid] = max(red[lid], red[lid + stride]))
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds stats[1] = red[1])
+    @synchronize
+    acc = 0f0
+    i = lid
+    while i <= L
+        @inbounds acc += exp(x[i, col] - stats[1])
+        i += T
+    end
+    @inbounds red[lid] = acc
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        lid <= stride && (@inbounds red[lid] += red[lid + stride])
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds stats[2] = 1f0 / red[1])
+    @synchronize
+    i = lid
+    while i <= L
+        @inbounds out[i, col] = exp(x[i, col] - stats[1]) * stats[2]
+        i += T
+    end
+end
+
+function execute_op!(out, op::SoftmaxOp, x)
+    L = size(x, 1)
+    xc = x isa DenseArray ? x : copy(x)
+    x2 = Base.reshape(xc, L, :)
+    o2 = Base.reshape(out, L, :)
+    if !(out isa AnyGPUArray)          # CPU: plain loops (the kernel's reductions are GPU-shaped)
+        for c in axes(x2, 2)
+            col = view(x2, :, c)
+            e = exp.(col .- maximum(col))
+            o2[:, c] .= e ./ sum(e)
+        end
+        return out
+    end
+    _softmax_kernel!(KernelAbstractions.get_backend(o2), 256)(o2, x2; ndrange = size(x2, 2) * 256)
+    return out
+end
+
 # --- Decode attention ---------------------------------------------------------
 # One workgroup per (query head, batch). Scores for the n = pos + 1 positions
 # (cache slots 1..pos, then the new token) live in local memory: dot products,

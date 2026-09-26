@@ -257,81 +257,169 @@ end
 export llama_generate
 
 """
-    greedy_decode(td, tokenizer, enc_output, weights; language="en", task=:transcribe,
-                  max_len=448, device=nothing, weight_dtype=Float32) -> (text, tokens)
+    WhisperSession(model_dir; device=nothing, weight_dtype=Float32)
 
-Greedy Whisper decoding with a device-resident KV cache.
-
-- `td`         : a `TextDecoder`, used only as the architecture template
-- `tokenizer`  : a `WhisperTokenizer`
-- `enc_output` : the audio encoder output, (Hidden, S_enc, 1)
-- `weights`    : model directory, or a `Dict` from `load_weights_to_dict`
-- `max_len`    : maximum length of the token sequence, prompt included
-
-The cross-attention K/V are projected once; then a single position-independent
-decode-step graph (captured as a HIP graph on AMD GPUs) is replayed per token:
-first for the start-of-transcript prompt, then for each greedily chosen token
-until end-of-text. Returns the decoded text and all token ids, the prompt included.
+A loaded Whisper checkpoint for repeated transcription: weights and tokenizer are
+read once, and the compiled graphs (audio encoder, cross-attention projection,
+decode step with its device-resident KV cache) are built per batch size on
+first use and reused. Transcribe with `transcribe(session, audio_or_clips)`.
 """
-function greedy_decode(td::TextDecoder,
-                       tokenizer::WhisperTokenizer,
-                       enc_output::AbstractArray{Float32, 3},
-                       weights;
-                       language::String="en",
-                       task::Symbol=:transcribe,
-                       max_len::Int=MAX_TARGET_POSITION,
-                       device=nothing,
-                       weight_dtype::Type=Float32)
-    hidden, enc_seq, batch = size(enc_output)
-    @assert batch == 1 "greedy_decode supports batch size 1"
+mutable struct WhisperSession{D}
+    tokenizer::WhisperTokenizer
+    weights::Dict{String, Any}
+    device::D
+    enc_cfg::Any                  # AudioEncoder kwargs (nothing: decoding only)
+    dec_cfg::Any                  # TextDecoder kwargs
+    weight_dtype::Type            # decode-step matmul weight storage
+    encoders::Dict{Int, Any}      # batch => compiled encoder
+    cross::Dict{Int, Any}         # batch => compiled cross-attention K/V projection
+    decoders::Dict{Int, Any}      # batch => compiled decode step and KV cache
+end
+
+function WhisperSession(model_dir::String; device=nothing, weight_dtype::Type=Float32)
     dev = device === nothing ? get_device() : device
-    W = weights isa AbstractString ? load_weights_to_dict(weights; device=dev) : weights
-    cfg = decoder_config(td)
+    enc_cfg, dec_cfg = _whisper_config(model_dir)
+    return WhisperSession(WhisperTokenizer(model_dir), load_weights_to_dict(model_dir; device=dev),
+                          dev, enc_cfg, dec_cfg, weight_dtype,
+                          Dict{Int,Any}(), Dict{Int,Any}(), Dict{Int,Any}())
+end
+
+Base.show(io::IO, s::WhisperSession) =
+    print(io, "WhisperSession(d_model $(s.dec_cfg.d_model), $(s.dec_cfg.n_layers) decoder layers, ",
+          "$(s.device), batch sizes compiled: $(sort!(collect(keys(s.decoders)))))")
+
+# Encoder output (Hidden, S_enc, B) on the device for log-mel spectrograms (n_mels, frames, B).
+function _encode(s::WhisperSession, mels::Array{Float32, 3})
+    s.enc_cfg === nothing && error("this session has no encoder configuration")
+    B = size(mels, 3)
+    e = get!(s.encoders, B) do
+        g = Graph(); reg = WeightRegistry()
+        enc = AudioEncoder(g; reg=reg, s.enc_cfg...)
+        mel_in = Luminal.tensor(g, collect(size(mels)))
+        out = enc(mel_in)
+        load_weights!(g, reg, s.weights; device=s.device)
+        (exec=compile(g; device=s.device, retain=[out.id]), in_id=mel_in.id, out_id=out.id)
+    end
+    return e.exec(Dict{Int,Any}(e.in_id => mels); device=s.device)[e.out_id]
+end
+
+# Greedy decoding for every sequence of the (Hidden, S_enc, B) encoder output.
+# Sequences share the prompt, so they stay at one position; a finished sequence
+# keeps being fed end-of-text, and its output is ignored, until all are done.
+function _greedy(s::WhisperSession, enc_output::AbstractArray{Float32, 3};
+                 language::String="en", task::Symbol=:transcribe,
+                 max_len::Int=MAX_TARGET_POSITION)
+    hidden, enc_seq, B = size(enc_output)
+    cfg = s.dec_cfg
     head_dim = cfg.d_model ÷ cfg.n_heads
 
-    # 1. Cross-attention K/V, projected once from the encoder output
-    cg = Graph(); creg = WeightRegistry()
-    ctd = TextDecoder(cg; reg=creg, cfg...)
-    enc_in = Luminal.tensor(cg, [hidden, enc_seq, batch])
-    kv = project_cross_kv(ctd, enc_in)
-    load_weights!(cg, creg, W; device=dev)
-    kv_ids = [id for (k, v) in kv for id in (k.id, v.id)]
-    cexec = compile(cg; device=dev, retain=kv_ids)
-    kv_res = cexec(Dict{Int,Any}(enc_in.id => enc_output); device=dev)
-
-    cache = KVCacheState(cfg.n_layers, cfg.n_heads, head_dim, enc_seq;
-                         batch=batch, max_seq=cfg.max_positions, device=dev)
-    for (i, (k, v)) in enumerate(kv)
-        cache.cross_cache[i][1] .= kv_res[k.id]
-        cache.cross_cache[i][2] .= kv_res[v.id]
+    # Cross-attention K/V, projected once per call
+    c = get!(s.cross, B) do
+        g = Graph(); reg = WeightRegistry()
+        td = TextDecoder(g; reg=reg, cfg...)
+        enc_in = Luminal.tensor(g, [hidden, enc_seq, B])
+        kv = project_cross_kv(td, enc_in)
+        load_weights!(g, reg, s.weights; device=s.device)
+        ids = [(k.id, v.id) for (k, v) in kv]
+        (exec=compile(g; device=s.device, retain=[i for p in ids for i in p]), in_id=enc_in.id, kv_ids=ids)
     end
-    cexec = kv_res = nothing
+    # The decode step: one shape-static graph for every position, and its cache.
+    # Reusing the cache arrays keeps a captured HIP graph valid across calls.
+    d = get!(s.decoders, B) do
+        g = Graph(); reg = WeightRegistry()
+        td = TextDecoder(g; reg=reg, cfg...)
+        idg = build_decode_step!(td, g, enc_seq; max_seq=cfg.max_positions, batch=B)
+        load_weights!(g, reg, s.weights; device=s.device)
+        retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
+                      idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
+                      idg.cross_k_ids, idg.cross_v_ids)
+        exec = compile(g; device=s.device, retain=retain, free_intermediates=false,
+                       weight_dtype=s.weight_dtype, capture=s.device isa Luminal.AMDDevice)
+        cache = KVCacheState(cfg.n_layers, cfg.n_heads, head_dim, enc_seq;
+                             batch=B, max_seq=cfg.max_positions, device=s.device)
+        (exec=exec, idg=idg, cache=cache)
+    end
+    kv_res = c.exec(Dict{Int,Any}(c.in_id => enc_output); device=s.device)
+    cache = d.cache
+    for (i, (k, v)) in enumerate(c.kv_ids)
+        cache.cross_cache[i][1] .= kv_res[k]
+        cache.cross_cache[i][2] .= kv_res[v]
+    end
+    cache.step_pos = 0      # self-attention slots are rewritten before they are read
 
-    # 2. The decode step: one shape-static graph for every position
-    g = Graph(); reg = WeightRegistry()
-    dtd = TextDecoder(g; reg=reg, cfg...)
-    idg = build_decode_step!(dtd, g, enc_seq; max_seq=cfg.max_positions, batch=batch)
-    load_weights!(g, reg, W; device=dev)
-    retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
-                  idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
-                  idg.cross_k_ids, idg.cross_v_ids)
-    exec = compile(g; device=dev, retain=retain, free_intermediates=false,
-                   weight_dtype=weight_dtype, capture=dev isa Luminal.AMDDevice)
-
-    # 3. Feed the prompt, then decode greedily
-    tokens = sot_sequence(tokenizer; language=language, task=task, notimestamps=true)
+    tok = s.tokenizer
+    prompt = sot_sequence(tok; language=language, task=task, notimestamps=true)
+    tokens = [copy(prompt) for _ in 1:B]
     logits = nothing
-    for t in tokens
-        logits = decode_step!(exec, idg, cache, [t]; device=dev)
+    for t in prompt
+        logits = decode_step!(d.exec, d.idg, cache, fill(t, B); device=s.device)
     end
-    while length(tokens) < max_len
-        next = argmax(view(Array{Float32}(logits), :, 1, 1)) - 1   # 0-indexed
-        push!(tokens, next)
-        (next == tokenizer.eot_id || cache.step_pos >= cache.max_seq) && break
-        logits = decode_step!(exec, idg, cache, [next]; device=dev)
+    done = falses(B)
+    while !all(done)
+        host = Array{Float32}(logits)                                     # (vocab, 1, B)
+        for b in 1:B
+            done[b] && continue
+            next = argmax(view(host, :, 1, b)) - 1                        # 0-indexed
+            push!(tokens[b], next)
+            done[b] = next == tok.eot_id || length(tokens[b]) >= max_len
+        end
+        (all(done) || cache.step_pos >= cache.max_seq) && break
+        logits = decode_step!(d.exec, d.idg, cache, [done[b] ? tok.eot_id : tokens[b][end] for b in 1:B];
+                              device=s.device)
     end
+    return [(decode(tok, t; skip_special=true), t) for t in tokens]
+end
 
-    return decode(tokenizer, tokens; skip_special=true), tokens
+_samples(audio::AbstractString) = load_audio_file(audio)
+_samples(audio::AbstractVector{<:Real}) = Vector{Float32}(audio)
+
+"""
+    transcribe(session::WhisperSession, audio; language="en", task=:transcribe, max_len=448) -> (text, tokens)
+    transcribe(session::WhisperSession, clips::Vector; kwargs...) -> Vector{(text, tokens)}
+    transcribe(model_dir, audio; device=nothing, weight_dtype=Float32, kwargs...)
+
+Transcribe (or, with `task=:translate`, translate to English) up to 30 s of
+audio. `audio` is a path (decoded with ffmpeg) or a 16 kHz mono vector of
+samples; a vector of them is encoded and decoded as one batch. `tokens`
+includes the start-of-transcript prompt. The `model_dir` form is one-shot: it
+creates a `WhisperSession` (loading and compiling) for a single call.
+"""
+# A vector of clips (paths and/or sample vectors); a vector of numbers is one clip
+# (the more specific method below).
+function transcribe(s::WhisperSession, clips::AbstractVector;
+                    language::String="en", task::Symbol=:transcribe, max_len::Int=MAX_TARGET_POSITION)
+    isempty(clips) && return Tuple{String, Vector{Int}}[]
+    mels = [log_mel_spectrogram(pad_or_trim(_samples(a)); n_mels=s.enc_cfg.n_mels) for a in clips]
+    enc = _encode(s, cat(mels...; dims=3))
+    return _greedy(s, enc; language=language, task=task, max_len=max_len)
+end
+
+transcribe(s::WhisperSession, audio::Union{AbstractString, AbstractVector{<:Real}}; kwargs...) =
+    only(transcribe(s, [audio]; kwargs...))
+
+function transcribe(model_dir::String, audio; device=nothing, weight_dtype::Type=Float32, kwargs...)
+    return transcribe(WhisperSession(model_dir; device=device, weight_dtype=weight_dtype), audio; kwargs...)
+end
+
+"""
+    greedy_decode(td, tokenizer, enc_output, weights; language="en", task=:transcribe,
+                  max_len=448, device=nothing, weight_dtype=Float32)
+
+Greedy Whisper decoding of an encoder output (Hidden, S_enc, B) with a
+device-resident KV cache; `td` is a `TextDecoder` used only as the architecture
+template, and `weights` a model directory or a `Dict` from `load_weights_to_dict`.
+Returns `(text, tokens)` for batch 1, or a vector of them. (`transcribe` and
+`WhisperSession` wrap this with the audio frontend and encoder.)
+"""
+function greedy_decode(td::TextDecoder, tokenizer::WhisperTokenizer,
+                       enc_output::AbstractArray{Float32, 3}, weights;
+                       device=nothing, weight_dtype::Type=Float32, kwargs...)
+    dev = device === nothing ? get_device() : device
+    W = weights isa AbstractString ? load_weights_to_dict(weights; device=dev) : weights
+    s = WhisperSession(tokenizer, W, dev, nothing, decoder_config(td), weight_dtype,
+                       Dict{Int,Any}(), Dict{Int,Any}(), Dict{Int,Any}())
+    out = _greedy(s, enc_output; kwargs...)
+    return length(out) == 1 ? only(out) : out
 end
 
 # Whisper dimensions from a Hugging Face config.json (defaults: whisper-tiny).
@@ -350,38 +438,6 @@ function _whisper_config(model_dir::String)
     return enc, dec
 end
 
-"""
-    transcribe(model_dir, audio; language="en", task=:transcribe, max_len=448,
-               device=nothing, weight_dtype=Float32) -> (text, tokens)
-
-Transcribe (or translate) up to 30 s of audio with a Hugging Face Whisper
-checkpoint directory (`config.json`, `model.safetensors` and tokenizer files).
-`audio` is a path (decoded with ffmpeg) or a 16 kHz mono `Vector{Float32}`.
-"""
-function transcribe(model_dir::String, audio;
-                    language::String="en", task::Symbol=:transcribe,
-                    max_len::Int=MAX_TARGET_POSITION, device=nothing,
-                    weight_dtype::Type=Float32)
-    dev = device === nothing ? get_device() : device
-    samples = audio isa AbstractString ? load_audio_file(audio) : Vector{Float32}(audio)
-    enc_cfg, dec_cfg = _whisper_config(model_dir)
-    mel = log_mel_spectrogram(pad_or_trim(samples); n_mels=enc_cfg.n_mels)
-    W = load_weights_to_dict(model_dir; device=dev)
-
-    g = Graph(); reg = WeightRegistry()
-    enc = AudioEncoder(g; reg=reg, enc_cfg...)
-    mel_in = Luminal.tensor(g, [size(mel)..., 1])
-    enc_out = enc(mel_in)
-    load_weights!(g, reg, W; device=dev)
-    exec = compile(g; device=dev, retain=[enc_out.id])
-    enc_arr = exec(Dict{Int,Any}(mel_in.id => Base.reshape(mel, size(mel)..., 1)); device=dev)[enc_out.id]
-
-    td = TextDecoder(Graph(); dec_cfg...)
-    return greedy_decode(td, WhisperTokenizer(model_dir), enc_arr, W;
-                         language=language, task=task, max_len=max_len, device=dev,
-                         weight_dtype=weight_dtype)
-end
-
-export transcribe
+export transcribe, WhisperSession
 
 end # module Decoding

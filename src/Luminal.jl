@@ -18,7 +18,7 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, Function, Slice, Pad, FlashAttentionOp, Unfold
+export Op, Add, Mul, LessThan, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, SoftmaxOp, Function, Slice, Pad, FlashAttentionOp, Unfold
 
 
 include("Graph.jl")
@@ -64,7 +64,7 @@ export LlamaTokenizer, encode, decode, chat_prompt
 # Decoding & Inference
 include("Decoding.jl")
 using .Decoding
-export greedy_decode, transcribe, llama_generate, LlamaSession, generate
+export greedy_decode, transcribe, WhisperSession, llama_generate, LlamaSession, generate
 
 # Training & Optimizers
 include("Optimizer.jl")
