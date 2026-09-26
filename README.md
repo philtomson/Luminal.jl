@@ -11,6 +11,9 @@ equivalent graphs for the fastest one.
 
 Models validated against Hugging Face `transformers`:
 
+- **Llama-3-8B-Instruct**: logits within 5e-6 of the reference at every prompt
+  position. Greedy chat continuations are identical to HF's with Float32,
+  Float16 and int8 decode weights.
 - **TinyLlama 1.1B**: prefill plus KV-cached decode. Perplexity in Float32
   matches the reference, and int8 weights cost +0.25%.
 - **Whisper** (tiny, and other sizes from their `config.json`): transcription
@@ -89,6 +92,7 @@ Requirements:
 |---------|--------------|
 | `examples/llama_chat.jl` | Text generation from a Llama-family checkpoint (TinyLlama, Llama-3-8B-Instruct): `--chat`, `--int8`, `--search=static\|measured`, extra `--prompt=` flags for a batch, `--interactive` |
 | `examples/llama_reference.py` | Dumps Hugging Face reference logits and greedy continuations for a Llama checkpoint |
+| `examples/llama_validate.jl` | Compares a checkpoint's logits, greedy output and batched output with that reference, and times decode |
 | `examples/batched_decode.jl` | Decode throughput against batch size |
 | `examples/whisper.jl` | Speech-to-text with a Hugging Face Whisper checkpoint |
 | `examples/quant_eval.jl` | Perplexity of Float32, Float16 and int8 weights on a fixed passage |
@@ -101,7 +105,20 @@ Requirements:
 
 ## Performance
 
-TinyLlama 1.1B on a Radeon 8060S (Strix Halo iGPU, ROCm 10), batch 1:
+Llama-3-8B-Instruct on a Radeon 8060S (Strix Halo iGPU, ROCm 10, weights in
+system memory through GTT):
+
+| Decode weights | Batch 1 | Batch 4 | Batch 8 |
+|----------------|---------|---------|---------|
+| Float32 | 149 ms/token (6.7 tok/s) | | |
+| Float16 | 67 ms/token (14.9 tok/s) | 52 tok/s | 77 tok/s |
+| int8 | 45 ms/token (22 tok/s) | 74 tok/s | 90 tok/s |
+
+For comparison, upstream Luminal reports 229 ms/token for the same checkpoint
+on an NVIDIA H200 with Float32 weights (batch 1; `examples/llm_chat`, September
+2026). Float32 prefill of a 22-token chat prompt takes 0.23 s.
+
+TinyLlama 1.1B on the same GPU, batch 1:
 
 | | Weights | Time | |
 |-|---------|------|-|
@@ -169,8 +186,10 @@ figure includes weight loading and graph compilation.
 ### Models and layers
 - Layers: `Linear`, `Conv1D`, `Embedding`, `LayerNorm`, `RMSNorm`, `Mlp`,
   `SelfAttention` (GQA, RoPE), `TransformerBlock`.
-- **Llama / TinyLlama**: prefill plus a device-resident KV cache with one
-  compiled decode graph for every position (`llama_generate`).
+- **Llama / TinyLlama / Llama-3**: models built from `config.json`
+  (`llama_config`), prefill, and a device-resident KV cache with one compiled
+  decode graph for every position. `LlamaSession`/`generate` reuse them, and
+  `chat_prompt` produces the model's chat format.
 - **Batched generation**: `llama_generate(model, tok, prompts::Vector{String}, dir)`
   runs one right-padded prefill for all prompts. It then decodes them together,
   each sequence at its own position, and stops each one independently. Its
@@ -182,7 +201,9 @@ figure includes weight loading and graph compilation.
   - cached greedy decoding (`greedy_decode`, `transcribe`)
 - **Weights**: safetensors (F32/F16/BF16) mapped by Hugging Face key through a
   `WeightRegistry`. They are converted to Float32 and transposed on the device.
-- **Tokenizers**: SentencePiece BPE (Llama, Phi-3) and byte-level BPE (Whisper).
+- **Tokenizers**: SentencePiece-style BPE (Llama-2, TinyLlama, Phi-3), byte-level BPE
+  (Llama-3, Whisper). Llama tokenizers match Hugging Face token for token, special
+  tokens included.
 
 ### Training
 Reverse-mode autodiff over the primitives (`backward`) and `SGD`/`Adam` optimizers.
