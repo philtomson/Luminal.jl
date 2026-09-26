@@ -12,11 +12,14 @@ using Luminal
     y = Luminal.sigmoid(h) * 2.0f0 + h                   # elementwise fusion
     z = Luminal.permute(Luminal.reshape(a, [16, 12, 1]), [1, 3, 2])   # views
     s = Luminal.slice_along(y, 1, 8, 24)                 # contiguous-slice view
+    c1 = Luminal.tensor(g, [8, 3]); c2 = Luminal.tensor(g, [5, 3])
+    c = Luminal.concat_along(c1 * 2.0f0, c2 + 1.0f0, 1)  # run-time concatenation
     ins = Dict{Int,Any}(x.id => randn(Float32, 32, 3), r.id => randn(Float32, 64, 3),
-                        a.id => randn(Float32, 16, 12))
+                        a.id => randn(Float32, 16, 12),
+                        c1.id => randn(Float32, 8, 3), c2.id => randn(Float32, 5, 3))
     g.tensors[(W.id, 1)] = Luminal.to_device(randn(Float32, 64, 32), dev)
     wd = dev isa CPUDevice ? Float32 : Int8
-    retain = [y.id, z.id, s.id]
+    retain = [y.id, z.id, s.id, c.id]
     run(lowering) = begin
         cg = compile(g; device=dev, retain=retain, weight_dtype=wd, free_intermediates=false,
                      lowering=lowering)
@@ -26,6 +29,8 @@ using Luminal
     ref, sites = run(Dict{String,Bool}())
     @test any(startswith("fuse "), sites)
     @test any(startswith("view "), sites)
+    @test any(startswith("concat "), sites)
+    @test ref[4] ≈ vcat(2 .* ins[c1.id], ins[c2.id] .+ 1)
     dev isa CPUDevice || @test any(startswith("residual "), sites)
     for site in sites
         out, _ = run(Dict(site => false))
