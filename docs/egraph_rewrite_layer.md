@@ -2,7 +2,7 @@
 
 **Status (2026-09-24):** in `src/EGraphRewrite.jl`, opt-in through
 `compile(graph; retain=..., search=:static | :measured, precision=...)` and
-`llama_generate(...; search=...)` (`examples/tinyllama_chat.jl --search=measured`).
+`llama_generate(...; search=...)` (`examples/llama_chat.jl --search=measured`).
 The old SymbolicUtils rules, `SymbolicIntegration.jl` and the tree-based
 `Metatheory*.jl` modules have been removed. Standalone driver:
 `examples/egraph_search.jl`; tests: `tests/test_egraph_rewrite.jl`.

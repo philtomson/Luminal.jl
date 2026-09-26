@@ -59,7 +59,7 @@ include("EGraphRewrite.jl")
 # Tokenizers
 include("LlamaTokenizer.jl")
 using .LlamaTokenization
-export LlamaTokenizer, encode, decode
+export LlamaTokenizer, encode, decode, chat_prompt
 
 # Decoding & Inference
 include("Decoding.jl")

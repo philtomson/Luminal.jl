@@ -2,7 +2,7 @@
 #
 # Builds a small Llama, compiles the position-independent single-token decode
 # graph (HIP-graph captured on AMD GPUs) and times it against a device-resident
-# KV cache. For real checkpoints and text, see examples/tinyllama_chat.jl.
+# KV cache. For real checkpoints and text, see examples/llama_chat.jl.
 #
 #   julia --project=. examples/llama.jl [cpu|gpu]
 using Luminal

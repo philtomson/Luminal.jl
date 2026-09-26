@@ -3,76 +3,146 @@ module LlamaTokenization
 using JSON3
 import ..Luminal: encode, decode
 
-export LlamaTokenizer, encode, decode
+export LlamaTokenizer, encode, decode, chat_prompt
 
 """
     LlamaTokenizer
-    
-A SentencePiece-style BPE tokenizer used by Llama-2, Llama-3, and Phi-3,
-loaded from a HuggingFace `tokenizer.json`.
+
+A BPE tokenizer loaded from a Hugging Face `tokenizer.json`, in either of the two
+forms Llama-family models use:
+- SentencePiece style (Llama-2, TinyLlama, Phi-3): spaces become `▁`, unknown
+  characters fall back to `<0xXX>` byte tokens.
+- Byte-level (Llama-3): text is pre-split by the tokenizer's regex, every byte is
+  mapped to a printable character (GPT-2's byte encoder), then BPE is applied.
+  Special tokens such as `<|eot_id|>` in the text are recognized as single tokens.
 """
 struct LlamaTokenizer
     vocab::Dict{String,Int}                        # token => id
     id_to_token::Dict{Int,String}                  # id => token
     merges::Vector{Tuple{String,String}}           # ordered merge rules
     merge_ranks::Dict{Tuple{String,String},Int}    # (a,b) => rank
-    
+
     # Common special token IDs
     bos_id::Int
     eos_id::Int
     unk_id::Int
     pad_id::Int
+
+    eos_ids::Vector{Int}          # every id that ends generation (eos_id included)
+    special_ids::Set{Int}         # special tokens, dropped by `decode`
+    byte_level::Bool              # byte-level BPE (Llama-3) rather than SentencePiece
+    pattern::Union{Regex,Nothing} # byte-level pre-tokenizer split
+    ignore_merges::Bool           # a whole pre-token found in the vocab is one token
+    specials::Union{Regex,Nothing}  # matches special tokens in the input text
 end
+
+# GPT-2's reversible byte <-> printable-character mapping.
+function _byte_encoder()
+    bs = vcat(Int('!'):Int('~'), Int('¡'):Int('¬'), Int('®'):Int('ÿ'))
+    cs = copy(bs)
+    n = 0
+    for b in 0:255
+        if !(b in bs)
+            push!(bs, b); push!(cs, 256 + n); n += 1
+        end
+    end
+    enc = Dict(UInt8(b) => Char(c) for (b, c) in zip(bs, cs))
+    return enc, Dict(c => b for (b, c) in enc)
+end
+const BYTE_ENCODER, BYTE_DECODER = _byte_encoder()
+
+_json_get(d, k, default) = haskey(d, k) && d[k] !== nothing ? d[k] : default
 
 """
     LlamaTokenizer(model_dir)
 
-Load the tokenizer from a HuggingFace model directory containing `tokenizer.json`.
+Load the tokenizer from a Hugging Face model directory containing `tokenizer.json`.
+The end-of-sequence ids come from `tokenizer_config.json` and `generation_config.json`
+when present (Llama-3-Instruct ends turns with `<|eot_id|>` as well as `<|end_of_text|>`).
 """
 function LlamaTokenizer(model_dir::String)
     tj = joinpath(model_dir, "tokenizer.json")
     !isfile(tj) && error("tokenizer.json not found in $model_dir")
-    
+
     data = JSON3.read(read(tj, String))
-    
+    model = data["model"]
+
     vocab = Dict{String,Int}()
     merges = Tuple{String,String}[]
-    
+
     # Vocabulary
-    raw_vocab = data["model"]["vocab"]
-    for (tok, id) in pairs(raw_vocab)
+    for (tok, id) in pairs(model["vocab"])
         vocab[String(tok)] = Int(id)
     end
-    
-    # Merges
-    for entry in data["model"]["merges"]
-        parts = split(String(entry), ' ')
+
+    # Merges: "a b" strings, or [a, b] pairs in newer tokenizer.json files
+    for entry in model["merges"]
+        parts = entry isa AbstractString ? split(String(entry), ' ') : String.(collect(entry))
         if length(parts) == 2
-            push!(merges, (parts[1], parts[2]))
+            push!(merges, (String(parts[1]), String(parts[2])))
         end
     end
-    
+
     id_to_token = Dict(v => k for (k, v) in vocab)
     merge_ranks = Dict(p => i for (i, p) in enumerate(merges))
-    
-    # Resolve special tokens
-    _id(n) = get(vocab, n, -1)
-    bos_id = _id("<s>")
-    eos_id = _id("</s>")
-    unk_id = _id("<unk>")
-    pad_id = _id("<pad>")
-    
-    # Handle added tokens if they are not in the main vocab
-    if haskey(data, "added_tokens")
-        for st in data["added_tokens"]
-            content = String(st["content"])
-            id = Int(st["id"])
-            vocab[content] = id
-            id_to_token[id] = content
+
+    # Added tokens (special tokens live here)
+    special_ids = Set{Int}()
+    special_strs = String[]
+    for st in _json_get(data, "added_tokens", [])
+        content = String(st["content"])
+        id = Int(st["id"])
+        vocab[content] = id
+        id_to_token[id] = content
+        if _json_get(st, "special", false)
+            push!(special_ids, id)
+            push!(special_strs, content)
         end
     end
-    
-    return LlamaTokenizer(vocab, id_to_token, merges, merge_ranks, bos_id, eos_id, unk_id, pad_id)
+
+    # Byte-level pre-tokenization (Llama-3): a Split regex followed by ByteLevel
+    pre = _json_get(data, "pre_tokenizer", nothing)
+    pres = pre === nothing ? [] : pre["type"] == "Sequence" ? collect(pre["pretokenizers"]) : [pre]
+    byte_level = any(p -> p["type"] == "ByteLevel", pres)
+    pattern = nothing
+    for p in pres
+        if p["type"] == "Split" && haskey(p["pattern"], "Regex")
+            # (*UCP): \s, \w etc. match Unicode, as in Hugging Face's regex engine
+            pattern = Regex("(*UCP)" * String(p["pattern"]["Regex"]))
+        end
+    end
+    if byte_level && pattern === nothing
+        # GPT-2's pattern, for ByteLevel with use_regex
+        pattern = r"(*UCP)'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+    end
+    specials = isempty(special_strs) ? nothing :
+        Regex(join(map(t -> "\\Q" * t * "\\E", sort(special_strs; by=length, rev=true)), "|"))
+
+    # Special token ids
+    _id(n) = get(vocab, n, -1)
+    tcfg_path = joinpath(model_dir, "tokenizer_config.json")
+    tcfg = isfile(tcfg_path) ? JSON3.read(read(tcfg_path, String)) : Dict{Symbol,Any}()
+    _name(x) = x isa AbstractString ? String(x) : x === nothing ? nothing : String(_json_get(x, "content", ""))
+    bos_name = _name(_json_get(tcfg, "bos_token", nothing))
+    eos_name = _name(_json_get(tcfg, "eos_token", nothing))
+    bos_id = bos_name !== nothing && haskey(vocab, bos_name) ? vocab[bos_name] : _id("<s>")
+    eos_id = eos_name !== nothing && haskey(vocab, eos_name) ? vocab[eos_name] : _id("</s>")
+    unk_id = _id("<unk>")
+    pad_id = _id("<pad>")
+
+    eos_ids = eos_id == -1 ? Int[] : [eos_id]
+    gcfg_path = joinpath(model_dir, "generation_config.json")
+    if isfile(gcfg_path)
+        e = _json_get(JSON3.read(read(gcfg_path, String)), "eos_token_id", nothing)
+        e isa Integer && push!(eos_ids, e)
+        e isa AbstractVector && append!(eos_ids, Int.(e))
+    end
+    unique!(eos_ids)
+    eos_id == -1 && !isempty(eos_ids) && (eos_id = eos_ids[1])
+
+    return LlamaTokenizer(vocab, id_to_token, merges, merge_ranks, bos_id, eos_id, unk_id, pad_id,
+                          eos_ids, special_ids, byte_level, pattern,
+                          Bool(_json_get(model, "ignore_merges", false)), specials)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,27 +186,64 @@ end
 """
     encode(tok, text; bos=false, eos=false) -> Vector{Int}
 
-Encode text into Llama/Phi-3 token IDs.
+Encode text into token IDs. Byte-level tokenizers also recognize special tokens
+written in `text` (e.g. a Llama-3 chat template).
 """
 function encode(tok::LlamaTokenizer, text::String; bos::Bool=false, eos::Bool=false)
-    # 1. Pre-processing: SentencePiece style
-    # Replace space with U+2581 (lower one eighth block)
-    # Llama-2 usually prepends a space if the string doesn't start with one.
-    processed = replace(text, " " => "\u2581")
-    if !startswith(processed, "\u2581")
-        processed = "\u2581" * processed
-    end
-    
-    # 2. Split into characters
-    chars = [string(c) for c in processed]
-    
-    # 3. Apply BPE
-    bpe_tokens = _bpe_encode(chars, tok.merge_ranks)
-    
-    # 4. Convert to IDs
     ids = Int[]
     bos && tok.bos_id != -1 && push!(ids, tok.bos_id)
-    
+    for (i, (seg, special)) in enumerate(_split_specials(tok, text))
+        if special
+            push!(ids, tok.vocab[seg])
+        elseif tok.byte_level
+            _encode_byte_level!(ids, tok, seg)
+        else
+            # SentencePiece prepends "▁" to the text, not to text after a special token
+            _encode_sentencepiece!(ids, tok, seg; prefix = i == 1)
+        end
+    end
+    eos && tok.eos_id != -1 && push!(ids, tok.eos_id)
+    return ids
+end
+
+# `text` as (segment, is special token) pieces: special tokens written in the text
+# (e.g. a chat template's "<|eot_id|>" or "</s>") are single tokens, as in HF tokenizers.
+function _split_specials(tok::LlamaTokenizer, text::String)
+    segments = Tuple{String,Bool}[]
+    pos = 1
+    if tok.specials !== nothing
+        for m in eachmatch(tok.specials, text)
+            m.offset > pos && push!(segments, (text[pos:prevind(text, m.offset)], false))
+            push!(segments, (m.match, true))
+            pos = m.offset + ncodeunits(m.match)
+        end
+    end
+    pos <= ncodeunits(text) && push!(segments, (text[pos:end], false))
+    return segments
+end
+
+function _encode_byte_level!(ids::Vector{Int}, tok::LlamaTokenizer, text::String)
+    for m in eachmatch(tok.pattern, text)
+        word = String([BYTE_ENCODER[b] for b in codeunits(m.match)])
+        if tok.ignore_merges && haskey(tok.vocab, word)
+            push!(ids, tok.vocab[word])
+            continue
+        end
+        for t in _bpe_encode([string(c) for c in word], tok.merge_ranks)
+            push!(ids, get(tok.vocab, t, tok.unk_id))
+        end
+    end
+    return ids
+end
+
+function _encode_sentencepiece!(ids::Vector{Int}, tok::LlamaTokenizer, text::String; prefix::Bool=true)
+    isempty(text) && return ids
+    # SentencePiece style: spaces become U+2581, and a leading one is prepended
+    processed = replace(text, " " => "\u2581")
+    if prefix && !startswith(processed, "\u2581")
+        processed = "\u2581" * processed
+    end
+    bpe_tokens = _bpe_encode([string(c) for c in processed], tok.merge_ranks)
     for t in bpe_tokens
         id = get(tok.vocab, t, -1)
         if id != -1
@@ -145,26 +252,24 @@ function encode(tok::LlamaTokenizer, text::String; bos::Bool=false, eos::Bool=fa
             # Byte fallback for unknown tokens: map each UTF-8 byte to its vocab ID
             for b in codeunits(t)
                 hex = uppercase(string(b, base=16, pad=2))
-                byte_token = "<0x$hex>"
-                push!(ids, get(tok.vocab, byte_token, tok.unk_id))
+                push!(ids, get(tok.vocab, "<0x$hex>", tok.unk_id))
             end
         end
     end
-    
-    eos && tok.eos_id != -1 && push!(ids, tok.eos_id)
     return ids
 end
 
 """
     decode(tok, ids) -> String
 
-Decode token IDs back to a string.
+Decode token IDs back to a string, dropping special tokens.
 """
-function decode(tok::LlamaTokenizer, ids::Vector{Int})
+function decode(tok::LlamaTokenizer, ids::AbstractVector{<:Integer})
+    tok.byte_level && return _decode_byte_level(tok, ids)
     text = ""
     for id in ids
         token = get(tok.id_to_token, id, "")
-        if isempty(token) || id in [tok.bos_id, tok.eos_id, tok.pad_id]
+        if isempty(token) || id in (tok.bos_id, tok.eos_id, tok.pad_id) || id in tok.eos_ids
             continue
         end
         
@@ -186,13 +291,34 @@ function decode(tok::LlamaTokenizer, ids::Vector{Int})
     
     # Replace U+2581 back to space
     decoded = replace(text, "\u2581" => " ")
-    
-    # Handle the potential leading space if added by pre-processing
-    # Actually, the leading block ' ' should just become a space.
-    # If the original text didn't have it, we might want to trim it, 
-    # but usually llama output includes it.
-    
     return decoded
+end
+
+function _decode_byte_level(tok::LlamaTokenizer, ids::AbstractVector{<:Integer})
+    bytes = UInt8[]
+    for id in ids
+        (id in tok.special_ids || id in tok.eos_ids) && continue
+        for c in get(tok.id_to_token, id, "")
+            push!(bytes, BYTE_DECODER[c])
+        end
+    end
+    return String(bytes)
+end
+
+"""
+    chat_prompt(tok, message) -> String
+
+`message` as a single user turn in the model's chat format, ending where the
+assistant's reply begins: Llama-3's header format when the vocabulary has its
+header tokens, otherwise the Zephyr format TinyLlama-Chat uses. The BOS token is
+not included (`encode(...; bos=true)` and `generate` add it).
+"""
+function chat_prompt(tok::LlamaTokenizer, message::AbstractString)
+    if haskey(tok.vocab, "<|start_header_id|>")
+        return "<|start_header_id|>user<|end_header_id|>\n\n$(strip(message))<|eot_id|>" *
+               "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    end
+    return "<|user|>\n$message</s>\n<|assistant|>\n"
 end
 
 end # module LlamaTokenization

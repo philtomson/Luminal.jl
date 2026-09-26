@@ -1,8 +1,9 @@
 module NN
 
 using ..Luminal
+import JSON3
 
-export Linear, Conv1D, Embedding, LayerNorm, RMSNorm, Mlp, SelfAttention, TransformerBlock, Llama, Phi3, repeat_kv
+export Linear, Conv1D, Embedding, LayerNorm, RMSNorm, Mlp, SelfAttention, TransformerBlock, Llama, Phi3, repeat_kv, llama_config
 
 # Layer Designs
 # --------------
@@ -450,6 +451,34 @@ function Llama(graph::Luminal.Graph, reg=nothing;
         _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false),
         rope_base
     )
+end
+
+"""
+    llama_config(model_dir) -> NamedTuple
+
+`Llama` keyword arguments from a Hugging Face `config.json`, e.g.
+`Llama(graph, reg; llama_config(dir)...)`. Errors on features this
+implementation does not support (RoPE scaling, tied embeddings, attention
+biases, a norm epsilon other than 1e-5, activations other than SiLU), rather
+than building a model that would silently compute something else.
+"""
+function llama_config(model_dir::String)
+    c = JSON3.read(read(joinpath(model_dir, "config.json"), String))
+    get_(k, d) = haskey(c, k) && c[k] !== nothing ? c[k] : d
+    unsupported = String[]
+    get_(:rope_scaling, nothing) === nothing || push!(unsupported, "rope_scaling=$(c[:rope_scaling])")
+    get_(:tie_word_embeddings, false) && push!(unsupported, "tie_word_embeddings")
+    get_(:attention_bias, false) && push!(unsupported, "attention_bias")
+    get_(:mlp_bias, false) && push!(unsupported, "mlp_bias")
+    get_(:hidden_act, "silu") == "silu" || push!(unsupported, "hidden_act=$(c[:hidden_act])")
+    Float32(get_(:rms_norm_eps, 1f-5)) == 1f-5 || push!(unsupported, "rms_norm_eps=$(c[:rms_norm_eps])")
+    isempty(unsupported) || error("unsupported Llama config in $model_dir: " * join(unsupported, ", "))
+    n_heads = Int(c[:num_attention_heads])
+    return (vocab_size=Int(c[:vocab_size]), hidden=Int(c[:hidden_size]),
+            n_layers=Int(c[:num_hidden_layers]), n_heads=n_heads,
+            n_kv_heads=Int(get_(:num_key_value_heads, n_heads)),
+            intermediate=Int(c[:intermediate_size]),
+            rope_base=Float32(get_(:rope_theta, 10000)))
 end
 
 function (l::Llama)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false)

@@ -48,12 +48,12 @@ text, tokens = transcribe("whisper-tiny", "speech.wav")   # ≤ 30 s, decoded wi
 
 ```julia
 using Luminal, Luminal.NN
-tok = LlamaTokenizer("TinyLlama-1.1B-Chat")
-model = Llama(Graph(), nothing; vocab_size=32000, hidden=2048, n_layers=22, n_heads=32,
-              n_kv_heads=4, intermediate=5632)
-session = LlamaSession(model, tok, "TinyLlama-1.1B-Chat"; rope_base=10000f0, decode_weights=Int8)
-generate(session, "Why is the sky blue?"; max_new_tokens=100)          # compiles on first use
-generate(session, ["First prompt", "Second prompt"])                   # one batch
+dir = "Meta-Llama-3-8B-Instruct"                     # or TinyLlama-1.1B-Chat, …
+tok = LlamaTokenizer(dir)
+model = Llama(Graph(), nothing; llama_config(dir)...)  # architecture from config.json
+session = LlamaSession(model, tok, dir; decode_weights=Int8)
+generate(session, chat_prompt(tok, "Why is the sky blue?"); max_new_tokens=100)  # compiles on first use
+generate(session, chat_prompt.(Ref(tok), ["First question", "Second question"]))  # one batch
 ```
 
 A session loads the weights once and keeps its compiled prefill graphs (per
@@ -62,10 +62,10 @@ later calls cost only the generation itself. `llama_generate(model, tok, prompt,
 is the one-shot form.
 
 ```bash
-julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "Why is the sky blue?"
-julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --int8 --search=measured "..."
-julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "First?" "--prompt=Second?"   # one batch
-julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat --int8 "Hi" --interactive          # keep chatting
+julia --project=. examples/llama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "Why is the sky blue?"
+julia --project=. examples/llama_chat.jl path/to/TinyLlama-1.1B-Chat --int8 --search=measured "..."
+julia --project=. examples/llama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "First?" "--prompt=Second?"   # one batch
+julia --project=. examples/llama_chat.jl path/to/TinyLlama-1.1B-Chat --chat --int8 "Hi" --interactive          # keep chatting
 ```
 
 ## Installation
@@ -87,7 +87,8 @@ Requirements:
 
 | Example | What it does |
 |---------|--------------|
-| `examples/tinyllama_chat.jl` | Text generation from a Llama checkpoint: prefill, then KV-cached decode (`--int8`, `--search=static\|measured`, `--chat`, extra `--prompt=` flags for a batch) |
+| `examples/llama_chat.jl` | Text generation from a Llama-family checkpoint (TinyLlama, Llama-3-8B-Instruct): `--chat`, `--int8`, `--search=static\|measured`, extra `--prompt=` flags for a batch, `--interactive` |
+| `examples/llama_reference.py` | Dumps Hugging Face reference logits and greedy continuations for a Llama checkpoint |
 | `examples/batched_decode.jl` | Decode throughput against batch size |
 | `examples/whisper.jl` | Speech-to-text with a Hugging Face Whisper checkpoint |
 | `examples/quant_eval.jl` | Perplexity of Float32, Float16 and int8 weights on a fixed passage |

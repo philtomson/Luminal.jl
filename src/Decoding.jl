@@ -14,7 +14,7 @@ using JSON3
 export greedy_decode, llama_generate, LlamaSession, generate
 
 """
-    LlamaSession(model, tokenizer, model_dir; max_seq=2048, rope_base=500000f0,
+    LlamaSession(model, tokenizer, model_dir; max_seq=2048, rope_base=model.rope_base,
                  device=nothing, search=:none, decode_weights=nothing)
 
 A loaded Llama-style model for repeated generation. The weights are read once;
@@ -32,7 +32,7 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
 - `tokenizer`     : a `LlamaTokenizer` loaded from the model directory
 - `model_dir`     : directory containing the `.safetensors` weights
 - `max_seq`       : KV cache capacity per sequence (default 2048)
-- `rope_base`     : RoPE base frequency (500000 for Llama-3, 10000 for Llama-2/Phi-3)
+- `rope_base`     : RoPE base frequency; defaults to the model's (see `llama_config`)
 - `device`        : device to run on; defaults to `get_device()`
 - `search`        : `:none`, `:static` or `:measured`: compile the graphs through the
                     e-graph rewrite layer (see `compile`). On GPU the search also
@@ -56,14 +56,14 @@ mutable struct LlamaSession{M, D}
 end
 
 function LlamaSession(model, tokenizer::LlamaTokenizer, model_dir::String;
-                      max_seq::Int=2048, rope_base::Float32=500000f0, device=nothing,
+                      max_seq::Int=2048, rope_base::Real=model.rope_base, device=nothing,
                       search::Symbol=:none, decode_weights::Union{Nothing,Type}=nothing)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
     wdtype = decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
     @info "Loading weights..." model_dir
     weights = load_weights_to_dict(model_dir; device=dev)
-    return LlamaSession(model, tokenizer, weights, dev, max_seq, rope_base, search, wdtype,
+    return LlamaSession(model, tokenizer, weights, dev, max_seq, Float32(rope_base), search, wdtype,
                         Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}())
 end
 
@@ -141,8 +141,8 @@ sequences.
 1. Encode each prompt (adds BOS).
 2. Prefill: the prompts right-padded in one graph; take each prompt's
    last-position logits and copy its K/V into the cache.
-3. Decode: `llama_decode_step!` until each sequence has produced EOS or
-   `max_new_tokens`. Every sequence runs at its own position, and a finished one
+3. Decode: `llama_decode_step!` until each sequence has produced an
+   end-of-sequence token (any of `tokenizer.eos_ids`) or `max_new_tokens`. Every sequence runs at its own position, and a finished one
    stops advancing while the others continue.
 4. Return each sequence's generated text.
 """
@@ -164,9 +164,9 @@ function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=
     end
     res = pf.exec(Dict{Int,Any}(pf.input_id => ids); device=s.device)
     logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B)
-    eos_id = s.tokenizer.eos_id
+    eos_ids = s.tokenizer.eos_ids
     generated = [[argmax(view(logits, :, plens[b], b)) - 1] for b in 1:B]   # 0-indexed
-    done = [g[1] == eos_id || max_new_tokens <= 1 for g in generated]
+    done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
     # KV cache: sequence b's next token goes to position plens[b]. Slots past a
     # sequence's position are never read, so the reused cache needs no clearing.
@@ -192,7 +192,7 @@ function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=
             done[b] && continue
             next = argmax(view(host, :, 1, b)) - 1                          # 0-indexed
             push!(generated[b], next)
-            done[b] = next == eos_id || length(generated[b]) >= max_new_tokens ||
+            done[b] = next in eos_ids || length(generated[b]) >= max_new_tokens ||
                       cache.positions[b] >= s.max_seq
         end
     end
