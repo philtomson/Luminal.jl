@@ -61,6 +61,25 @@ Upstream's figures are from `benchmark-128-2026-09-21` and
 request is computed as TTFT + 127 × TPOT. Ours were measured on 2026-09-26 at
 Luminal.jl commit `373eb97` (plus this benchmark script).
 
+### Luminal.jl weight formats on Llama-3-8B (decode, batch 1)
+
+Perplexity is on WikiText-2 against Float32, measured on two separate texts:
+16 × 512 tokens each, from the start of the test split and from a held-out later
+part (`examples/quant_sensitivity.jl`, section `presets`). Batch throughput is from
+`examples/batched_decode.jl`.
+
+| Decode weights | Size | Perplexity vs Float32 | TPOT | tok/s | Batch 4 | Batch 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Float32 | 28.0 GB | — | 148.2 ms | 6.7 | | |
+| Float16 | 14.0 GB | ≈0% | 67.2 ms | 14.9 | 52 | 77 |
+| int8 | 7.20 GB | 0.00% / +0.03% | 38.8 ms | 25.8 | 76 | 110 |
+| `:int4_mixed_plus` (int8 down/up/o/k/v, lm_head) | 6.15 GB | −0.7% / +0.4% | 33.7 ms | 29.7 | 84 | 111 |
+| `:int4_mixed` (int8 down/k/v, lm_head) | 5.10 GB | +0.8% / +2.4% | 29.0 ms | 34.4 | 93 | 112 |
+| int4 (symmetric, groups of 32) | 3.93 GB | +5.2% / +7.9% | 23.5 ms | 42.5 | 98 | 111 |
+
+Against upstream's FP32 221 ms/token, int4 is 9.4× faster and `:int4_mixed` is
+7.6× faster.
+
 ### Normalized to each machine
 
 | | Upstream (H200) | Luminal.jl (8060S) |
@@ -96,9 +115,13 @@ Measured unless marked otherwise.
    (BF16) and converted on the GPU.
 5. **Reduced precision (upstream has none; it runs FP32 only):**
    - Float16 weights: 67 ms/token, 3.3× upstream's FP32.
-   - int8 weights: 38.8 ms/token, 5.7× upstream's FP32. Perplexity +0.25% on
-     TinyLlama; greedy output identical to Hugging Face on the 8B validation
-     prompts.
+   - int8 weights: 38.8 ms/token, 5.7× upstream's FP32. Perplexity unchanged;
+     greedy output identical to Hugging Face on the 8B validation prompts.
+   - 4-bit weights: 23.5 ms/token (9.4×), +5–8% perplexity.
+   - Mixed int8/int4 presets chosen by measured sensitivity: `:int4_mixed` is
+     29 ms (+0.8–2.4%); `:int4_mixed_plus` is 33.7 ms (within 0.4% of int8).
+   - Per-tensor policies are available to users (`decode_weights` as a function
+     of the weight name).
 6. **Batched decode:** upstream publishes batch-1 numbers only.
    - Llama-3-8B, int8: 76 tok/s at batch 4, 110 tok/s at batch 8.
    - Llama-3-8B, Float16: 52 / 77 tok/s at batch 4 / 8.
@@ -178,7 +201,7 @@ the metrics above.
 | 3 | Faster measured search: prune dominated variants, early-stop groups, reuse across batch sizes | 12.7 min → minutes on 8B | medium |
 | 4 | Cold start: PrecompileTools workload, on-disk graph/kernel cache | 43–54 s first request → seconds | medium |
 | 5 | Prefill: fused/flash attention for long prompts; Float16 GEMM by default where tolerable | TTFT at long context; memory | medium |
-| 6 | Decode: 4-bit weights (int4 GEMV) | ~1.6–1.8× 8B decode (weights 7.7 GB → ~4 GB) | medium |
+| 6 | 4-bit weights: calibrated quantization (AWQ/GPTQ-style) to cut int4's +5–8% perplexity; activation staging so batched int4 scales (at batch 8 it only ties int8) | quality at 4 bits; batch-8 throughput | medium |
 | 7 | Same-hardware comparison: CUDA path on an NVIDIA GPU | Separates software from hardware in every number above | small once a GPU is available |
 | 8 | Broader validation: multi-turn, chunked prefill, longer contexts, more models | Confidence in the other items | ongoing |
 
@@ -191,6 +214,9 @@ the metrics above.
 | 2026-09-26 | Luminal.jl | `373eb97` | Radeon 8060S | Llama-3-8B / FP32 | 691 ms | 148.2 ms | `chat_benchmark.jl` |
 | 2026-09-26 | Luminal.jl | `373eb97` | Radeon 8060S | Llama-3-8B / Float16 | 683 ms | 67.2 ms | |
 | 2026-09-26 | Luminal.jl | `373eb97` | Radeon 8060S | Llama-3-8B / int8 | 688 ms | 38.8 ms | |
+| 2026-09-26 | Luminal.jl | `b5ef9c0`+ | Radeon 8060S | Llama-3-8B / int4 | — | 23.5 ms | `batched_decode.jl`, decode step only |
+| 2026-09-26 | Luminal.jl | `b5ef9c0`+ | Radeon 8060S | Llama-3-8B / `:int4_mixed` | — | 29.0 ms | |
+| 2026-09-26 | Luminal.jl | `b5ef9c0`+ | Radeon 8060S | Llama-3-8B / `:int4_mixed_plus` | — | 33.7 ms | |
 
 ## Reproduce
 

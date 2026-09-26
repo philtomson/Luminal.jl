@@ -1,13 +1,16 @@
 # Batched decode throughput on a Llama-family checkpoint: time one decode step for
 # several batch sizes and report per-step latency and aggregate tokens/s.
 #
-#   julia --project=. examples/batched_decode.jl path/to/checkpoint [f16|int8|int4|f32] [1,2,4,8] [none|static|measured]
+#   julia --project=. examples/batched_decode.jl path/to/checkpoint [f16|int8|int4|f32|int4_mixed|int4_mixed_plus] [1,2,4,8] [none|static|measured]
 using Luminal
 using Luminal.NN
 using Printf
 
 model_dir = ARGS[1]
-wdtype = get(Dict("f16" => Float16, "int8" => Int8, "int4" => Luminal.Int4, "f32" => Float32), get(ARGS, 2, "int8"), Int8)
+wdtype = let a = get(ARGS, 2, "int8")
+    get(Dict("f16" => Float16, "int8" => Int8, "int4" => Luminal.Int4, "f32" => Float32), a, nothing) |>
+        t -> t === nothing ? weight_preset(Symbol(a)) : t   # else a preset, e.g. int4_mixed
+end
 batches = parse.(Int, split(get(ARGS, 3, "1,2,4,8"), ","))
 search = Symbol(get(ARGS, 4, "none"))
 device = get_device()
@@ -15,7 +18,7 @@ cfg = llama_config(model_dir)
 max_seq, ctx = 512, 128        # every sequence decodes at ~position 128
 
 weights = load_weights_to_dict(model_dir; device=device)
-println("$(basename(abspath(model_dir))), $(wdtype) weights, $(device), search=$(search)")
+println("$(basename(abspath(model_dir))), $(get(ARGS, 2, "int8")) weights, $(device), search=$(search)")
 @printf("%6s %12s %12s\n", "batch", "ms/step", "tok/s")
 for B in batches
     g = Graph(); reg = WeightRegistry()
@@ -24,9 +27,13 @@ for B in batches
     load_weights!(g, reg, weights; device=device)
     retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids, idg.token_input_id,
                   idg.pos_input_id, idg.self_k_ids, idg.self_v_ids)
+    # a preset is a function of the weight name; compile() takes one of the node id
+    wd = wdtype isa Type ? wdtype : let by_id = Dict(id => wdtype(n) for (n, id) in reg.mapping)
+        id -> get(by_id, id, Float32)
+    end
     exec = search === :none ?
         compile(g; device=device, retain=retain, free_intermediates=false,
-                weight_dtype=wdtype, capture=device isa Luminal.AMDDevice) :
+                weight_dtype=wd, capture=device isa Luminal.AMDDevice) :
         compile(g; device=device, retain=retain, free_intermediates=false,
                 capture=device isa Luminal.AMDDevice, search=search,
                 precision=wdtype === Int8 ? :int8 : wdtype === Float16 ? :weights : false)

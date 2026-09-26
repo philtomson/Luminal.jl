@@ -4,7 +4,7 @@
 # exactly `output` generated tokens (end-of-sequence ignored), greedy, one full
 # warm-up request, then the median of `reps` requests.
 #
-#   julia --project=. examples/chat_benchmark.jl <model_dir> [f32|f16|int8|int4] [input] [output] [reps]
+#   julia --project=. examples/chat_benchmark.jl <model_dir> [f32|f16|int8|int4|int4_mixed|int4_mixed_plus] [input] [output] [reps]
 #
 # TTFT = time to the first generated token (prefill + one greedy pick; upstream's
 # also includes one decode step). TPOT = (time for `output` tokens - TTFT) /
@@ -13,7 +13,10 @@
 using Luminal, Luminal.NN, Printf, Statistics
 
 dir = ARGS[1]
-wd = Dict("f32" => Float32, "f16" => Float16, "int8" => Int8, "int4" => Luminal.Int4)[get(ARGS, 2, "f32")]
+wd = let a = get(ARGS, 2, "f32")
+    get(Dict("f32" => Float32, "f16" => Float16, "int8" => Int8, "int4" => Luminal.Int4), a, nothing) |>
+        t -> t === nothing ? Symbol(a) : t          # else a preset name, e.g. int4_mixed
+end
 n_in = parse(Int, get(ARGS, 3, "128"))
 n_out = parse(Int, get(ARGS, 4, "128"))
 reps = parse(Int, get(ARGS, 5, "3"))

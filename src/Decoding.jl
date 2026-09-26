@@ -11,7 +11,27 @@ using ..Luminal.LlamaTokenization
 using AMDGPU
 using JSON3
 
-export greedy_decode, llama_generate, LlamaSession, generate
+export greedy_decode, llama_generate, LlamaSession, generate, weight_preset
+
+"""
+    weight_preset(name) -> (weight name -> Type)
+
+Named per-tensor weight policies for `LlamaSession(...; decode_weights=name)`,
+chosen with examples/quant_sensitivity.jl (WikiText-2 perplexity, TinyLlama and
+Llama-3-8B, two texts):
+- `:int4`: every matmul weight 4-bit (smallest; +5-8% perplexity on these models)
+- `:int4_mixed`: int8 for down_proj, lm_head, k_proj and v_proj, 4-bit for the
+  rest. down_proj and lm_head are the most sensitive types on Llama-3-8B; k/v are
+  tiny under grouped-query attention, and v_proj is TinyLlama's most sensitive.
+- `:int4_mixed_plus`: also up_proj and o_proj at int8 (within ~0.1% of int8 on 8B)
+"""
+function weight_preset(name::Symbol)
+    int8_types = name === :int4 ? () :
+                 name === :int4_mixed ? ("down_proj", "lm_head", "k_proj", "v_proj") :
+                 name === :int4_mixed_plus ? ("down_proj", "lm_head", "k_proj", "v_proj", "up_proj", "o_proj") :
+                 error("unknown weight preset $name (use :int4, :int4_mixed, :int4_mixed_plus)")
+    return w -> any(t -> occursin(t, w), int8_types) ? Int8 : Luminal.Int4
+end
 
 """
     LlamaSession(model, tokenizer, model_dir; max_seq=2048, rope_base=model.rope_base,
@@ -43,7 +63,8 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
                     faster decode on TinyLlama at ~+0.25% perplexity; `Luminal.Int4`
                     (group-wise 4-bit) is smaller and faster again, at a larger cost.
                     A function of the Hugging Face weight name chooses per tensor, e.g.
-                    `name -> occursin("down_proj", name) ? Int8 : Luminal.Int4`.
+                    `name -> occursin("down_proj", name) ? Int8 : Luminal.Int4`, and
+                    a Symbol names a preset (`weight_preset`: `:int4_mixed`, ...).
 """
 mutable struct LlamaSession{M, D}
     model::M
@@ -63,7 +84,8 @@ function LlamaSession(model, tokenizer::LlamaTokenizer, model_dir::String;
                       search::Symbol=:none, decode_weights=nothing)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
-    wdtype = decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
+    wdtype = decode_weights isa Symbol ? weight_preset(decode_weights) :
+             decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
     @info "Loading weights..." model_dir
     weights = load_weights_to_dict(model_dir; device=dev)
     return LlamaSession(model, tokenizer, weights, dev, max_seq, Float32(rope_base), search, wdtype,

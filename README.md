@@ -117,6 +117,13 @@ system memory through GTT):
 | Float32 | 149 ms/token (6.7 tok/s) | | |
 | Float16 | 67 ms/token (14.9 tok/s) | 52 tok/s | 77 tok/s |
 | int8 | 38.3 ms/token (26 tok/s) | 76 tok/s | 109 tok/s |
+| `:int4_mixed_plus` (int8 for sensitive tensors) | 33.7 ms/token (29.7 tok/s) | 84 tok/s | 111 tok/s |
+| `:int4_mixed` | 29.0 ms/token (34.4 tok/s) | 93 tok/s | 112 tok/s |
+| int4 | 23.5 ms/token (42.5 tok/s) | 98 tok/s | 111 tok/s |
+
+WikiText-2 perplexity against Float32 (two texts): int8 0.0%;
+`:int4_mixed_plus` −0.7% / +0.4%; `:int4_mixed` +0.8% / +2.4%; int4 +5.2% / +7.9%.
+See [docs/performance_vs_luminal.md](docs/performance_vs_luminal.md).
 
 For comparison, upstream Luminal reports 229 ms/token for the same checkpoint
 on an NVIDIA H200 with Float32 weights (batch 1; `examples/llm_chat`, September
@@ -178,7 +185,12 @@ batch of 4 clips decodes in about the time of 2.
 - **HIP graph capture** (`capture=true`): a shape-static step, such as the
   decode step, is recorded once and replayed with a single launch.
 - **Weight storage** (`weight_dtype`): `Float16` (transposed, with a GEMV
-  kernel) or `Int8` (group-wise scales, GEMV kernel). Compute stays in Float32.
+  kernel), `Int8` (group-wise scales) or `Luminal.Int4` (4-bit, symmetric, groups
+  of 32, 0.5625 bytes per weight). Compute stays in Float32.
+  - **Per-tensor mixes:** a function of the weight chooses each tensor's format,
+    with named presets `:int4_mixed` and `:int4_mixed_plus`.
+  - **Choosing a mix:** `examples/quant_sensitivity.jl` measures each tensor type's
+    and layer's sensitivity, and `examples/quant_formats.jl` compares formats.
 - **Search** (`compile(g; search=:static | :measured)`): an e-graph rewrite layer
   on Metatheory.jl explores equivalent graphs: expand elimination, scale motion,
   merged Q/K/V and gate/up projections, transposed matmuls, and a precision per

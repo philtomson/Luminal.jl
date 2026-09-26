@@ -75,40 +75,83 @@ function perplexity(policy)
     return exp(nll / n)
 end
 
+# Sections to run (argument 5, comma-separated; default all): baselines, types,
+# layers, mixed, frontier, presets.
+sections = Set(split(get(ARGS, 5, "baselines,types,layers,mixed,frontier"), ","))
+
 base = perplexity(_ -> Float32)
 row(label, policy, p=perplexity(policy)) =
-    (@printf("%-34s perplexity %8.4f  (%+6.2f%%)   weights %5.2f GB\n", label, p, 100 * (p / base - 1), size_gb(policy)); p)
+    (@printf("%-40s perplexity %8.4f  (%+6.2f%%)   weights %5.2f GB\n", label, p, 100 * (p / base - 1), size_gb(policy)); p)
 
-println("\n== baselines")
-row("all Float32", _ -> Float32, base)
-row("all int8", _ -> Int8)
-all4 = row("all int4", _ -> Luminal.Int4)
+if "baselines" in sections
+    println("\n== baselines")
+    row("all Float32", _ -> Float32, base)
+    row("all int8", _ -> Int8)
+    row("all int4", _ -> Luminal.Int4)
+end
 
-println("\n== one tensor type at int4 (rest Float32)")
 kinds = sort!(unique(kind.(matmuls)))
-kind_cost = Dict(k => row("int4: $k", n -> kind(n) == k ? Luminal.Int4 : Float32) / base - 1 for k in kinds)
-
-println("\n== one layer at int4 (rest Float32)")
 layers = sort!(unique(filter(>=(0), layer.(matmuls))))
-layer_cost = Dict(l => row("int4: layer $l", n -> layer(n) == l ? Luminal.Int4 : Float32) / base - 1 for l in layers)
+kind_cost = Dict{String,Float64}(); layer_cost = Dict{Int,Float64}()
+if !isempty(intersect(sections, ["types", "mixed", "frontier"]))
+    println("\n== one tensor type at int4 (rest Float32)")
+    for k in kinds
+        kind_cost[k] = row("int4: $k", n -> kind(n) == k ? Luminal.Int4 : Float32) / base - 1
+    end
+end
+if !isempty(intersect(sections, ["layers", "mixed"]))
+    println("\n== one layer at int4 (rest Float32)")
+    for l in layers
+        layer_cost[l] = row("int4: layer $l", n -> layer(n) == l ? Luminal.Int4 : Float32) / base - 1
+    end
+end
 
-println("\n== sensitivity ranking")
-for (k, c) in sort!(collect(kind_cost), by = last, rev = true)
-    @printf("  %-10s %+6.2f%%\n", k, 100c)
+if !isempty(kind_cost)
+    println("\n== sensitivity ranking")
+    for (k, c) in sort!(collect(kind_cost), by = last, rev = true)
+        @printf("  %-10s %+6.2f%%\n", k, 100c)
+    end
 end
-worst_layers = first.(sort!(collect(layer_cost), by = last, rev = true))
-@printf("  layers, most sensitive first: %s\n", join(worst_layers[1:min(8, end)], ", "))
+if !isempty(layer_cost)
+    worst_layers = first.(sort!(collect(layer_cost), by = last, rev = true))
+    @printf("  layers, most sensitive first: %s\n", join(worst_layers[1:min(8, end)], ", "))
+end
 
-println("\n== mixed: int4 except the most sensitive at int8")
-ranked_kinds = first.(sort!(collect(kind_cost), by = last, rev = true))
-for k in 1:3
-    keep = Set(ranked_kinds[1:k])
-    row("int8: $(join(sort!(collect(keep)), "+"))", n -> kind(n) in keep ? Int8 : Luminal.Int4)
+if "mixed" in sections
+    println("\n== mixed: int4 except the most sensitive at int8")
+    ranked_kinds = first.(sort!(collect(kind_cost), by = last, rev = true))
+    for k in 1:3
+        keep = Set(ranked_kinds[1:k])
+        row("int8: $(join(sort!(collect(keep)), "+"))", n -> kind(n) in keep ? Int8 : Luminal.Int4)
+    end
+    for k in (2, 4)
+        keep = Set(worst_layers[1:min(k, end)])
+        row("int8: layers $(join(sort!(collect(keep)), ","))", n -> layer(n) in keep ? Int8 : Luminal.Int4)
+    end
 end
-for k in (2, 4)
-    keep = Set(worst_layers[1:min(k, end)])
-    row("int8: layers $(join(sort!(collect(keep)), ","))", n -> layer(n) in keep ? Int8 : Luminal.Int4)
+
+if "frontier" in sections
+    # Size/accuracy frontier: promote tensor types from int4 to int8 in order of
+    # isolated 4-bit loss per extra GB (the loss of that type alone at int4, from
+    # "types", divided by the bytes int8 adds), evaluating each cumulative policy.
+    println("\n== frontier: int4, promoting tensor types to int8 by loss per extra GB")
+    extra_gb(k) = sum(length(W[n]) for n in matmuls if kind(n) == k) * (bytes_per(Int8) - bytes_per(Luminal.Int4)) / 2^30
+    order = sort(kinds, by = k -> kind_cost[k] / extra_gb(k), rev = true)
+    for k in order
+        @printf("  %-10s %+6.2f%% alone, +%.2f GB at int8: %6.2f%%/GB\n", k, 100kind_cost[k], extra_gb(k), 100kind_cost[k] / extra_gb(k))
+    end
+    row("all int4", _ -> Luminal.Int4)
+    for i in 1:length(order)-1
+        keep = Set(order[1:i])
+        row("int8: " * join(order[1:i], "+"), n -> kind(n) in keep ? Int8 : Luminal.Int4)
+    end
+    row("all int8", _ -> Int8)
 end
-keep_k = Set(ranked_kinds[1:1]); keep_l = Set(worst_layers[1:min(2, end)])
-row("int8: $(ranked_kinds[1]) + layers $(join(sort!(collect(keep_l)), ","))",
-    n -> (kind(n) in keep_k || layer(n) in keep_l) ? Int8 : Luminal.Int4)
+
+if "presets" in sections
+    println("\n== presets (weight_preset)")
+    for name in (:int4, :int4_mixed, :int4_mixed_plus)
+        row(string(name), weight_preset(name))
+    end
+    row("all int8", _ -> Int8)
+end
