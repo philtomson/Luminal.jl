@@ -91,3 +91,25 @@ for dev in devices
         end
     end
 end
+
+# A LlamaSession reuses its weights and compiled graphs across calls; batched and
+# single-prompt generation agree. Needs the TinyLlama checkpoint (tinyllama_chat/).
+const TINYLLAMA_DIR = get(ENV, "TINYLLAMA_DIR", joinpath(@__DIR__, "..", "tinyllama_chat"))
+if isfile(joinpath(TINYLLAMA_DIR, "model.safetensors")) && !(Luminal.get_device() isa CPUDevice)
+    @testset "LlamaSession reuse (TinyLlama)" begin
+        tok = LlamaTokenizer(TINYLLAMA_DIR)
+        model = Llama(Graph(), nothing; vocab_size=32000, hidden=2048, n_layers=22, n_heads=32,
+                      n_kv_heads=4, intermediate=5632)
+        s = LlamaSession(model, tok, TINYLLAMA_DIR; max_seq=128, rope_base=10000f0, decode_weights=Int8)
+        chat(p) = "<|user|>\n$p</s>\n<|assistant|>\n"
+        prompts = chat.(["What is the capital of France?", "List three prime numbers."])
+        first = generate(s, prompts; max_new_tokens=12)
+        @test length(s.prefill) == 1 && length(s.decode) == 1
+        @test generate(s, prompts; max_new_tokens=12) == first      # reused cache and graphs
+        @test length(s.prefill) == 1 && length(s.decode) == 1
+        @test generate(s, prompts[2]; max_new_tokens=12) == first[2]
+        @test occursin("Paris", first[1])
+    end
+else
+    @info "Skipping LlamaSession test (no $TINYLLAMA_DIR or no GPU)"
+end

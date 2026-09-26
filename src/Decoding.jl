@@ -11,194 +11,207 @@ using ..Luminal.LlamaTokenization
 using AMDGPU
 using JSON3
 
-export greedy_decode, llama_generate
+export greedy_decode, llama_generate, LlamaSession, generate
 
 """
-    llama_generate(model, tokenizer, prompt, model_dir; kwargs...) -> String
-    llama_generate(model, tokenizer, prompts::Vector{String}, model_dir; kwargs...) -> Vector{String}
+    LlamaSession(model, tokenizer, model_dir; max_seq=2048, rope_base=500000f0,
+                 device=nothing, search=:none, decode_weights=nothing)
 
-End-to-end greedy text generation for Llama-style (decoder-only) models. A vector
-of prompts is generated as one batch: one prefill and one decode step per token
-for all of them, which raises throughput because decode is bound by reading the
-weights, not by the number of sequences.
+A loaded Llama-style model for repeated generation. The weights are read once;
+compiled graphs are built on first use and kept:
+- prefill graphs per (padded prompt length, batch size). Prompts are right-padded
+  to a bucket (16, 32, 64, 128, 256, then multiples of 256) so similar lengths
+  share a graph. Attention is causal, so padding cannot change the real positions.
+- decode graphs and their device-resident KV caches per batch size. Reusing the
+  cache arrays keeps a captured HIP graph valid from one call to the next.
 
-# Steps
-1. Encode each prompt with `tokenizer` (adds BOS).
-2. Prefill: run the prompts forward in one graph, right-padded to the longest
-   (attention is causal, so padding cannot affect the real positions), and take
-   each prompt's last-position logits.
-3. Decode: repeatedly call `llama_decode_step!` with a device-resident KV cache.
-   Every sequence runs at its own position; a finished sequence (EOS or
-   `max_new_tokens`) stops advancing while the others continue.
-4. Decode each sequence's generated token ids back to a string.
+Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
 
 # Arguments
-- `model`         : A `Luminal.NN.Llama` (or `Phi3`) instance
-- `tokenizer`     : A `LlamaTokenizer` loaded from the model directory
-- `prompt(s)`     : Input string, or a vector of them
-- `model_dir`     : Path to the directory containing `.safetensors` weights
-- `max_new_tokens`: Maximum tokens to generate per sequence (default 200)
-- `max_seq`       : KV cache capacity (default 2048)
+- `model`         : a `Luminal.NN.Llama` (or `Phi3`) instance, used as the architecture template
+- `tokenizer`     : a `LlamaTokenizer` loaded from the model directory
+- `model_dir`     : directory containing the `.safetensors` weights
+- `max_seq`       : KV cache capacity per sequence (default 2048)
 - `rope_base`     : RoPE base frequency (500000 for Llama-3, 10000 for Llama-2/Phi-3)
-- `device`        : Device to run on; defaults to `get_device()`
-- `search`        : `:none`, `:static` or `:measured`: compile the decode graph
-                    through the e-graph rewrite layer (see `compile`). On GPU the
-                    search also chooses Float16 weights per matmul. `:measured`
-                    results are cached per model and device.
+- `device`        : device to run on; defaults to `get_device()`
+- `search`        : `:none`, `:static` or `:measured`: compile the graphs through the
+                    e-graph rewrite layer (see `compile`). On GPU the search also
+                    chooses Float16 weights per matmul. `:measured` results are
+                    cached per model and device.
 - `decode_weights`: storage for decode's matmul weights (default `Float16` on GPU,
                     `Float32` on CPU). `Int8` (group-wise int8, weight-only) is ~1.6x
                     faster decode on TinyLlama at ~+0.25% perplexity.
 """
-function llama_generate(model, tokenizer::LlamaTokenizer, prompt::String, model_dir::String; kwargs...)
-    return only(llama_generate(model, tokenizer, [prompt], model_dir; kwargs...))
+mutable struct LlamaSession{M, D}
+    model::M
+    tokenizer::LlamaTokenizer
+    weights::Dict{String, Any}       # Float32 weights on `device`, shared by every graph
+    device::D
+    max_seq::Int
+    rope_base::Float32
+    search::Symbol
+    decode_weights::Type
+    prefill::Dict{Tuple{Int,Int}, Any}   # (padded length, batch) => compiled prefill
+    decode::Dict{Int, Any}               # batch => compiled decode step and its cache
 end
 
-function llama_generate(model,
-                         tokenizer::LlamaTokenizer,
-                         prompts::Vector{String},
-                         model_dir::String;
-                         max_new_tokens::Int=200,
-                         max_seq::Int=2048,
-                         rope_base::Float32=500000f0,
-                         device=nothing,
-                         search::Symbol=:none,
-                         decode_weights::Union{Nothing,Type}=nothing)
+function LlamaSession(model, tokenizer::LlamaTokenizer, model_dir::String;
+                      max_seq::Int=2048, rope_base::Float32=500000f0, device=nothing,
+                      search::Symbol=:none, decode_weights::Union{Nothing,Type}=nothing)
+    dev = device === nothing ? get_device() : device
+    on_gpu = dev isa Luminal.AbstractGPUDevice
+    wdtype = decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
+    @info "Loading weights..." model_dir
+    weights = load_weights_to_dict(model_dir; device=dev)
+    return LlamaSession(model, tokenizer, weights, dev, max_seq, rope_base, search, wdtype,
+                        Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}())
+end
 
-    target_device = (device === nothing ? get_device() : device)
+Base.show(io::IO, s::LlamaSession) =
+    print(io, "LlamaSession($(nameof(typeof(s.model))), $(s.device), decode weights $(s.decode_weights), ",
+          "$(length(s.prefill)) prefill / $(length(s.decode)) decode graphs compiled)")
+
+# Padded prefill length for a prompt of `n` tokens.
+_prefill_bucket(n::Int) = n <= 256 ? max(16, nextpow(2, n)) : cld(n, 256) * 256
+
+# The compiled prefill graph for (slen, B), built on first use.
+function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
+    get!(s.prefill, (slen, B)) do
+        g = Graph(); reg = WeightRegistry()
+        m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
+        input = Luminal.tensor(g, [slen, B])
+        out, kvs = m(input, 0; return_kv=true)
+        load_weights!(g, reg, s.weights; device=s.device)
+        retain = vcat(out.id, [t.id for kv in kvs for t in kv])
+        on_gpu = s.device isa Luminal.AbstractGPUDevice
+        # Prefill multiplies each weight by slen*B >= 16 columns, where rocBLAS's
+        # Float32 GEMM beats the Float16 GEMV (which suits decode's single column).
+        exec = if s.search === :none
+            @info "Compiling prefill graph ($slen × $B)..."
+            compile(g; device=s.device, retain=retain)
+        else
+            @info "Searching equivalent prefill graphs ($(s.search), $slen × $B)..."
+            ids = Luminal.to_device(zeros(Float32, slen, B), s.device)
+            compile(g; device=s.device, retain=vcat(retain, input.id), search=s.search,
+                    precision=on_gpu, search_inputs=Dict{Int,Any}(input.id => ids))
+        end
+        (exec=exec, input_id=input.id, out_id=out.id, kv_ids=[(k.id, v.id) for (k, v) in kvs])
+    end
+end
+
+# The compiled decode step and KV cache for batch size B, built on first use.
+function _decode_graph(s::LlamaSession, B::Int)
+    get!(s.decode, B) do
+        g = Base.invokelatest(Graph); reg = WeightRegistry()
+        m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
+        idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base)
+        load_weights!(g, reg, s.weights; device=s.device)
+        retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
+                      idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids)
+        # The decode graph is shape-static (positions are data), so on AMD GPUs it is
+        # captured once as a HIP graph and replayed each token.
+        capture = s.device isa Luminal.AMDDevice
+        wd = s.decode_weights
+        exec = if s.search === :none
+            @info "Compiling decode graph (batch $B)..."
+            compile(g; device=s.device, retain=retain, free_intermediates=false,
+                    weight_dtype=wd, capture=capture)
+        else
+            @info "Searching equivalent decode graphs ($(s.search), batch $B)..."
+            compile(g; device=s.device, retain=retain, free_intermediates=false,
+                    capture=capture, search=s.search,
+                    precision=wd === Int8 ? (:weights, :int8) : wd === Float16 ? :weights : false)
+        end
+        attn = s.model.layers[1].attention
+        cache = LlamaKVCacheState(length(s.model.layers), attn.n_kv_heads, attn.head_dim;
+                                  batch=B, max_seq=s.max_seq, device=s.device)
+        (exec=exec, idg=idg, cache=cache)
+    end
+end
+
+"""
+    generate(session, prompt; max_new_tokens=200) -> String
+    generate(session, prompts::Vector{String}; max_new_tokens=200) -> Vector{String}
+
+Greedy generation with a `LlamaSession`. A vector of prompts is generated as one
+batch: one prefill and one decode step per token for all of them, which raises
+throughput because decode is bound by reading the weights, not by the number of
+sequences.
+
+1. Encode each prompt (adds BOS).
+2. Prefill: the prompts right-padded in one graph; take each prompt's
+   last-position logits and copy its K/V into the cache.
+3. Decode: `llama_decode_step!` until each sequence has produced EOS or
+   `max_new_tokens`. Every sequence runs at its own position, and a finished one
+   stops advancing while the others continue.
+4. Return each sequence's generated text.
+"""
+generate(s::LlamaSession, prompt::String; kwargs...) = only(generate(s, [prompt]; kwargs...))
+
+function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=200)
     B = length(prompts)
     B >= 1 || error("no prompts")
-
-    # 1. Encode prompts
-    prompt_ids = [LlamaTokenization.encode(tokenizer, p; bos=true) for p in prompts]
+    prompt_ids = [LlamaTokenization.encode(s.tokenizer, p; bos=true) for p in prompts]
     plens = length.(prompt_ids)
-    @info "Prompts: $(B) × ≤$(maximum(plens)) tokens"
-    maximum(plens) < max_seq || error("prompt longer than max_seq=$max_seq")
+    maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
 
-    # 2. Prefill — all prompts in one graph, right-padded with token 0 to the longest.
-    #    With `search`, the length is padded further to a power-of-two bucket so one
-    #    searched graph (cached per bucket) serves every prompt up to that length.
-    #    Attention is causal, so padding cannot change the first `plen` positions.
-    slen = search === :none ? maximum(plens) : max(16, nextpow(2, maximum(plens)))
-    pfx_graph = Graph()
-    pfx_reg   = WeightRegistry()
-    pfx_model = _rebuild_model_like(model, pfx_graph, pfx_reg; rope_base=rope_base)
-    pfx_input = Luminal.tensor(pfx_graph, [slen, B])
-    pfx_out, pfx_kvs = pfx_model(pfx_input, 0; return_kv=true)
-
-    # Mark K/V tensors for retrieval so we can populate the cache
-    push!(pfx_graph.to_retrieve, pfx_out.id)
-    for (k, v) in pfx_kvs
-        push!(pfx_graph.to_retrieve, k.id)
-        push!(pfx_graph.to_retrieve, v.id)
-    end
-
-    @info "Loading weights for prefill graph..."
-    # We load ALL weights into a dictionary on the target device once,
-    # and reuse them across all graphs to save VRAM.
-    weights_dict = load_weights_to_dict(model_dir; device=target_device)
-    load_weights!(pfx_graph, pfx_reg, weights_dict; device=target_device)
-
-    retain_pfx = collect(pfx_graph.to_retrieve)
-    on_gpu = target_device isa Luminal.AbstractGPUDevice
-    # Decode (one column per sequence per matmul) is fastest with Float16 weights.
-    # Prefill is not: the Float16 kernel is a GEMV looping over the columns, while
-    # rocBLAS's Float32 GEMM stays bandwidth-bound. Measured on TinyLlama: f16 is ~1x
-    # f32 at 16 columns and ~3x slower at 64+, so prefill uses Float16 only for very
-    # few columns.
-    wdtype = decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
-    pfx_wdtype = (on_gpu && slen * B <= 8) ? Float16 : Float32
+    # Prefill
+    slen = _prefill_bucket(maximum(plens))
+    pf = _prefill_graph(s, slen, B)
     ids = zeros(Float32, slen, B)
     for (b, p) in enumerate(prompt_ids)
         ids[1:plens[b], b] .= p
     end
-    pfx_inputs = Dict{Int,Any}(pfx_input.id => ids)
-    pfx_exec = if search === :none
-        compile(pfx_graph; device=target_device, retain=retain_pfx, weight_dtype=pfx_wdtype)
-    else
-        @info "Searching equivalent prefill graphs ($search, bucket $slen × $B)..."
-        compile(pfx_graph; device=target_device, retain=vcat(retain_pfx, pfx_input.id),
-                search=search, precision=on_gpu,
-                search_inputs=Dict{Int,Any}(pfx_input.id => Luminal.to_device(ids, target_device)))
-    end
-
-    pfx_results = pfx_exec(pfx_inputs; device=target_device)
-    prefill_logits = Array{Float32}(pfx_results[pfx_out.id])  # (vocab, slen, B)
-
-    # Greedy-pick each sequence's first generated token from its last prompt position
-    eos_id = tokenizer.eos_id
-    generated = [[argmax(view(prefill_logits, :, plens[b], b)) - 1] for b in 1:B]  # 0-indexed
+    res = pf.exec(Dict{Int,Any}(pf.input_id => ids); device=s.device)
+    logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B)
+    eos_id = s.tokenizer.eos_id
+    generated = [[argmax(view(logits, :, plens[b], b)) - 1] for b in 1:B]   # 0-indexed
     done = [g[1] == eos_id || max_new_tokens <= 1 for g in generated]
 
-    # 3. KV cache: sequence b's next token goes to position plens[b]
-    first_attn = model.layers[1].attention
-    cache = LlamaKVCacheState(
-        length(model.layers), first_attn.n_kv_heads, first_attn.head_dim;
-        batch=B, max_seq=max_seq, device=target_device)
+    # KV cache: sequence b's next token goes to position plens[b]. Slots past a
+    # sequence's position are never read, so the reused cache needs no clearing.
+    dc = _decode_graph(s, B)
+    cache = dc.cache
     cache.positions .= plens
-    for (i, (k, v)) in enumerate(pfx_kvs)
+    for (i, (k, v)) in enumerate(pf.kv_ids)
         # Prefill K/V (head_dim, slen, kv_heads, B) -> cache (head_dim, max_seq, kv_heads, B),
         # in place on the device; only each prompt's own positions.
         for b in 1:B
-            view(cache.self_cache[i][1], :, 1:plens[b], :, b) .= view(pfx_results[k.id], :, 1:plens[b], :, b)
-            view(cache.self_cache[i][2], :, 1:plens[b], :, b) .= view(pfx_results[v.id], :, 1:plens[b], :, b)
+            view(cache.self_cache[i][1], :, 1:plens[b], :, b) .= view(res[k], :, 1:plens[b], :, b)
+            view(cache.self_cache[i][2], :, 1:plens[b], :, b) .= view(res[v], :, 1:plens[b], :, b)
         end
     end
 
-    # Free prefill memory
-    pfx_exec = nothing
-    pfx_graph = nothing
-    pfx_results = nothing
-    prefill_logits = nothing
-    GC.gc()
-    Luminal.reclaim!(target_device)
-
-    avail = Luminal.available_memory(target_device)
-    if avail >= 0
-        @info "VRAM before decode loop" available_mb=avail
-    end
-
-    @info "Compiling position-agnostic decode graph (batch $B)..."
-    dg = Base.invokelatest(Graph)
-    dreg = WeightRegistry()
-    dm = _rebuild_model_like(model, dg, dreg; rope_base=rope_base)
-    idg = build_llama_decode_step!(dm, dg, 0; max_seq=max_seq, batch=B, rope_base=rope_base)
-
-    load_weights!(dg, dreg, weights_dict; device=target_device)
-    retain_nodes = vcat(
-        idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
-        idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids
-    )
-    # The decode graph is shape-static (positions are data), so on AMD GPUs it is
-    # captured once as a HIP graph and replayed each token.
-    capture = target_device isa Luminal.AMDDevice
-    exec_fn = if search === :none
-        compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
-                weight_dtype=wdtype, capture=capture)
-    else
-        @info "Searching equivalent decode graphs ($search)..."
-        compile(dg; device=target_device, retain=retain_nodes, free_intermediates=false,
-                capture=capture, search=search,
-                precision=wdtype === Int8 ? (:weights, :int8) : wdtype === Float16 ? :weights : false)
-    end
-
-    # 4. Decode. A finished sequence keeps being fed (its last token, at the same
-    #    position, so it never runs into max_seq) until every sequence is done.
+    # Decode. A finished sequence keeps being fed (its last token, at the same
+    # position, so it never runs into max_seq) until every sequence is done.
     while !all(done)
         tokens = [g[end] for g in generated]
-        logits = llama_decode_step!(exec_fn, idg, cache, tokens;
-                                    advance=.!done, device=target_device)
-        host = Array{Float32}(logits)                                     # (vocab, 1, B)
+        out = llama_decode_step!(dc.exec, dc.idg, cache, tokens; advance=.!done, device=s.device)
+        host = Array{Float32}(out)                                          # (vocab, 1, B)
         for b in 1:B
             done[b] && continue
-            next = argmax(view(host, :, 1, b)) - 1                        # 0-indexed
+            next = argmax(view(host, :, 1, b)) - 1                          # 0-indexed
             push!(generated[b], next)
             done[b] = next == eos_id || length(generated[b]) >= max_new_tokens ||
-                      cache.positions[b] >= max_seq
+                      cache.positions[b] >= s.max_seq
         end
     end
 
-    # 5. Decode token IDs to text (the generated tokens only)
-    return [LlamaTokenization.decode(tokenizer, g) for g in generated]
+    return [LlamaTokenization.decode(s.tokenizer, g) for g in generated]
+end
+
+"""
+    llama_generate(model, tokenizer, prompt(s), model_dir; max_new_tokens=200, kwargs...)
+
+One-shot generation: builds a `LlamaSession` (loading the weights and compiling
+the graphs) and generates. For more than one call, create a `LlamaSession` once
+and use `generate`, which reuses the weights and compiled graphs. The remaining
+keyword arguments are `LlamaSession`'s.
+"""
+function llama_generate(model, tokenizer::LlamaTokenizer, prompts::Union{String, Vector{String}},
+                        model_dir::String; max_new_tokens::Int=200, kwargs...)
+    return generate(LlamaSession(model, tokenizer, model_dir; kwargs...), prompts;
+                    max_new_tokens=max_new_tokens)
 end
 
 """

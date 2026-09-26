@@ -3,8 +3,11 @@
 # Usage:
 #   julia --project=. examples/tinyllama_chat.jl [model_dir] [prompt] [max_tokens] [rope_base]
 #       [--chat] [--int8] [--search=static|measured] [--prompt=another --prompt=...]
+#       [--interactive]
 #
 # Extra `--prompt=` flags are generated together with `prompt` as one batch.
+# `--interactive` then keeps reading prompts from stdin (one per line) and answers
+# each with the same LlamaSession: weights and compiled graphs are reused.
 #
 # Defaults:
 #   model_dir = /devel/phil/Llama-3.2
@@ -78,13 +81,13 @@ function main()
     println("-" ^ 40)
 
     t0 = time()
-    responses = llama_generate(model, tok, prompts, model_dir;
-                               max_new_tokens=max_tokens,
-                               max_seq=256,
-                               device=device,
-                               rope_base=rope_base,  # Decided by command-line or default
-                               search=search,
-                               decode_weights=decode_weights)
+    session = LlamaSession(model, tok, model_dir;
+                           max_seq=256,
+                           device=device,
+                           rope_base=rope_base,  # Decided by command-line or default
+                           search=search,
+                           decode_weights=decode_weights)
+    responses = generate(session, prompts; max_new_tokens=max_tokens)
     t1 = time()
 
     for (p, r) in zip(prompts, responses)
@@ -95,6 +98,19 @@ function main()
     n_gen = sum(r -> length(Luminal.encode(tok, r)), responses)
     elapsed = t1 - t0
     @printf "\n[Stats] %d tokens in %.1fs, including weight loading and compilation\n" n_gen elapsed
+
+    if "--interactive" in ARGS
+        println("Enter a prompt per line (empty line or EOF to quit).")
+        while true
+            print("\n>> ")
+            line = readline()
+            isempty(strip(line)) && break
+            p = chat_mode ? "<|user|>\n$line</s>\n<|assistant|>\n" : line
+            t = @elapsed r = generate(session, p; max_new_tokens=max_tokens)
+            println(r)
+            @printf "[%.2fs]\n" t
+        end
+    end
     println("=========================================")
 end
 

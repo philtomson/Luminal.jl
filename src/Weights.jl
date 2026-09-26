@@ -77,41 +77,10 @@ function load_weights!(graph::Luminal.Graph,
                 sym = Symbol(key)
                 !haskey(header, sym) && continue
 
-                entry   = header[sym]
-                dtype   = String(entry[:dtype])
-                shape   = tuple(Int.(entry[:shape])...)
-                start   = Int(entry[:data_offsets][1]) + header_length
-                stop    = Int(entry[:data_offsets][2]) + header_length
+                data = _load_tensor(fio, header[sym], header_length, device)
+                data === nothing && error("Unsupported dtype $(header[sym][:dtype]) for tensor $key")
 
-                # Read raw bytes directly to bypass SafeTensors.jl's BF16 error
-                seek(fio, start)
-                raw_bytes = read(fio, stop - start)
-
-                # Convert based on dtype
-                if dtype == "F32"
-                    data = reinterpret(Float32, raw_bytes)
-                elseif dtype == "BF16"
-                    # Reinterpret as UInt16, cast to UInt32, shift left 16, reinterpret as Float32
-                    u16 = reinterpret(UInt16, raw_bytes)
-                    data = map(u -> reinterpret(Float32, UInt32(u) << 16), u16)
-                elseif dtype == "F16"
-                    data = Float32.(reinterpret(Float16, raw_bytes))
-                else
-                    error("Unsupported dtype $dtype for tensor $key")
-                end
-
-                # Reshape and permute to match Julia's column-major format
-                data = Base.reshape(collect(data), reverse(shape)...)
-                if length(shape) > 1
-                    data = Array(permutedims(data, length(shape):-1:1))
-                end
-
-                graph.tensors[(node_id, 1)] =
-                    Luminal.to_device(Dict(node_id => data), device)[node_id]
-
-                # Let GC collect the raw array
-                raw_bytes = nothing
-                data = nothing
+                graph.tensors[(node_id, 1)] = data
                 loaded += 1
             end
         end
@@ -155,6 +124,27 @@ function load_weights!(graph::Luminal.Graph, reg::WeightRegistry, tensors::Dict{
     return load_weights!(graph, reg, Dict{String, Any}(k => v for (k,v) in tensors); device=device)
 end
 
+# Read one safetensors entry as a Float32 array on `device`, in Julia's
+# column-major layout with the tensor's logical (row-major) shape. The raw
+# F32/F16/BF16 data is uploaded as stored (BF16 and F16 are half the bytes of
+# Float32), then converted and transposed on the device. `nothing` for other dtypes.
+function _load_tensor(fio::IO, entry, header_length::Integer, device::Luminal.AbstractDevice)
+    dtype = String(entry[:dtype])
+    T = dtype == "F32" ? Float32 : dtype == "F16" ? Float16 : dtype == "BF16" ? UInt16 : nothing
+    T === nothing && return nothing
+    shape = Int.(entry[:shape])
+    start = Int(entry[:data_offsets][1]) + header_length
+    stop  = Int(entry[:data_offsets][2]) + header_length
+    seek(fio, start)
+    raw = Vector{T}(undef, (stop - start) ÷ sizeof(T))
+    read!(fio, raw)
+    # Row-major data read column-major is the transpose: reversed dims.
+    d = Luminal.to_device(Base.reshape(raw, reverse(shape)...), device)
+    f = T === UInt16 ? reinterpret.(Float32, UInt32.(d) .<< 16) :   # BF16: the high half of a Float32
+        T === Float16 ? Float32.(d) : d
+    return length(shape) > 1 ? permutedims(f, length(shape):-1:1) : f
+end
+
 """
     load_weights_to_dict(path; device=get_device()) -> Dict{String, Any}
 
@@ -179,41 +169,9 @@ function load_weights_to_dict(path::String;
                 haskey(tensors, key) && continue # Skip if already loaded from previous shard
 
                 !haskey(entry, :dtype) && continue # Skip if not a tensor entry
-                dtype   = String(entry[:dtype])
-                shape   = tuple(Int.(entry[:shape])...)
-                offsets = entry[:data_offsets]
-                start   = Int(offsets[1]) + header_length
-                stop    = Int(offsets[2]) + header_length
-
-                seek(fio, start)
-                raw_bytes = read(fio, stop - start)
-
-                if dtype == "F32"
-                    data = reinterpret(Float32, raw_bytes)
-                elseif dtype == "BF16"
-                    u16 = reinterpret(UInt16, raw_bytes)
-                    data = map(u -> reinterpret(Float32, UInt32(u) << 16), u16)
-                elseif dtype == "F16"
-                    data = reinterpret(Float16, raw_bytes)
-                else
-                    # Skip unknown dtypes (like metadata)
-                    continue
-                end
-
-                # Reshape and permute to match Julia's column-major format
-                permuted = Base.reshape(collect(data), reverse(shape)...)
-                if length(shape) > 1
-                    permuted = Array(permutedims(permuted, length(shape):-1:1))
-                end
-                
-                # Use Float32 even on GPU (diagnostics)
-                # if device isa Luminal.CUDADevice || device isa Luminal.AMDDevice
-                #     permuted = convert(Array{Float16}, permuted)
-                # else
-                    permuted = convert(Array{Float32}, permuted)
-                # end
-
-                tensors[key] = Luminal.to_device(permuted, device)
+                data = _load_tensor(fio, entry, header_length, device)
+                data === nothing && continue       # unsupported dtype
+                tensors[key] = data
             end
         end
     end

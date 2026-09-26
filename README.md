@@ -46,10 +46,26 @@ text, tokens = transcribe("whisper-tiny", "speech.wav")   # ≤ 30 s, decoded wi
 
 ### Generate text (Llama)
 
+```julia
+using Luminal, Luminal.NN
+tok = LlamaTokenizer("TinyLlama-1.1B-Chat")
+model = Llama(Graph(), nothing; vocab_size=32000, hidden=2048, n_layers=22, n_heads=32,
+              n_kv_heads=4, intermediate=5632)
+session = LlamaSession(model, tok, "TinyLlama-1.1B-Chat"; rope_base=10000f0, decode_weights=Int8)
+generate(session, "Why is the sky blue?"; max_new_tokens=100)          # compiles on first use
+generate(session, ["First prompt", "Second prompt"])                   # one batch
+```
+
+A session loads the weights once and keeps its compiled prefill graphs (per
+padded prompt length and batch size) and decode graphs (per batch size), so
+later calls cost only the generation itself. `llama_generate(model, tok, prompt, dir)`
+is the one-shot form.
+
 ```bash
 julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "Why is the sky blue?"
 julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --int8 --search=measured "..."
 julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "First?" "--prompt=Second?"   # one batch
+julia --project=. examples/tinyllama_chat.jl path/to/TinyLlama-1.1B-Chat --chat --int8 "Hi" --interactive          # keep chatting
 ```
 
 ## Installation
@@ -107,6 +123,11 @@ batch-1 times here include copying the logits to the host for the argmax.)
 
 Perplexity on the evaluation passage: Float32 12.1229, Float16 12.1228, int8 12.1526.
 
+With a `LlamaSession`, a warm call generating 40 tokens for 4 prompts takes
+0.47 s end to end, prefill included. Loading TinyLlama's weights takes 1.3 s:
+they are uploaded as stored (BF16) and converted on the GPU. The first load in
+a process also compiles those kernels, and takes ~16 s.
+
 Decode started this work at 893 ms/token. It is now bound by memory bandwidth:
 the int8 GEMVs run at ~213 GB/s. What remains on top of them is kernel launch
 overhead.
@@ -159,7 +180,7 @@ figure includes weight loading and graph compilation.
   - audio encoder and text decoder
   - cached greedy decoding (`greedy_decode`, `transcribe`)
 - **Weights**: safetensors (F32/F16/BF16) mapped by Hugging Face key through a
-  `WeightRegistry`.
+  `WeightRegistry`. They are converted to Float32 and transposed on the device.
 - **Tokenizers**: SentencePiece BPE (Llama, Phi-3) and byte-level BPE (Whisper).
 
 ### Training
