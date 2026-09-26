@@ -1,13 +1,13 @@
 # Batched decode throughput on a Llama-family checkpoint: time one decode step for
 # several batch sizes and report per-step latency and aggregate tokens/s.
 #
-#   julia --project=. examples/batched_decode.jl path/to/checkpoint [f16|int8|f32] [1,2,4,8] [none|static|measured]
+#   julia --project=. examples/batched_decode.jl path/to/checkpoint [f16|int8|int4|f32] [1,2,4,8] [none|static|measured]
 using Luminal
 using Luminal.NN
 using Printf
 
 model_dir = ARGS[1]
-wdtype = get(Dict("f16" => Float16, "int8" => Int8, "f32" => Float32), get(ARGS, 2, "int8"), Int8)
+wdtype = get(Dict("f16" => Float16, "int8" => Int8, "int4" => Luminal.Int4, "f32" => Float32), get(ARGS, 2, "int8"), Int8)
 batches = parse.(Int, split(get(ARGS, 3, "1,2,4,8"), ","))
 search = Symbol(get(ARGS, 4, "none"))
 device = get_device()

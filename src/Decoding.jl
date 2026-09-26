@@ -40,7 +40,10 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
                     cached per model and device.
 - `decode_weights`: storage for decode's matmul weights (default `Float16` on GPU,
                     `Float32` on CPU). `Int8` (group-wise int8, weight-only) is ~1.6x
-                    faster decode on TinyLlama at ~+0.25% perplexity.
+                    faster decode on TinyLlama at ~+0.25% perplexity; `Luminal.Int4`
+                    (group-wise 4-bit) is smaller and faster again, at a larger cost.
+                    A function of the Hugging Face weight name chooses per tensor, e.g.
+                    `name -> occursin("down_proj", name) ? Int8 : Luminal.Int4`.
 """
 mutable struct LlamaSession{M, D}
     model::M
@@ -50,14 +53,14 @@ mutable struct LlamaSession{M, D}
     max_seq::Int
     rope_base::Float32
     search::Symbol
-    decode_weights::Type
+    decode_weights::Any              # a Type, or name -> Type (per tensor)
     prefill::Dict{Tuple{Int,Int}, Any}   # (padded length, batch) => compiled prefill
     decode::Dict{Int, Any}               # batch => compiled decode step and its cache
 end
 
 function LlamaSession(model, tokenizer::LlamaTokenizer, model_dir::String;
                       max_seq::Int=2048, rope_base::Real=model.rope_base, device=nothing,
-                      search::Symbol=:none, decode_weights::Union{Nothing,Type}=nothing)
+                      search::Symbol=:none, decode_weights=nothing)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
     wdtype = decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
@@ -112,6 +115,11 @@ function _decode_graph(s::LlamaSession, B::Int)
         # captured once as a HIP graph and replayed each token.
         capture = s.device isa Luminal.AMDDevice
         wd = s.decode_weights
+        if !(wd isa Type)
+            # per-tensor policy by weight name -> by node id (other tensors: Float32)
+            by_id = Dict{Int, Type}(id => wd(name) for (name, id) in reg.mapping)
+            wd = id -> get(by_id, id, Float32)
+        end
         exec = if s.search === :none
             @info "Compiling decode graph (batch $B)..."
             compile(g; device=s.device, retain=retain, free_intermediates=false,

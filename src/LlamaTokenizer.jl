@@ -149,38 +149,66 @@ end
 # BPE Logic
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Byte-pair encoding of one pre-token: repeatedly merge the adjacent pair with the
+# lowest merge rank (leftmost first on ties). Symbols form a linked list and
+# candidate pairs sit in a min-heap keyed by (rank, position), so a long input is
+# O(n log n) -- a SentencePiece-style tokenizer has no pre-split, and the whole
+# text is one "word". Heap entries whose symbols have since changed are skipped.
 function _bpe_encode(word::Vector{String}, merge_ranks::Dict{Tuple{String,String},Int})
-    symbols = copy(word)
-    isempty(symbols) && return symbols
-
-    while length(symbols) > 1
-        best_rank = typemax(Int)
-        best_idx  = -1
-        for i in 1:(length(symbols) - 1)
-            pair = (symbols[i], symbols[i+1])
-            rank = get(merge_ranks, pair, typemax(Int))
-            if rank < best_rank
-                best_rank = rank
-                best_idx  = i
-            end
-        end
-        best_rank == typemax(Int) && break
-
-        merged = symbols[best_idx] * symbols[best_idx + 1]
-        new_symbols = String[]
-        i = 1
-        while i <= length(symbols)
-            if i == best_idx
-                push!(new_symbols, merged)
-                i += 2
-            else
-                push!(new_symbols, symbols[i])
-                i += 1
-            end
-        end
-        symbols = new_symbols
+    n = length(word)
+    n <= 1 && return copy(word)
+    sym = copy(word)
+    nxt = collect(2:n+1); nxt[n] = 0
+    prv = collect(0:n-1)
+    alive = trues(n)
+    heap = Tuple{Int,Int,String,String}[]       # (rank, left position, left, right)
+    function push_pair!(i)
+        j = nxt[i]
+        j == 0 && return
+        r = get(merge_ranks, (sym[i], sym[j]), 0)
+        r > 0 && _heap_push!(heap, (r, i, sym[i], sym[j]))
     end
-    return symbols
+    for i in 1:n-1
+        push_pair!(i)
+    end
+    while !isempty(heap)
+        r, i, a, b = _heap_pop!(heap)
+        (alive[i] && sym[i] == a && nxt[i] != 0 && sym[nxt[i]] == b) || continue   # stale
+        j = nxt[i]
+        sym[i] = a * b
+        alive[j] = false
+        nxt[i] = nxt[j]
+        nxt[j] != 0 && (prv[nxt[j]] = i)
+        prv[i] != 0 && push_pair!(prv[i])
+        push_pair!(i)
+    end
+    out = String[]
+    i = 1
+    while i != 0
+        push!(out, sym[i]); i = nxt[i]
+    end
+    return out
+end
+
+function _heap_push!(h, x)
+    push!(h, x); i = length(h)
+    while i > 1 && h[i] < h[i >> 1]
+        h[i], h[i >> 1] = h[i >> 1], h[i]; i >>= 1
+    end
+end
+function _heap_pop!(h)
+    top = h[1]; last = pop!(h)
+    if !isempty(h)
+        h[1] = last; i = 1; n = length(h)
+        while true
+            l = 2i; r = l + 1; m = i
+            l <= n && h[l] < h[m] && (m = l)
+            r <= n && h[r] < h[m] && (m = r)
+            m == i && break
+            h[i], h[m] = h[m], h[i]; i = m
+        end
+    end
+    return top
 end
 
 """

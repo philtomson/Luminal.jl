@@ -136,8 +136,13 @@ end
 # 2D Float32 GPU array whose every use is as the left operand of a matmul, read
 # unchanged, and all uses must want the same storage:
 #   MatMulF16(_, :gemv) -> HalfWeight, MatMulF16(_, :gemm_ex) -> HalfWeightN,
-#   MatMulQ8 -> QuantWeight, MatMul -> per `weight_dtype` (Float16 / Int8).
+#   MatMulQ8 -> QuantWeight, MatMul -> per `weight_dtype` (Float16 / Int8 / Luminal.Int4).
+# `weight_dtype` is one type for every weight, or a function of the weight's node id
+# (a per-tensor policy, e.g. int8 for sensitive tensors and 4-bit for the rest).
+_wdtype(weight_dtype, node_id) = weight_dtype isa Type ? weight_dtype : weight_dtype(node_id)
+
 function _weight_storage(graph, node_id, data, consumers, retain, weight_dtype)
+    weight_dtype = _wdtype(weight_dtype, node_id)
     (data isa AnyGPUArray && data isa DenseArray && eltype(data) == Float32 && ndims(data) == 2) || return nothing
     node_id in retain && return nothing
     isempty(consumers[node_id]) && return nothing
@@ -147,14 +152,15 @@ function _weight_storage(graph, node_id, data, consumers, retain, weight_dtype)
         want = c.op isa Luminal.MatMulF16 ? (c.op.impl === :gemm_ex ? Luminal.HalfWeightN : Luminal.HalfWeight) :
                c.op isa Luminal.MatMulQ8  ? Luminal.QuantWeight :
                (c.op isa Luminal.MatMul && weight_dtype === Float16) ? Luminal.HalfWeight :
-               (c.op isa Luminal.MatMul && weight_dtype === Int8)    ? Luminal.QuantWeight : nothing
+               (c.op isa Luminal.MatMul && weight_dtype === Int8)    ? Luminal.QuantWeight :
+               (c.op isa Luminal.MatMul && weight_dtype === Luminal.Int4) ? Luminal.Q4Weight : nothing
         want === nothing && return nothing
         storage === nothing || storage === want || return nothing
         storage = want
         (c.inputs[1][1] == node_id && c.inputs[2][1] != node_id) || return nothing
         _is_trivial_view(st, graph.shapes[node_id]) || return nothing
     end
-    align = storage === Luminal.QuantWeight ? 16 : storage === Luminal.HalfWeight ? 8 : 1
+    align = storage === Luminal.Q4Weight ? 32 : storage === Luminal.QuantWeight ? 16 : storage === Luminal.HalfWeight ? 8 : 1
     size(data, 2) % align == 0 || return nothing
     return storage
 end
@@ -309,7 +315,9 @@ end
 
 # --- Memory -------------------------------------------------------------------
 
-_storage_bytes(T, n) = T === Luminal.QuantWeight ? n + 4 * cld(n, Luminal.DEFAULT_Q8_GROUP) :
+_storage_bytes(T, n) = T === Luminal.Q4Weight ?
+                           cld(n, 2) + (Luminal.DEFAULT_Q4_SYMMETRIC ? 2 : 4) * cld(n, Luminal.DEFAULT_Q4_GROUP) :
+                       T === Luminal.QuantWeight ? n + 4 * cld(n, Luminal.DEFAULT_Q8_GROUP) :
                        (T === Luminal.HalfWeight || T === Luminal.HalfWeightN) ? 2n : 4n
 
 """
@@ -322,7 +330,7 @@ weights) and their conversions, and every intermediate. Lets a search skip a
 candidate that would not fit instead of running the machine out of memory.
 """
 function estimate_compile_bytes(graph::Luminal.Graph; retain::Vector{Int}=Int[],
-                                weight_dtype::Type=Float32, fold::Bool=true)
+                                weight_dtype=Float32, fold::Bool=true)
     n = length(graph.nodes)
     consumers = [Tuple{Int, ShapeTracker}[] for _ in 1:n]
     for (cid, node) in enumerate(graph.nodes), (id, _, st) in node.inputs
@@ -362,9 +370,11 @@ function estimate_compile_bytes(graph::Luminal.Graph; retain::Vector{Int}=Int[],
             transient = max(transient, 4k)
         else
             ops = [graph.nodes[c].op for c in cs]
+            wd = _wdtype(weight_dtype, id)
             per = isempty(ops) ? 4.0 :
-                  all(op -> op isa Luminal.MatMulQ8 || (op isa Luminal.MatMul && weight_dtype === Int8), ops) ? 1.04 :
-                  all(op -> op isa Luminal.MatMulF16 || (op isa Luminal.MatMul && weight_dtype === Float16), ops) ? 2.0 : 4.0
+                  all(op -> op isa Luminal.MatMul && wd === Luminal.Int4, ops) ? 0.63 :
+                  all(op -> op isa Luminal.MatMulQ8 || (op isa Luminal.MatMul && wd === Int8), ops) ? 1.04 :
+                  all(op -> op isa Luminal.MatMulF16 || (op isa Luminal.MatMul && wd === Float16), ops) ? 2.0 : 4.0
             bytes += ceil(Int, per * k)
             transient = max(transient, 4k)    # its Float32 value, before conversion
         end
@@ -391,6 +401,8 @@ function release!(cg::CompiledGraph)
             free!(x.w)
         elseif x isa Luminal.QuantWeight
             free!(x.q); free!(x.scale)
+        elseif x isa Luminal.Q4Weight
+            free!(x.p); free!(x.scale); x.mn === nothing || free!(x.mn)
         else
             free!(x)
         end
@@ -416,8 +428,11 @@ size, which suits graphs executed many times such as per-token decode.
 Retained outputs are overwritten by the next run in either mode.
 `fuse=true` merges chains of elementwise ops into single kernels.
 `fold=true` computes nodes that depend only on persistent tensors (weights) once,
-at compile time. `weight_dtype=Float16` (or `Int8`, per-row symmetric int8) stores GPU weights that are only ever used as the left
-operand of matmuls in Float16 (see `HalfWeight`); compute stays Float32.
+at compile time. `weight_dtype=Float16` (or `Int8`: group-wise int8, or `Luminal.Int4`:
+group-wise asymmetric 4-bit) stores GPU weights that are only ever used as the left
+operand of matmuls in that format (`HalfWeight`, `QuantWeight`, `Q4Weight`); compute
+stays Float32. `weight_dtype` may also be a function of a weight's node id returning
+its type, for a different format per tensor (`LlamaSession` builds one from names).
 `search=:static` or `:measured` first runs the e-graph rewrite layer
 (`EGraphRewrite`) and compiles the graph it picks: by the static cost model, or
 by timing verified candidates (cached in `search_cache`). `precision=true`
@@ -433,7 +448,7 @@ the same device arrays each run, or as host arrays copied into place.
 """
 function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.get_device(),
                  retain::Vector{Int}=Int[], free_intermediates::Bool=true, fuse::Bool=true,
-                 weight_dtype::Type=Float32, capture::Bool=false, fold::Bool=true,
+                 weight_dtype=Float32, capture::Bool=false, fold::Bool=true,
                  search::Symbol=:none, precision=false, search_inputs=nothing,
                  search_tolerance::Real=1e-3,
                  search_cache::Union{Nothing,String}=joinpath(homedir(), ".cache", "Luminal.jl", "search"),
@@ -612,7 +627,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             consumer_count[mid] == 1 && length(consumers[mid]) == 1 || continue
             _is_trivial_view(mst, graph.shapes[mid]) && _is_trivial_view(rst, graph.shapes[rid]) || continue
             (wid, _, wst) = m.inputs[1]
-            (persistent[wid] && (results[wid] isa Luminal.HalfWeight || results[wid] isa Luminal.QuantWeight)) || continue
+            (persistent[wid] && (results[wid] isa Luminal.HalfWeight || results[wid] isa Luminal.QuantWeight ||
+                                 results[wid] isa Luminal.Q4Weight)) || continue
             rdims = try [eval_dim(d) for d in realized_dims(graph.shapes[rid])] catch; continue end
             isequal(rdims, dims) || continue
             allow("residual $(nameof(typeof(results[wid]))) $(_dimstr(node_id))") || continue

@@ -10,7 +10,7 @@ using KernelAbstractions
 using KernelAbstractions.Extras: @unroll
 
 
-export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight
+export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight, Q4Weight, Int4, dequantize
 
 # Helper for batch matrix multiplication
 function batch_matmul(A, B)
@@ -544,6 +544,209 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, cols
     return C
 end
 
+# --- 4-bit matmul weights ---------------------------------------------------------
+# Weight-only 4-bit quantization per group of `group` consecutive inputs of each
+# output row, w = q * scale + min with q in 0..15: symmetric (min = -8 * scale,
+# scale = max|w| / 7, only the scale stored) or asymmetric (the group's
+# [min, max], both stored), as Float16. Transposed to (In, Out) and packed two per
+# byte (input 2i-1 in the low nibble, 2i in the high one), so a 16-byte load
+# brings 32 weights. Symmetric groups of 32 (the default) are 0.5625 bytes per
+# weight (int8: ~1.03, Float16: 2).
+"""
+    Int4
+
+Marker for 4-bit weight storage: `compile(...; weight_dtype=Luminal.Int4)`,
+`LlamaSession(...; decode_weights=Luminal.Int4)`. See `Q4Weight`.
+"""
+abstract type Int4 end
+
+# Default: symmetric, groups of 32 -- the most accurate at 0.5625 bytes per weight
+# on WikiText-2 perplexity for both TinyLlama and Llama-3-8B (examples/quant_formats.jl:
+# +5.2% / +5.3% vs Float32, against +7.6% / +9.0% for asymmetric groups of 64 at the
+# same size; asymmetric groups of 32 is slightly better on 8B but 11% larger).
+const DEFAULT_Q4_GROUP = 32
+const DEFAULT_Q4_SYMMETRIC = true
+struct Q4Weight{P, V, S, M} <: AbstractMatrix{Float32}
+    p::P          # (In/2, Out) UInt8, two 4-bit values per byte
+    v::V          # (In/32, Out) NTuple{16, UInt8} view of `p`
+    scale::S      # (In/group, Out) Float16
+    mn::M         # (In/group, Out) Float16 group minimum, or `nothing` when symmetric (-8 * scale)
+    group::Int
+end
+# `symmetric`: codes q - 8 in -8..7 around zero, scale = max|w| / 7, stored as
+# min = -8 * scale, so the same kernel runs both. Asymmetric fits each group's
+# [min, max] instead.
+function Q4Weight(W::AbstractMatrix; group::Int = DEFAULT_Q4_GROUP, symmetric::Bool = DEFAULT_Q4_SYMMETRIC)
+    M, K = size(W)
+    K % 32 == 0 || error("Q4Weight: input dimension $K is not a multiple of 32")
+    (group % 32 == 0 && K % group == 0) || (group = K)       # one group per row
+    G = K ÷ group
+    Wt = similar(W, K, M)
+    permutedims!(Wt, W, (2, 1))                              # (In, Out)
+    Wg = Base.reshape(Wt, group, G, M)
+    lo = minimum(Wg; dims=1); hi = maximum(Wg; dims=1)
+    # Float16 scale and minimum, and the codes computed from those rounded values,
+    # so dequantization reproduces exactly what was fitted
+    if symmetric
+        sc16 = Float16.(max.(max.(abs.(lo), abs.(hi)) ./ 7f0, Float32(floatmin(Float16))))
+        mn16 = Float16.(-8f0 .* Float32.(sc16))                # exact: a power-of-two multiple
+    else
+        mn16 = Float16.(lo)
+        sc16 = Float16.(max.((hi .- lo) ./ 15f0, Float32(floatmin(Float16))))
+    end
+    q = similar(W, UInt8, K, M)
+    qg = Base.reshape(q, group, G, M)
+    qg .= unsafe_trunc.(UInt8, clamp.(round.((Wg .- Float32.(mn16)) ./ Float32.(sc16)), 0f0, 15f0))
+    p = similar(W, UInt8, K ÷ 2, M)
+    q2 = Base.reshape(q, 2, K ÷ 2, M)
+    lo_nib = view(q2, 1, :, :); hi_nib = view(q2, 2, :, :)
+    p .= lo_nib .| (hi_nib .<< 0x04)
+    v = Base.reshape(reinterpret(NTuple{16, UInt8}, vec(p)), K ÷ 32, M)
+    scale = Base.reshape(sc16, G, M)
+    mn = symmetric ? nothing : Base.reshape(mn16, G, M)
+    foreach(_free_now!, (Wg, Wt, lo, hi, qg, q2, q))            # temporaries and their reshapes
+    symmetric && _free_now!(mn16)
+    return Q4Weight(p, v, scale, mn, group)
+end
+Base.size(w::Q4Weight) = (size(w.p, 2), 2 * size(w.p, 1))
+function Base.getindex(w::Q4Weight, i::Int, j::Int)
+    b = w.p[(j + 1) ÷ 2, i]
+    q = isodd(j) ? b & 0x0f : b >> 0x04
+    gi = (j - 1) ÷ w.group + 1
+    s = Float32(w.scale[gi, i])
+    return Float32(q) * s + (w.mn === nothing ? -8f0 * s : Float32(w.mn[gi, i]))
+end
+
+"""
+    dequantize(w) -> Float32 matrix (Out, In)
+
+The Float32 values a reduced-precision matmul weight (`HalfWeight`, `QuantWeight`,
+`Q4Weight`) stands for, on the same device: exactly what the kernels compute with.
+Lets a Float32 model be evaluated with any mix of quantized tensors.
+"""
+dequantize(w::HalfWeight) = permutedims(Float32.(w.t), (2, 1))
+# (Temporaries are freed at once: dequantizing a whole model otherwise piles up
+# tens of GB of garbage before the GC runs.)
+function dequantize(w::QuantWeight)
+    K, M = size(w.q); G = K ÷ w.group
+    x = Float32.(Base.reshape(w.q, w.group, G, M)) .* Base.reshape(w.scale, 1, G, M)
+    xr = Base.reshape(x, K, M)
+    out = permutedims(xr, (2, 1))
+    foreach(_free_now!, (xr, x))
+    return out
+end
+function dequantize(w::Q4Weight)
+    M, K = size(w); G = K ÷ w.group
+    codes = similar(w.p, UInt8, 2, K ÷ 2, M)
+    view(codes, 1, :, :) .= w.p .& 0x0f
+    view(codes, 2, :, :) .= w.p .>> 0x04
+    cg = Base.reshape(codes, w.group, G, M)
+    s = Base.reshape(w.scale, 1, G, M)
+    x = w.mn === nothing ? (Float32.(cg) .- 8f0) .* Float32.(s) :
+        Float32.(cg) .* Float32.(s) .+ Float32.(Base.reshape(w.mn, 1, G, M))
+    xr = Base.reshape(x, K, M)
+    out = permutedims(xr, (2, 1))
+    foreach(_free_now!, (xr, x, cg, codes))
+    return out
+end
+
+# sum_i q_i x_i over one 32-weight load: byte b holds inputs 2b-1 (low nibble) and
+# 2b (high nibble); x is the load's 32 activations as four 8-tuples. (Unpacking the
+# load once to 32 Float32s for reuse across columns spills registers: ~2x slower.)
+@inline function _dot_q4(w::NTuple{16, UInt8}, xa, xb, xc, xd)
+    x = (xa..., xb..., xc..., xd...)
+    return sum(ntuple(b -> Float32(w[b] & 0x0f) * x[2b - 1] + Float32(w[b] >> 0x04) * x[2b], Val(16)))
+end
+@inline _sum32(xa, xb, xc, xd) = sum(xa) + sum(xb) + sum(xc) + sum(xd)
+
+# Y[:, c] = Wq * X[:, c], like the int8 kernel: R rows per workgroup share each
+# column's activations, C columns per pass. Per 32-weight load a row adds
+# scale * sum(q x) + min * sum(x), and sum(x) is shared by the rows.
+# SYM: symmetric weights, whose minimum is -8 * scale (`mn` is not read).
+@kernel function _q4_matmul_kernel!(Y, @Const(Wv), @Const(sc), @Const(mn), @Const(Xv), K32, N,
+                                    shift, ::Val{R}, ::Val{C}, @Const(Res), ::Val{RES},
+                                    ::Val{SYM}) where {R, C, RES, SYM}
+    grp = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256, 2 * C)
+    row0 = (grp - 1) * R
+    c0 = 0
+    while c0 < N
+        acc1 = ntuple(_ -> 0f0, Val(C))
+        acc2 = ntuple(_ -> 0f0, Val(C))
+        k = lid
+        while k <= K32
+            gi = ((k - 1) >> shift) + 1
+            @inbounds w1 = Wv[k, row0 + 1]
+            @inbounds w2 = Wv[k, row0 + R]
+            @inbounds s1 = Float32(sc[gi, row0 + 1])
+            @inbounds s2 = Float32(sc[gi, row0 + R])
+            m1 = SYM ? -8f0 * s1 : (@inbounds Float32(mn[gi, row0 + 1]))
+            m2 = SYM ? -8f0 * s2 : (@inbounds Float32(mn[gi, row0 + R]))
+            kk = 4k; cb = c0   # fresh bindings: closures must not capture reassigned variables
+            acc1, acc2 = let a1 = acc1, a2 = acc2
+                xs = ntuple(j -> (c = min(cb + j, N);
+                                  @inbounds (Xv[kk - 3, c], Xv[kk - 2, c], Xv[kk - 1, c], Xv[kk, c])), Val(C))
+                sums = ntuple(j -> _sum32(xs[j]...), Val(C))
+                (ntuple(j -> a1[j] + s1 * _dot_q4(w1, xs[j]...) + m1 * sums[j], Val(C)),
+                 R == 2 ? ntuple(j -> a2[j] + s2 * _dot_q4(w2, xs[j]...) + m2 * sums[j], Val(C)) : a2)
+            end
+            k += G
+        end
+        @unroll for j in 1:C
+            @inbounds s[lid, (j - 1) * R + 1] = acc1[j]
+            R == 2 && (@inbounds s[lid, (j - 1) * R + R] = acc2[j])
+        end
+        @synchronize
+        stride = G ÷ 2
+        while stride > 0
+            if lid <= stride
+                @unroll for i in 1:R*C
+                    @inbounds s[lid, i] += s[lid + stride, i]
+                end
+            end
+            @synchronize
+            stride ÷= 2
+        end
+        if lid <= R * C
+            r = (lid - 1) % R + 1; j = (lid - 1) ÷ R + 1
+            if c0 + j <= N
+                @inbounds Y[row0 + r, c0 + j] = RES ? s[1, lid] + Res[row0 + r, c0 + j] : s[1, lid]
+            end
+        end
+        @synchronize
+        c0 += C
+    end
+end
+
+# Columns per pass and threads, measured on Llama-3-8B shapes with weights read
+# from DRAM: batch 1 wants 256 threads only where K/32 >= 256 (every thread busy);
+# with several columns, 2 per pass and 128 threads are best (~2x 4 per pass at 4
+# columns). Batched int4 is still bound by activation reads (128 bytes per column
+# per 16-byte load, twice int8's ratio); unpacking the codes once per load instead
+# of per column did not help. Staging activations in local memory is the next step
+# for batch sizes > 2.
+const Q4_MAX_COLS = 2
+const DEFAULT_Q4_THREADS = 0     # 0: chosen per call (`_q4_threads`)
+_q4_threads(K32::Int, N::Int) = (N == 1 && K32 >= 256) ? 256 : 128
+
+function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::Int = 0,
+                     residual = nothing)
+    M, K = size(W)
+    N = length(B) ÷ K
+    Bc = B isa DenseArray ? B : copy(B)
+    Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
+    R = iseven(M) ? 2 : 1
+    lpg = W.group ÷ 32
+    ispow2(lpg) || error("Q4Weight: group $(W.group) must be 32 times a power of two")
+    group == 0 && (group = _q4_threads(K ÷ 32, N))
+    group <= 256 || error("int4 GEMV: at most 256 threads per workgroup")
+    _q4_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
+        Base.reshape(C, M, N), W.v, W.scale, W.mn === nothing ? W.scale : W.mn, Xv, K ÷ 32, N,
+        trailing_zeros(lpg), Val(R), Val(min(N, cols == 0 ? Q4_MAX_COLS : cols)),
+        _residual_arg(residual, C, M, N)..., Val(W.mn === nothing); ndrange = (M ÷ R) * group)
+    return C
+end
+
 # Float16 copies of activations for gemm_ex, reused per (device array type, size):
 # a captured graph bakes in the pointer, so they must outlive every call.
 const _GEMM_EX_WORKSPACE = Dict{Any, Any}()
@@ -633,6 +836,7 @@ function matmul_residual!(out, op, W, x, r)
     W isa QuantWeight && return _q8_matmul!(out, W, x; residual = r,
                                              group = op isa MatMulQ8 ? op.group : DEFAULT_Q8_THREADS,
                                              cols = op isa MatMulQ8 ? op.cols : 0)
+    W isa Q4Weight && return _q4_matmul!(out, W, x; residual = r)
     W isa HalfWeight && return _half_matmul!(out, W, x; residual = r,
                                               group = op isa MatMulF16 ? op.group : DEFAULT_HALF_GROUP)
     error("matmul_residual!: unsupported weight storage $(typeof(W))")
@@ -708,6 +912,7 @@ end
 function batch_matmul!(C, A, B)
     A isa HalfWeight && return _half_matmul!(C, A, B)
     A isa QuantWeight && return _q8_matmul!(C, A, B)
+    A isa Q4Weight && return _q4_matmul!(C, A, B)
     A = _ensure_contiguous(A)
     B = _ensure_contiguous(B)
     # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
@@ -771,7 +976,7 @@ function batch_matmul!(C, A, B)
 end
 
 function realize_view(data, st::ShapeTracker)
-    (data isa HalfWeight || data isa HalfWeightN || data isa QuantWeight) && return data  # consumed whole, as a matmul weight
+    (data isa HalfWeight || data isa HalfWeightN || data isa QuantWeight || data isa Q4Weight) && return data  # consumed whole, as a matmul weight
     # If buffer already matches logical size, it's likely already realized (common in interpreter)
     r_dims = realized_dims(st)
     # Already exactly this shape (e.g. a strided slice view): pass through unchanged

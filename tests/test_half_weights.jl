@@ -117,3 +117,31 @@ if Luminal.get_device() isa Luminal.AMDDevice
         end
     end
 end
+
+# A per-tensor weight policy (weight_dtype as a function of the node id) mixes
+# formats in one graph, and each weight computes exactly with its dequantized
+# values: 4-bit, int8 and Float32 side by side.
+if Luminal.get_device() isa Luminal.AMDDevice
+    @testset "per-tensor weight policy and dequantize" begin
+        dev = Luminal.get_device()
+        g = Luminal.Graph()
+        W1 = Luminal.tensor(g, [96, 128]); W2 = Luminal.tensor(g, [64, 96]); W3 = Luminal.tensor(g, [32, 64])
+        x = Luminal.tensor(g, [128, 3])
+        out = Luminal.matmul(W3, Luminal.matmul(W2, Luminal.matmul(W1, x)))
+        vals = [randn(Float32, 96, 128), randn(Float32, 64, 96), randn(Float32, 32, 64)]
+        for (t, v) in zip((W1, W2, W3), vals)
+            g.tensors[(t.id, 1)] = Luminal.to_device(v, dev)
+        end
+        xv = randn(Float32, 128, 3)
+        policy = Dict(W1.id => Luminal.Int4, W2.id => Int8)
+        cg = compile(g; device=dev, retain=[out.id], weight_dtype=id -> get(policy, id, Float32))
+        @test cg.results[W1.id] isa Luminal.Q4Weight
+        @test cg.results[W2.id] isa Luminal.QuantWeight
+        @test !(cg.results[W3.id] isa Union{Luminal.Q4Weight, Luminal.QuantWeight, Luminal.HalfWeight})
+        got = Array(cg(Dict{Int,Any}(x.id => xv); device=dev)[out.id])
+        D1 = Array(Luminal.dequantize(cg.results[W1.id])); D2 = Array(Luminal.dequantize(cg.results[W2.id]))
+        @test got ≈ vals[3] * (D2 * (D1 * xv)) rtol=1e-4
+        @test D1 ≈ vals[1] rtol=0.1          # 4-bit is close to the original, not equal
+        @test Array(Luminal.dequantize(Luminal.HalfWeight(Luminal.to_device(vals[3], dev)))) ≈ vals[3] rtol=1e-3
+    end
+end
