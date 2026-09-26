@@ -218,7 +218,17 @@ batch of 4 clips decodes in about the time of 2.
   tokens included.
 
 ### Training
-Reverse-mode autodiff over the primitives (`backward`) and `SGD`/`Adam` optimizers.
+Reverse-mode autodiff (`backward`, `gradients`) with gradient rules for all 12 of
+Luminal's original primitives:
+- Log2, Exp2, Sin, Sqrt, Recip, Add, Mul, Mod;
+- SumReduce and MaxReduce (ties share the gradient);
+- Contiguous;
+- LessThan (zero gradient).
+
+It also covers ReLU, MatMul and the movement ops (Permute, Reshape, Expand, Slice,
+Pad), with broadcasting. `SGD` and `Adam` optimizers are included. The fused
+inference kernels (`DecodeAttention`, `RMSNormOp`, `RotaryEmbed`, `SoftmaxOp`) and
+the reduced-precision weight formats have no gradients.
 
 ### Devices
 - **AMD ROCm** (AMDGPU.jl) is the primary, tested target.

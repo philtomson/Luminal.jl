@@ -235,7 +235,44 @@ function vjp_rules(op::SumReduce, node_id::Int, node::Node, grad_out::GraphTenso
     accumulate_grad!(grads, input_id, grad_x)
 end
 
+function vjp_rules(op::MaxReduce, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # d(max(x, dim))/dx: the gradient flows to the elements equal to the maximum,
+    # split evenly among ties (as PyTorch's amax)
+    input_id = node.inputs[1][1]
+    graph = grad_out.graph_ref
+    x = GraphTensor(input_id, node.inputs[1][3], graph)
+    n = realized_dims(node.inputs[1][3])[op.dim]
+    out = GraphTensor(node_id, graph.shapes[node_id], graph)
+    is_max = x == expand(out, op.dim, n)
+    count = expand(sum(is_max, op.dim), op.dim, n)
+    accumulate_grad!(grads, input_id, expand(grad_out, op.dim, n) * is_max / count)
+end
+
+# --- Piecewise ops ---
+
+function vjp_rules(op::Mod, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # a % b = a - q * b with q = trunc(a / b), constant between jumps:
+    # d/da = 1, d/db = -q, where q = (a - a % b) / b
+    graph = grad_out.graph_ref
+    a = GraphTensor(node.inputs[1][1], node.inputs[1][3], graph)
+    b = GraphTensor(node.inputs[2][1], node.inputs[2][3], graph)
+    out = GraphTensor(node_id, graph.shapes[node_id], graph)
+    q = (a - out) / b
+    accumulate_grad!(grads, a.id, unbroadcast(grad_out, realized_dims(a.shape)))
+    accumulate_grad!(grads, b.id, unbroadcast(grad_out * q * -1.0f0, realized_dims(b.shape)))
+end
+
+# LessThan is piecewise constant: its gradient is zero everywhere it exists, so it
+# contributes nothing (stated explicitly rather than falling to the default rule).
+vjp_rules(op::LessThan, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict) = nothing
+
 # --- Movement Ops ---
+
+function vjp_rules(op::Contiguous, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # a copy: the gradient passes through unchanged
+    accumulate_grad!(grads, node.inputs[1][1], grad_out)
+end
+
 
 function vjp_rules(op::Permute, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
     # gradient of permute is inverse permute

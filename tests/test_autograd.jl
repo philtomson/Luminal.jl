@@ -108,3 +108,55 @@ end
     
     @test isapprox(res[grads[a.id].id], expected_grad, atol=1f-5)
 end
+
+# Gradient checks against central finite differences for the remaining primitives:
+# MaxReduce (with and without ties), Contiguous, Mod; LessThan has zero gradient.
+function fd_grad(f, x; h=1f-2)
+    g = similar(x)
+    for i in eachindex(x)
+        xp = copy(x); xm = copy(x); xp[i] += h; xm[i] -= h
+        g[i] = (f(xp) - f(xm)) / 2h
+    end
+    g
+end
+
+@testset "Autograd MaxReduce, Contiguous, Mod, LessThan" begin
+    run(g, out, grad_ids, inputs) = execute(g, vcat(out, grad_ids), inputs, CPUDevice())
+
+    # MaxReduce: loss = sum(max(x, 2) .* w), distinct values
+    g = Graph(); x = tensor(g, [3, 4]); w = tensor(g, [3])
+    loss = sum(max_reduce(x, 2) * w, 1)
+    mark_trainable!(x); gr = backward(loss)
+    xv = Float32[1 5 2 0; 3 1 4 2; 0 0 7 1]; wv = Float32[1, 2, 3]
+    res = run(g, loss.id, [gr[x.id].id], Dict(x.id => xv, w.id => wv))
+    @test res[gr[x.id].id] ≈ fd_grad(v -> sum(maximum(v; dims=2)[:] .* wv), xv) atol=1e-3
+
+    # MaxReduce with a tie: the gradient is split between the tied maxima
+    res = run(g, loss.id, [gr[x.id].id], Dict(x.id => Float32[1 5 5 0; 3 1 4 2; 0 0 7 1], w.id => wv))
+    @test res[gr[x.id].id][1, 2] ≈ 0.5f0 && res[gr[x.id].id][1, 3] ≈ 0.5f0
+
+    # Contiguous (of a permute, so the copy is real)
+    g = Graph(); x = tensor(g, [2, 3])
+    y = Luminal.contiguous(Luminal.permute(x, [2, 1]))
+    loss = sum(sum(y * y, 1), 1)
+    mark_trainable!(x); gr = backward(loss)
+    xv = Float32[1 2 3; 4 5 6]
+    res = run(g, loss.id, [gr[x.id].id], Dict(x.id => xv))
+    @test res[gr[x.id].id] ≈ 2 .* xv
+
+    # Mod: d(a % b)/da = 1, d/db = -trunc(a/b), away from the jumps
+    g = Graph(); a = tensor(g, [4]); b = tensor(g, [4])
+    loss = sum((a % b) * (a % b), 1)
+    mark_trainable!(a); mark_trainable!(b); gr = backward(loss)
+    av = Float32[7.3, -5.6, 9.1, 2.2]; bv = Float32[2.0, 2.5, -4.0, 3.0]
+    res = run(g, loss.id, [gr[a.id].id, gr[b.id].id], Dict(a.id => av, b.id => bv))
+    @test res[gr[a.id].id] ≈ fd_grad(v -> sum((v .% bv) .^ 2), av) atol=1e-2
+    @test res[gr[b.id].id] ≈ fd_grad(v -> sum((av .% v) .^ 2), bv) atol=1e-2
+
+    # LessThan: no gradient flows through the comparison, only through x itself
+    g = Graph(); x = tensor(g, [3])
+    loss = sum((x < 0.5f0) * x, 1)
+    mark_trainable!(x); gr = backward(loss)
+    res = run(g, loss.id, [gr[x.id].id], Dict(x.id => Float32[0.2, 0.9, -1.0]))
+    @test res[gr[x.id].id] ≈ Float32[1, 0, 1]
+end
