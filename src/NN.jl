@@ -580,11 +580,10 @@ Device-resident storage for past K/V tensors for one decode session.
 - `step_pos`: the common position, for batch 1 (or when all sequences agree);
   assigning it sets every sequence's position.
 """
-mutable struct LlamaKVCacheState{A<:AbstractArray{Float32,4}, P<:AbstractVector{Int32}}
+mutable struct LlamaKVCacheState{A<:AbstractArray{Float32,4}}
     positions::Vector{Int}
     max_seq::Int
     self_cache::Vector{Tuple{A, A}}
-    positions_dev::P            # `positions` on the cache's device, for the slot writes
 end
 
 function Base.getproperty(c::LlamaKVCacheState, name::Symbol)
@@ -610,8 +609,7 @@ function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
     self = [(Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch),
              Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch))
             for _ in 1:n_layers]
-    pos_dev = Luminal.to_device(zeros(Int32, batch), device)
-    return LlamaKVCacheState(zeros(Int, batch), max_seq, self, pos_dev)
+    return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
 end
 
 
@@ -623,7 +621,8 @@ Single-token cached self-attention for Llama decoder-only models.
 - `step_pos_tensor` : (1,) current 0-indexed decode position, as data
 - `past_k`, `past_v` : (head_dim, max_seq, n_kv_heads, batch); slots `>= pos` are ignored
 Returns `(output, k_new, v_new)`, where `k_new`/`v_new` are this token's
-(D, 1, KV_H, B) K/V slot, to be written into the cache at `step_pos`.
+(D, 1, KV_H, B) K/V slot; the attention op also writes them into the cache at
+`step_pos` (in place), so running the graph updates the cache.
 
 All shapes are static (independent of the position), so the step can be
 captured once and replayed. The cache is scored in place under a mask
@@ -655,7 +654,8 @@ function llama_self_attn_cached(sa::SelfAttention,
     # head-major order the output projection expects.
     scale = 1.0f0 / sqrt(Float32(D))
     ins = [(t.id, 0, t.shape) for t in (q, past_k, past_v, k_new, v_new, step_pos_tensor)]
-    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(scale), ins,
+    # The op also writes this token's K/V into the cache slot (write_cache=true).
+    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(scale, true), ins,
                           Luminal.ShapeTracker([D, sa.n_heads, batch]))
     out = Luminal.reshape(out, [hidden, 1, batch])
 
@@ -784,15 +784,8 @@ function llama_decode_step!(exec_fn,
     results = exec_fn(inputs; sym_vals=sym_vals, device=device)
     logits  = results[idg.logits_id]
 
-    # Write each sequence's K/V into its slot, in place on device: one kernel per
-    # cache tensor for the whole batch.
-    copyto!(cache.positions_dev, Int32.(pos))
-    for (i, (nk_id, nv_id)) in enumerate(zip(idg.new_self_k_ids, idg.new_self_v_ids))
-        k_cache, v_cache = cache.self_cache[i]
-        Luminal.write_cache_slots!(k_cache, results[nk_id], cache.positions_dev)
-        Luminal.write_cache_slots!(v_cache, results[nv_id], cache.positions_dev)
-    end
-
+    # The step graph's DecodeAttention nodes have already written each sequence's
+    # K/V into its cache slot (in place, inside the captured graph).
     pos .+= advance
     return logits
 end

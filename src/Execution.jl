@@ -146,30 +146,14 @@ function execute_op!(out, op::RMSNormOp, x, w)
     return out
 end
 
-# --- KV-cache slot writes -----------------------------------------------------
-# cache (D, max_seq, H, B)[:, pos[b] + 1, :, b] = new (D, 1, H, B)[:, 1, :, b], for
-# every sequence of the batch in one launch; `pos` holds 0-indexed positions.
-@kernel function _cache_slot_kernel!(cache, @Const(new), @Const(pos))
-    d, h, b = @index(Global, NTuple)
-    @inbounds cache[d, pos[b] + 1, h, b] = new[d, 1, h, b]
-end
-
-function write_cache_slots!(cache, new, pos)
-    D, _, H, B = size(cache)
-    src = new isa DenseArray ? new : copy(new)
-    src = ndims(src) == 4 ? src : Base.reshape(src, D, 1, H, B)
-    _cache_slot_kernel!(KernelAbstractions.get_backend(cache), 256)(cache, src, pos; ndrange = (D, H, B))
-    return cache
-end
-
 # --- Decode attention ---------------------------------------------------------
 # One workgroup per (query head, batch). Scores for the n = pos + 1 positions
 # (cache slots 1..pos, then the new token) live in local memory: dot products,
 # then a parallel max and sum for the softmax, then the probability-weighted sum
 # of V with the workgroup split into G ÷ D slices over positions.
 const DECODE_ATTN_MAX_CTX = 8192
-@kernel function _decode_attn_kernel!(out, @Const(q), @Const(pk), @Const(pv), @Const(kn), @Const(vn),
-                                      @Const(posv), scale, Gq)
+@kernel function _decode_attn_kernel!(out, @Const(q), pk, pv, @Const(kn), @Const(vn),
+                                      @Const(posv), scale, Gq, write_cache)
     # Values shared across barriers must be @uniform (the CPU backend splits the
     # kernel into loops at each @synchronize); the softmax statistics go through
     # local memory (`stats`) for the same reason.
@@ -182,6 +166,12 @@ const DECODE_ATTN_MAX_CTX = 8192
     kv = @uniform (h - 1) ÷ Gq + 1
     pos = @uniform unsafe_trunc(Int, @inbounds posv[length(posv) == 1 ? 1 : b])
     n = @uniform pos + 1
+    # write_cache: the first query head of each KV group stores this token's K/V in
+    # slot pos + 1 (no workgroup reads that slot from the cache).
+    if write_cache && (h - 1) % Gq == 0 && lid <= D
+        @inbounds pk[lid, pos + 1, kv, b] = kn[lid, 1, kv, b]
+        @inbounds pv[lid, pos + 1, kv, b] = vn[lid, 1, kv, b]
+    end
     sc = @localmem Float32 (DECODE_ATTN_MAX_CTX,)
     red = @localmem Float32 (256,)
     stats = @localmem Float32 (2,)
@@ -281,13 +271,20 @@ function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
                 o3[d, h, b] = sum(p[j] * (j <= pos ? pv[d, j, kv, b] : vn[d, 1, kv, b]) for j in 1:pos+1)
             end
         end
+        if op.write_cache
+            for b in 1:B
+                pos = Int(posv[length(posv) == 1 ? 1 : b])
+                pk[:, pos + 1, :, b] .= kn[:, 1, :, b]
+                pv[:, pos + 1, :, b] .= vn[:, 1, :, b]
+            end
+        end
         return out
     end
     size(pk, 2) + 1 <= DECODE_ATTN_MAX_CTX || error("DecodeAttention: cache longer than $(DECODE_ATTN_MAX_CTX)")
     (D <= 256 && 256 % D == 0) || error("DecodeAttention: head_dim must divide 256")
     o3 = Base.reshape(out, D, H, B)
     _decode_attn_kernel!(KernelAbstractions.get_backend(o3), 256)(
-        o3, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH; ndrange = H * B * 256)
+        o3, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH, op.write_cache; ndrange = H * B * 256)
     return out
 end
 
@@ -330,7 +327,16 @@ Base.getindex(w::HalfWeightN, i::Int, j::Int) = w.w[i, j]
 # groups track the weights' range more closely (a single large weight no longer
 # coarsens a whole 2048- or 5632-element row) for ~4 bytes per group.
 const DEFAULT_Q8_GROUP = 128     # inputs per int8 scale
-const DEFAULT_Q8_THREADS = 128   # int8 GEMV threads per workgroup
+# int8 GEMV threads per workgroup; 0 = choose per call (`_q8_threads`).
+const DEFAULT_Q8_THREADS = 0
+
+# Threads per workgroup for an int8 GEMV with K16 = K/16 vector loads per row and N
+# columns. A thread handles K16/threads loads, so 256 threads only pay off when
+# that is ~1-2: measured with weights read from DRAM (not cache), 256 threads are
+# +20-55% on K = 4096 (Llama-3-8B) with 1-4 columns, but slower on K = 2048
+# (TinyLlama: half the threads idle), on K = 14336, and at 8 columns.
+_q8_threads(K16::Int, N::Int) =
+    (N == 1 && 256 <= K16 < 512) || (N <= 4 && 256 <= K16 < 320) ? 256 : 128
 struct QuantWeight{Q, V, S} <: AbstractMatrix{Float32}
     q::Q         # (In, Out) Int8
     v::V         # (In/16, Out) NTuple{16, Int8} view of `q`
@@ -360,8 +366,8 @@ Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j 
 # GB/s; with two it reaches ~205 GB/s on a Radeon 8060S (R = 4 was slower).
 # 16 int8 weights per load, Float32 accumulation, scaled once per load.
 # `shift` >= 0: loads per scale group is 2^shift (index by bit shift).
-# Columns are processed in chunks of up to C (C = N for N <= 8, so batched decode
-# reads each weight vector once for the whole batch). Accumulators are tuples, so
+# Columns are processed in chunks of up to C (C = N for N <= Q8_MAX_COLS, so
+# batched decode reads each weight vector once per chunk). Accumulators are tuples, so
 # they stay in registers: a thread holds R x C partial sums, reduced together once
 # per chunk. Weights are converted to Float32 once per load, not per column.
 @inline _dot16(w, xa, xb) =
@@ -424,6 +430,11 @@ Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j 
 end
 
 const GEMV_MAX_COLS = 8   # columns accumulated per pass in the GEMV kernels
+# The int8 kernel holds 16 activations per column: at 8 columns the register
+# pressure costs more than re-reading the (by then cached) weights for a second
+# pass, so it takes at most 4 columns per pass (+25-40% at 8 columns on
+# Llama-3-8B shapes).
+const Q8_MAX_COLS = 4
 
 function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
     K, M = size(W.q)
@@ -432,10 +443,11 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R = iseven(M) ? 2 : 1
     lpg = W.group ÷ 16
+    group == 0 && (group = _q8_threads(K ÷ 16, N))
     group <= 256 || error("int8 GEMV: at most 256 threads per workgroup")
     _q8_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
         Base.reshape(C, M, N), W.v, W.scale, Xv, K ÷ 16, N, lpg,
-        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, GEMV_MAX_COLS)); ndrange = (M ÷ R) * group)
+        ispow2(lpg) ? trailing_zeros(lpg) : -1, Val(R), Val(min(N, Q8_MAX_COLS)); ndrange = (M ÷ R) * group)
     return C
 end
 

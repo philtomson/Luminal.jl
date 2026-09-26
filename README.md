@@ -112,7 +112,7 @@ system memory through GTT):
 |----------------|---------|---------|---------|
 | Float32 | 149 ms/token (6.7 tok/s) | | |
 | Float16 | 67 ms/token (14.9 tok/s) | 52 tok/s | 77 tok/s |
-| int8 | 45 ms/token (22 tok/s) | 74 tok/s | 90 tok/s |
+| int8 | 38.5 ms/token (26 tok/s) | 75 tok/s | 110 tok/s |
 
 For comparison, upstream Luminal reports 229 ms/token for the same checkpoint
 on an NVIDIA H200 with Float32 weights (batch 1; `examples/llm_chat`, September
@@ -122,7 +122,7 @@ TinyLlama 1.1B on the same GPU, batch 1:
 
 | | Weights | Time | |
 |-|---------|------|-|
-| Decode | int8 (group-wise, weight-only) | **6.7 ms/token** | 149 tok/s |
+| Decode | int8 (group-wise, weight-only) | **6.5 ms/token** | 154 tok/s |
 | Decode | Float16 | 11.0 ms/token | 91 tok/s |
 | Prefill, 16 tokens | Float16 GEMM (`search`, `:activations`) | 22 ms | |
 | Prefill, 16 tokens | Float32 | 45 ms | |
@@ -131,10 +131,10 @@ Batched decode: B sequences share one step, and each weight is read once per ste
 
 | Batch | int8 ms/step | int8 tok/s | Float16 ms/step | Float16 tok/s |
 |------:|-------------:|-----------:|----------------:|--------------:|
-| 1 | 6.9 | 146 | 11.2 | 89 |
+| 1 | 6.7 | 149 | 11.2 | 89 |
 | 2 | 8.2 | 243 | 12.0 | 167 |
-| 4 | 9.8 | 408 | 13.7 | 292 |
-| 8 | 17.5 | 458 | 20.3 | 394 |
+| 4 | 9.7 | 412 | 13.7 | 292 |
+| 8 | 14.2 | 564 | 20.3 | 394 |
 
 (`examples/batched_decode.jl`; sequences at ~128 tokens of context. The
 batch-1 times here include copying the logits to the host for the argmax.)
@@ -147,8 +147,9 @@ they are uploaded as stored (BF16) and converted on the GPU. The first load in
 a process also compiles those kernels, and takes ~16 s.
 
 Decode started this work at 893 ms/token. It is now bound by memory bandwidth:
-the int8 GEMVs run at ~213 GB/s. What remains on top of them is kernel launch
-overhead.
+the int8 GEMVs read weights at ~215-220 GB/s. On the 8B model they are ~34 of
+the ~38.5 ms per token; the rest is small kernels and launch gaps inside the
+HIP graph (~5.5 µs per kernel).
 
 Whisper tiny transcribes a 5-second clip in 1.3 s end to end when warm. That
 figure includes weight loading and graph compilation.

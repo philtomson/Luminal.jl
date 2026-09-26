@@ -456,7 +456,7 @@ end
 #
 # The decode step is one shape-static graph for every position: the position is
 # data (a (1,) tensor), self-attention reads the device-resident cache under
-# `DecodeAttention`, and the host writes each step's K/V slot into the cache in
+# `DecodeAttention`, which also writes each step's K/V slot into the cache in
 # place. Cross-attention K/V are projected once from the encoder output.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -508,7 +508,8 @@ function whisper_self_attn_cached(sa::WhisperAttention, x::Luminal.GraphTensor,
     k_new = _split_heads(sa.k_proj(x), sa.n_heads)
     v_new = _split_heads(sa.v_proj(x), sa.n_heads)
     ins = [(t.id, 0, t.shape) for t in (q, past_k, past_v, k_new, v_new, pos_tensor)]
-    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(1.0f0 / sqrt(Float32(d))), ins,
+    # The op also writes this token's K/V into the cache slot (write_cache=true).
+    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(1.0f0 / sqrt(Float32(d)), true), ins,
                           Luminal.ShapeTracker([d, sa.n_heads, batch]))
     return sa.out_proj(Luminal.reshape(out, [hidden, 1, batch])), k_new, v_new
 end
@@ -615,12 +616,7 @@ function decode_step!(exec_fn, idg::IncrementalDecodeGraph, cache::KVCacheState,
     else
         exec_fn(inputs; device=device)
     end
-    slot = cache.step_pos + 1
-    for i in eachindex(idg.new_self_k_ids)
-        k_cache, v_cache = cache.self_cache[i]
-        view(k_cache, :, slot:slot, :, :) .= results[idg.new_self_k_ids[i]]
-        view(v_cache, :, slot:slot, :, :) .= results[idg.new_self_v_ids[i]]
-    end
+    # The step's DecodeAttention nodes wrote this token's K/V into the cache.
     cache.step_pos += 1
     return results[idg.logits_id]
 end

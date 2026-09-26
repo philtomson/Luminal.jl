@@ -278,10 +278,10 @@ end
 
 # precision=:int8 offers weight-only int8 (one scale per output row) for weight
 # matmuls: half the bytes of Float16 for decode, lossy (see docs).
-const INT8_VARIANTS = ((128,),)
+const INT8_VARIANTS = ((Luminal.DEFAULT_Q8_THREADS,),)
 const INT8_RULES = @theory q w x begin
     xMatMul(q::Tuple, w, x) => (_half_ok(_egraph, w) && w.data.dims[2] % 16 == 0) ?
-                                :(xMatMulQ8($((128,)), $w, $x)) : nothing
+                                :(xMatMulQ8($((Luminal.DEFAULT_Q8_THREADS,)), $w, $x)) : nothing
 end
 
 # `precision` enables reduced-precision alternatives: false (exact rewrites only);

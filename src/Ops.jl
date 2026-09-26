@@ -104,11 +104,12 @@ MatMulF16(group::Int) = MatMulF16(group, :gemv)
 
 # Same product as MatMul with the (weight) left operand stored as int8 with one
 # Float32 scale per output row (weight-only quantization; activations and
-# accumulation stay Float32). `group` is the GEMV's threads per output row.
+# accumulation stay Float32). `group` is the GEMV's threads per workgroup
+# (0: chosen per call from the shape, see `_q8_threads`).
 struct MatMulQ8 <: Op
     group::Int
 end
-MatMulQ8() = MatMulQ8(128)
+MatMulQ8() = MatMulQ8(DEFAULT_Q8_THREADS)
 
 # Rotary position embedding ("rotate half") in one kernel. Inputs: x (D, S, H, B),
 # cos and sin tables (D/2, S). For i <= D/2:
@@ -129,9 +130,14 @@ end
 #   (D, 1, KVH, B), pos (1,) -- the number of valid cache slots (slots >= pos are
 #   ignored). Query head h uses KV head (h-1) ÷ (H/KVH) + 1 (grouped-query).
 # Output (D, H, B): softmax(scale * q.[K_past[:, 1:pos], k_new]) * [V_past; v_new].
+# With `write_cache`, the op also stores k_new/v_new into past_k/past_v at slot
+# pos + 1, in place: the decode step then updates its KV cache without separate
+# launches. (Other slots are untouched, and attention reads only slots <= pos.)
 struct DecodeAttention <: Op
     scale::Float32
+    write_cache::Bool
 end
+DecodeAttention(scale) = DecodeAttention(scale, false)
 
 # op(A) * op(B), where op transposes the first two dims when its flag is set:
 # a matmul that reads a permuted operand through BLAS transpose flags instead of
