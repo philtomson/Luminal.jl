@@ -340,20 +340,36 @@ function estimate_compile_bytes(graph::Luminal.Graph; retain::Vector{Int}=Int[],
         entry = get(Luminal._HALF_WEIGHTS, hash(T, objectid(data)), nothing)
         (entry !== nothing && entry[1].value === data) || (bytes += _storage_bytes(T, length(data)))
     end
+    folded = falses(n)
     for (id, node) in enumerate(graph.nodes)
         persistent[id] && continue
         k = numel(id)
         k < 0 && continue                     # symbolic shape: sized at run time
         if fold && !isempty(node.inputs) && all(persistent[i] for (i, _, _) in node.inputs)
-            persistent[id] = true             # folded: Float32 value, plus a converted copy
-            bytes += 4k
-            any(c -> graph.nodes[c].op isa Union{Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8},
-                first.(consumers[id])) && (bytes += 2k)
+            persistent[id] = folded[id] = true
         else
             bytes += 4k                       # an intermediate (or input) buffer
         end
     end
-    return bytes
+    # Folded tensors: those some run-time node reads are kept (converted, if only
+    # matmuls read them); the rest are transient (see compile's streaming folding),
+    # costing at most a few of the largest at once.
+    transient = 0
+    for id in findall(folded)
+        k = numel(id)
+        cs = first.(consumers[id])
+        if !isempty(cs) && all(c -> folded[c], cs) && !(id in retain)
+            transient = max(transient, 4k)
+        else
+            ops = [graph.nodes[c].op for c in cs]
+            per = isempty(ops) ? 4.0 :
+                  all(op -> op isa Luminal.MatMulQ8 || (op isa Luminal.MatMul && weight_dtype === Int8), ops) ? 1.04 :
+                  all(op -> op isa Luminal.MatMulF16 || (op isa Luminal.MatMul && weight_dtype === Float16), ops) ? 2.0 : 4.0
+            bytes += ceil(Int, per * k)
+            transient = max(transient, 4k)    # its Float32 value, before conversion
+        end
+    end
+    return bytes + 3 * transient
 end
 
 """
@@ -474,7 +490,13 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     # 2. Constant folding: a node whose inputs are all persistent (weights, or nodes
     # folded here) and whose shapes are static is computed once, now, and becomes
     # persistent itself -- e.g. weights concatenated by a rewrite.
+    # Folding streams, so a model's worth of concatenated weights never sits in
+    # memory at once (Llama-3-8B's merged gate/up alone is ~15 GB in Float32, and its
+    # Pad intermediates twice that): an intermediate is freed as soon as all its
+    # consumers are folded, and a folded weight is converted to its reduced-precision
+    # storage (freeing the Float32 value) as soon as it is complete.
     folded = falses(length(graph.nodes))
+    pending = [length(consumers[i]) for i in eachindex(graph.nodes)]   # consumers not yet folded
     for (node_id, node) in enumerate(graph.nodes)
         fold || break
         (persistent[node_id] || isempty(node.inputs)) && continue
@@ -485,6 +507,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             args = [realize_view(results[id], evaluate_shapes(st, none)) for (id, _, st) in node.inputs]
             out = Luminal.zero_tensor(compile_device, Float32, dims...)
             execute_op!(out, evaluate_op_shapes(node.op, none), args...)
+            # Views made for the inputs hold references to whole input buffers until
+            # the GC runs; drop them now (the inputs themselves keep theirs).
+            for (k, (id, _, _)) in enumerate(node.inputs)
+                args[k] !== results[id] && Luminal._free_now!(args[k])
+            end
             out
         catch
             nothing   # e.g. symbolic shapes: leave it to run time
@@ -492,13 +519,26 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         val === nothing && continue
         results[node_id] = val
         persistent[node_id] = folded[node_id] = true
+        for (id, _, _) in node.inputs
+            folded[id] || continue
+            pending[id] -= 1
+            if pending[id] == 0 && !(id in retain) && results[id] !== nothing
+                Luminal._free_now!(results[id])   # every consumer is folded: no longer needed
+                results[id] = nothing
+            end
+        end
+        # A tensor used only as a matmul weight feeds no further folding: convert now.
+        # Folded values belong to this compile only: converted directly, no shared cache.
+        storage = _weight_storage(graph, node_id, val, consumers, retain, weight_dtype)
+        if storage !== nothing
+            results[node_id] = storage(val)
+            Luminal._free_now!(val)
+        end
     end
     for node_id in findall(folded)
-        if !(node_id in retain) && all(folded[c] for (c, _) in consumers[node_id])
+        if !(node_id in retain) && all(folded[c] for (c, _) in consumers[node_id]) && results[node_id] !== nothing
+            Luminal._free_now!(results[node_id])
             results[node_id] = nothing          # only fed other folded nodes
-        elseif (storage = _weight_storage(graph, node_id, results[node_id], consumers, retain, weight_dtype)) !== nothing
-            # Folded values belong to this compile only: convert directly, no shared cache
-            results[node_id] = storage(results[node_id])
         end
     end
 
