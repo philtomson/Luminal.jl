@@ -151,6 +151,58 @@ function relu(a::GraphTensor)
     return add_op!(a.graph_ref, ReLU(), inputs, a.shape)
 end
 
+"""
+    gather(data, coords::Vector{GraphTensor})
+
+Coordinate-form gather: `out[c] = data[coords[1][c], .., coords[r][c]]`, one
+coordinate tensor per axis of `data` (0-based, as Float32 values), all of the
+same shape, which is the output's. Out-of-range coordinates read 0. (The
+two-tensor `gather(weight, ids)` is the embedding row lookup.)
+"""
+function gather(data::GraphTensor, coords::AbstractVector{GraphTensor})
+    d = _coords_dims(data, coords)
+    inputs = vcat([(data.id, 0, data.shape)], [(c.id, 0, c.shape) for c in coords])
+    return add_op!(data.graph_ref, GatherND(), inputs, ShapeTracker(d))
+end
+
+"""
+    scatter(init, src, coords::Vector{GraphTensor}; mode=:replace)
+
+Coordinate-form scatter: a copy of `init` with `out[coords[1][c], .., coords[r][c]]`
+set to `src[c]` (`mode=:replace`) or incremented by it (`mode=:add`, atomic, so
+repeated coordinates accumulate). One coordinate tensor per axis of `init`,
+each of `src`'s shape; out-of-range writes are dropped. With `:replace`, which of
+several writes to one element survives is unspecified on the GPU.
+"""
+function scatter(init::GraphTensor, src::GraphTensor, coords::AbstractVector{GraphTensor}; mode::Symbol=:replace)
+    mode in (:replace, :add) || throw(ArgumentError("scatter mode must be :replace or :add, got :$mode"))
+    d = _coords_dims(init, coords)
+    isequal(d, realized_dims(src.shape)) || throw(DimensionMismatch("scatter: coordinates have shape $d, src $(realized_dims(src.shape))"))
+    inputs = vcat([(init.id, 0, init.shape), (src.id, 0, src.shape)], [(c.id, 0, c.shape) for c in coords])
+    return add_op!(init.graph_ref, ScatterND(mode), inputs, ShapeTracker(realized_dims(init.shape)))
+end
+
+function _coords_dims(data::GraphTensor, coords)
+    r = length(realized_dims(data.shape))
+    length(coords) == r || throw(ArgumentError("need one coordinate tensor per axis of the data ($r), got $(length(coords))"))
+    all(c -> c.graph_ref === data.graph_ref, coords) || throw(ArgumentError("coordinates must be from the data's graph"))
+    d = realized_dims(coords[1].shape)
+    all(c -> isequal(realized_dims(c.shape), d), coords) ||
+        throw(DimensionMismatch("coordinate tensors must share one shape: $([realized_dims(c.shape) for c in coords])"))
+    return d
+end
+
+"""
+    iota(graph, dims, f)
+
+A tensor of shape `dims` with `out[c_1, .., c_k] = f(c_1, .., c_k)` over its
+0-based coordinates (Int arguments; the result is stored as Float32). For
+example `iota(g, [n], i -> i)` is `0:n-1`, and `iota(g, [n, m], (i, j) -> i * m + j)`
+a row-major index. Evaluated on the host; `f` should be pure.
+"""
+iota(graph::Graph, dims::AbstractVector, f) =
+    add_op!(graph, Iota(f), Tuple{Int, Int, ShapeTracker}[], ShapeTracker(collect(Luminal.DimType, dims)))
+
 # Rounding, elementwise; values stay Float32 (round: half to even)
 Base.floor(a::GraphTensor) = add_op!(a.graph_ref, Floor(), [(a.id, 0, a.shape)], a.shape)
 Base.ceil(a::GraphTensor) = add_op!(a.graph_ref, Ceil(), [(a.id, 0, a.shape)], a.shape)

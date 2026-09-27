@@ -738,6 +738,18 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             owned[node_id] = true
             processed[node_id] = true
             continue
+        elseif op isa Luminal.Iota
+            # evaluated on the host, uploaded again only when its (symbolic) size changes
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(graph.shapes[node_id]))
+                if !isassigned(res, node_id) || res[node_id] === nothing || size(res[node_id]) != Tuple(dims_int)
+                    isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
+                    res[node_id] = to_device(Luminal._iota_values(op, dims_int), dev)
+                end
+            end)
+            owned[node_id] = true
+            processed[node_id] = true
+            continue
         elseif op isa Luminal.Function && op.name == "InputTensor"
             processed[node_id] = true
             continue

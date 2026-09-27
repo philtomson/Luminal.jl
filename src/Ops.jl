@@ -32,6 +32,27 @@ struct Trunc <: Op end
 struct Div <: Op end
 struct Exp <: Op end
 
+# Coordinate-form gather and scatter (upstream's logical gather / scatter): one
+# coordinate tensor per axis of the data, all of one shape, holding 0-based
+# indices as Float32 values (exact up to 2^24).
+#   GatherND:  out[c] = data[coord_1[c], .., coord_r[c]], 0 where out of range
+#   ScatterND: out = init, then out[coord_1[c], .., coord_r[c]] = src[c] (:replace)
+#              or += src[c] (:add, atomic); out-of-range writes are dropped.
+#              With :replace, repeated coordinates leave one of the writes
+#              (which one is unspecified on the GPU).
+struct GatherND <: Op end
+struct ScatterND <: Op
+    mode::Symbol
+end
+
+# A source: out[c_1, .., c_k] = f(c_1, .., c_k) over the 0-based output
+# coordinates (upstream's iota, with any Julia function as the expression).
+# (Untyped field: one op type for every function, as the e-graph bridge needs;
+# evaluated on the host, so nothing is lost.)
+struct Iota <: Op
+    f::Any
+end
+
 # Ternary (C x A x B -> A): select(c, a, b) = c != 0 ? a : b, broadcasting
 struct Select <: Op end
 

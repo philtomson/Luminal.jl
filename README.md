@@ -171,7 +171,11 @@ batch of 4 clips decodes in about the time of 2.
 ### Graph and compiler
 - **Primitive ops**: unary `Log2, Exp2, Exp, Sin, Sqrt, Recip, ReLU`, rounding
   `Floor, Ceil, Round, Trunc`; binary `Add, Mul, Div, Mod, Max, LessThan`; ternary
-  `Select` (`select(c, a, b)`); `SumReduce, MaxReduce`; movement ops (`Permute, Expand,
+  `Select` (`select(c, a, b)`); coordinate-form `GatherND` / `ScatterND`
+  (`gather(data, [coords...])`, `scatter(init, src, [coords...]; mode=:replace | :add)`,
+  one 0-based coordinate tensor per axis, out-of-range reads 0 and writes are
+  dropped, `:add` accumulates repeated coordinates atomically); `Iota`
+  (`iota(g, dims, f)`, any function of the coordinates); `SumReduce, MaxReduce`; movement ops (`Permute, Expand,
   Reshape, Slice, Pad`); and `MatMul`. Everything else (softmax, norms, GELU,
   attention) is built from these in `HighLevelOps.jl`.
 - **Symbolic shapes**: dimensions may be symbols, for example a decode position,

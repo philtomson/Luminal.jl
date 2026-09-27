@@ -1557,6 +1557,72 @@ end
     end
 end
 
+# --- Coordinate gather / scatter and iota -------------------------------------
+# One coordinate array per data axis, each with the output's (gather) or src's
+# (scatter) shape, holding 0-based indices as Float32 values.
+
+# Linear index of element i's coordinates into an array of size `dims`, and
+# whether they are in range
+@inline function _coord_index(coords, i, dims)
+    lin = 0; stride = 1; ok = true
+    for k in 1:length(coords)
+        c = unsafe_trunc(Int, @inbounds coords[k][i])
+        ok &= (0 <= c) & (c < dims[k])
+        lin += c * stride
+        stride *= dims[k]
+    end
+    return ok, lin + 1
+end
+
+@kernel function _gather_nd_kernel!(out, @Const(data), coords, dims)
+    i = @index(Global, Linear)
+    ok, j = _coord_index(coords, i, dims)
+    @inbounds out[i] = ok ? data[j] : zero(eltype(out))
+end
+
+@kernel function _scatter_nd_kernel!(out, @Const(src), coords, dims, ::Val{ADD}) where ADD
+    i = @index(Global, Linear)
+    ok, j = _coord_index(coords, i, dims)
+    if ok
+        if ADD
+            KernelAbstractions.@atomic out[j] += src[i]
+        else
+            @inbounds out[j] = src[i]
+        end
+    end
+end
+
+_dense(x) = x isa DenseArray ? x : copy(x)
+# `x` as a dense array of `like`'s size and device (coordinates may arrive as
+# views, or with size-1 dims left by an expand)
+function _dense_like(x, like)
+    x isa DenseArray && size(x) == size(like) && return x
+    y = similar(like)
+    broadcast!(identity, y, _align_broadcast(x, y))
+    return y
+end
+
+function execute_op!(out, op::GatherND, data, coords...)
+    d = _dense(data)
+    cs = map(c -> _dense_like(c, out), coords)
+    length(out) == 0 && return out
+    _gather_nd_kernel!(KernelAbstractions.get_backend(out), 256)(out, d, cs, size(d); ndrange=length(out))
+    return out
+end
+
+function execute_op!(out, op::ScatterND, init, src, coords...)
+    out === init || copyto!(out, _dense_like(init, out))
+    s = _dense(src)
+    cs = map(c -> _dense_like(c, s), coords)
+    length(s) == 0 && return out
+    _scatter_nd_kernel!(KernelAbstractions.get_backend(out), 256)(out, s, cs, size(out), Val(op.mode === :add);
+                                                                 ndrange=length(s))
+    return out
+end
+
+_iota_values(op::Iota, dims) = Float32[op.f((Tuple(I) .- 1)...) for I in CartesianIndices(Tuple(dims))]
+execute_op!(out, op::Iota) = copyto!(out, _iota_values(op, size(out)))
+
 function execute_op!(out, op::Function, inputs...)
     if op.name == "InputTensor"
         return nothing

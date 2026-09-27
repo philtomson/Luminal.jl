@@ -55,6 +55,42 @@ function Luminal.execute_op(op::Luminal.Pad, x::TA{T}) where T
                             low=[p[1] for p in op.padding], high=[p[2] for p in op.padding])
 end
 
+# Coordinate gather / scatter: 1-based linear indices into the flattened data,
+# and which coordinates are in range (the rest read 0 / are dropped, as on CPU/GPU)
+_mat(x) = Reactant.TracedUtils.materialize_traced_array(x)
+
+function _lin_index(coords, dims)
+    ok = nothing; lin = nothing; stride = 1
+    for (c, d) in zip(coords, dims)
+        ci = Reactant.Ops.convert(TracedRArray{Int64, ndims(c)}, _mat(c))    # truncates, as the kernels
+        okk = (ci .>= 0) .& (ci .< d)
+        ok = ok === nothing ? okk : ok .& okk
+        lin = lin === nothing ? ci .* stride : lin .+ ci .* stride
+        stride *= d
+    end
+    return ok, lin .+ 1
+end
+
+function Luminal.execute_op(::Luminal.GatherND, data::TA{T}, coords...) where T
+    ok, lin = _lin_index(coords, size(data))
+    safe = ifelse.(ok, lin, 1)
+    v = Reactant.Ops.gather_getindex(_mat(vec(data)), _mat(Base.reshape(safe, :, 1)))
+    return ifelse.(ok, Base.reshape(v, size(safe)), zero(T))
+end
+
+function Luminal.execute_op(op::Luminal.ScatterND, init::TA{T}, src, coords...) where T
+    ok, lin = _lin_index(coords, size(init))
+    L = length(init)
+    idx = Base.broadcast((i, _) -> i, ifelse.(ok, lin, L + 1), src)   # out of range: a spare slot
+    ext = cat(_mat(vec(init)), Reactant.Ops.constant(zeros(T, 1)); dims=1)
+    f = op.mode === :add ? ((a, b) -> a + b) : ((_, b) -> b)
+    r = Reactant.Ops.scatter(f, [ext], _mat(Base.reshape(idx, :, 1)), [_mat(vec(src))];
+                             update_window_dims=Int64[], inserted_window_dims=Int64[1],
+                             input_batching_dims=Int64[], scatter_indices_batching_dims=Int64[],
+                             scatter_dims_to_operand_dims=Int64[1], index_vector_dim=Int64(2))[1]
+    return Base.reshape(_mat(r[1:L]), size(init))
+end
+
 # W[ids, :] as onehot(ids) * W: token ids arrive as Float32 values
 function _gather(W, ids)
     V = size(W, 1)
@@ -116,6 +152,8 @@ function _evaluate(g::Luminal.Graph, outs::Vector{Int}, ins::Vector{Int}, xs)
         res[id] = if op isa Luminal.Function && op.name == "ARange"
             n = Luminal.eval_dim(Luminal.realized_dims(g.shapes[id])[1])
             lift(Float32.(collect(0:n-1)))
+        elseif op isa Luminal.Iota
+            lift(Luminal._iota_values(op, Luminal.eval_dim.(Luminal.realized_dims(g.shapes[id]))))
         elseif op isa Luminal.Function && op.name == "Gather"
             _gather(vals...)
         elseif op isa Luminal.Constant

@@ -284,6 +284,39 @@ vjp_rules(op::LessThan, node_id::Int, node::Node, grad_out::GraphTensor, grads::
 # The rounding ops likewise (as in PyTorch)
 vjp_rules(op::Union{Floor, Ceil, Round, Trunc}, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict) = nothing
 
+# --- Gather / scatter ---
+# Coordinates get no gradient (they are indices). The two ops are each other's
+# adjoints: gathered gradients scatter-add back (repeated coordinates accumulate),
+# scattered ones are gathered.
+
+_coords(node, first, graph) = [GraphTensor(id, st, graph) for (id, _, st) in node.inputs[first:end]]
+_zeros(graph, dims) = expand_to(constant(graph, 0.0f0), dims)
+
+function vjp_rules(op::GatherND, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    graph = grad_out.graph_ref
+    data_id, _, data_st = node.inputs[1]
+    g = scatter(_zeros(graph, realized_dims(data_st)), grad_out, _coords(node, 2, graph); mode=:add)
+    accumulate_grad!(grads, data_id, g)
+end
+
+function vjp_rules(op::ScatterND, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    graph = grad_out.graph_ref
+    init_id, _, init_st = node.inputs[1]
+    src_id, _, src_st = node.inputs[2]
+    coords = _coords(node, 3, graph)
+    # src: each element's gradient is the output gradient where it landed (exact
+    # for :add; for :replace with repeated coordinates, as if every write survived)
+    accumulate_grad!(grads, src_id, gather(grad_out, coords))
+    if op.mode === :add
+        accumulate_grad!(grads, init_id, grad_out)
+    else
+        # init: only where nothing was written
+        written = scatter(_zeros(graph, realized_dims(init_st)), expand_to(constant(graph, 1.0f0), realized_dims(src_st)),
+                          coords; mode=:replace)
+        accumulate_grad!(grads, init_id, grad_out * (1.0f0 - written))
+    end
+end
+
 function vjp_rules(op::Select, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
     # the gradient goes to whichever branch was selected; none to the condition
     graph = grad_out.graph_ref

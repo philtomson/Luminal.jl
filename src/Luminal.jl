@@ -18,7 +18,7 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, Floor, Ceil, Round, Trunc, Select, Div, Exp, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulQ4, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, SoftmaxOp, Function, Slice, Pad, FlashAttentionOp, Unfold
+export Op, Add, Mul, LessThan, Floor, Ceil, Round, Trunc, Select, Div, Exp, GatherND, ScatterND, Iota, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulQ4, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, SoftmaxOp, Function, Slice, Pad, FlashAttentionOp, Unfold
 
 
 include("Graph.jl")
@@ -30,7 +30,7 @@ export gradients, backward, mark_trainable!
 
 # Graph Construction API
 include("HighLevelOps.jl")
-export matmul, relu, sigmoid, swish, silu, gelu, softmax, layer_norm, mean_norm, std_norm, arange, gather, max_reduce, flash_attention, triu, unfold, log2, exp2, sin, cos, sqrt, abs, select
+export matmul, relu, sigmoid, swish, silu, gelu, softmax, layer_norm, mean_norm, std_norm, arange, gather, max_reduce, flash_attention, triu, unfold, log2, exp2, sin, cos, sqrt, abs, select, scatter, iota
 
 # Hardware Abstraction
 include("Device.jl")

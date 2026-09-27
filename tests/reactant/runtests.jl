@@ -51,6 +51,18 @@ end
         check(g, outs, [a, c], Any[av, Float32.(rand(0:1, 16, 1))])
     end
 
+    @testset "gather, scatter, iota" begin
+        g = Graph()
+        A = tensor(g, [5, 4]); i = tensor(g, [6]); j = tensor(g, [6]); s = tensor(g, [6])
+        y = gather(A, [i, j])
+        t = gather(A, [i, iota(g, [6], k -> k % 4)])
+        sr = scatter(A, s, [i, j])
+        sa = scatter(A, s, [i * 0f0, j]; mode=:add)            # repeated coordinates
+        io = iota(g, [3, 4], (a, b) -> a * 4 + b)
+        iv = Float32[0, 4, 2, 5, 1, 3]; jv = Float32[3, 0, 1, 1, -1, 2]   # (5,1), (1,-1) out of range
+        check(g, [y, t, sr, sa, io * 1f0], [A, i, j, s], Any[randn(Float32, 5, 4), iv, jv, randn(Float32, 6)])
+    end
+
     @testset "views: permute, slice, pad, concat" begin
         g = Graph()
         a = tensor(g, [6, 5, 4]); b = tensor(g, [6, 3, 4])
