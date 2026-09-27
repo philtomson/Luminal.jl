@@ -723,8 +723,11 @@ end
 # with several columns, 2 per pass and 128 threads are best (~2x 4 per pass at 4
 # columns). Batched int4 is still bound by activation reads (128 bytes per column
 # per 16-byte load, twice int8's ratio); unpacking the codes once per load instead
-# of per column did not help. Staging activations in local memory is the next step
-# for batch sizes > 2.
+# of per column did not help, and neither did more rows per workgroup (4 or 8 rows
+# sharing each activation load were slower). The kernel is instruction-bound with
+# several columns (nibble extract, convert and multiply-add per weight and column,
+# ~60% of the GPU's scalar issue rate at 8 columns): the next step is packed Float16
+# math (two weights per instruction) with Float16 activations.
 const Q4_MAX_COLS = 2
 const DEFAULT_Q4_THREADS = 0     # 0: chosen per call (`_q4_threads`)
 _q4_threads(K32::Int, N::Int) = (N == 1 && K32 >= 256) ? 256 : 128
