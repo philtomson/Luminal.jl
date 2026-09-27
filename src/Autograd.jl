@@ -265,6 +265,18 @@ end
 # LessThan is piecewise constant: its gradient is zero everywhere it exists, so it
 # contributes nothing (stated explicitly rather than falling to the default rule).
 vjp_rules(op::LessThan, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict) = nothing
+# The rounding ops likewise (as in PyTorch)
+vjp_rules(op::Union{Floor, Ceil, Round, Trunc}, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict) = nothing
+
+function vjp_rules(op::Select, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # the gradient goes to whichever branch was selected; none to the condition
+    graph = grad_out.graph_ref
+    c = GraphTensor(node.inputs[1][1], node.inputs[1][3], graph)
+    a = GraphTensor(node.inputs[2][1], node.inputs[2][3], graph)
+    b = GraphTensor(node.inputs[3][1], node.inputs[3][3], graph)
+    accumulate_grad!(grads, a.id, unbroadcast(select(c, grad_out, 0.0f0), realized_dims(a.shape)))
+    accumulate_grad!(grads, b.id, unbroadcast(select(c, 0.0f0, grad_out), realized_dims(b.shape)))
+end
 
 # --- Movement Ops ---
 

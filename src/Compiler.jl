@@ -31,6 +31,8 @@ function fix_gpu_ast!(expr::Expr)
             expr.args[1] = :(Base.max)
         elseif expr.args[1] == :min
             expr.args[1] = :(Base.min)
+        elseif expr.args[1] in (:floor, :ceil, :round, :trunc, :exp)
+            expr.args[1] = :(Base.$(expr.args[1]))
         end
         for i in 2:length(expr.args)
             if expr.args[i] isa Expr
@@ -226,7 +228,9 @@ function is_elementwise(op)
            op isa Luminal.FusedAddReLU || op isa Luminal.LessThan ||
            op isa Luminal.Log2 || op isa Luminal.Exp2 || op isa Luminal.Sin || 
            op isa Luminal.Cos || op isa Luminal.Sqrt || op isa Luminal.Recip || 
-           op isa Luminal.ReLU || op isa Luminal.Constant
+           op isa Luminal.ReLU || op isa Luminal.Constant ||
+           op isa Luminal.Floor || op isa Luminal.Ceil || op isa Luminal.Round ||
+           op isa Luminal.Trunc || op isa Luminal.Select
 end
 
 # Helper functions for fused kernels
@@ -262,6 +266,16 @@ function op_to_sym(op, inputs)
         return term(max, inputs[1] + inputs[2], 0.0f0; type=Real)
     elseif op isa Luminal.LessThan
         return term(ifelse, term(<, inputs[1], inputs[2]), 1.0f0, 0.0f0; type=Real)
+    elseif op isa Luminal.Floor
+        return term(floor, inputs[1]; type=Real)
+    elseif op isa Luminal.Ceil
+        return term(ceil, inputs[1]; type=Real)
+    elseif op isa Luminal.Round
+        return term(round, inputs[1]; type=Real)
+    elseif op isa Luminal.Trunc
+        return term(trunc, inputs[1]; type=Real)
+    elseif op isa Luminal.Select
+        return term(ifelse, term(!=, inputs[1], 0.0f0), inputs[2], inputs[3]; type=Real)
     elseif op isa Luminal.Constant
         return Float32(op.value)
     else

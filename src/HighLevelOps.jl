@@ -143,6 +143,29 @@ function relu(a::GraphTensor)
     return add_op!(a.graph_ref, ReLU(), inputs, a.shape)
 end
 
+# Rounding, elementwise; values stay Float32 (round: half to even)
+Base.floor(a::GraphTensor) = add_op!(a.graph_ref, Floor(), [(a.id, 0, a.shape)], a.shape)
+Base.ceil(a::GraphTensor) = add_op!(a.graph_ref, Ceil(), [(a.id, 0, a.shape)], a.shape)
+Base.round(a::GraphTensor) = add_op!(a.graph_ref, Round(), [(a.id, 0, a.shape)], a.shape)
+Base.trunc(a::GraphTensor) = add_op!(a.graph_ref, Trunc(), [(a.id, 0, a.shape)], a.shape)
+
+"""
+    select(cond, a, b)
+
+Elementwise `cond != 0 ? a : b`, broadcasting all three (`a` and `b` may be
+numbers). Unlike `cond * a + (1 - cond) * b`, the branch not taken never
+reaches the result, so an Inf or NaN there does not leak through.
+"""
+function select(c::GraphTensor, a::GraphTensor, b::GraphTensor)
+    @assert c.graph_ref === a.graph_ref === b.graph_ref "Tensors must be from the same graph"
+    inputs = [(c.id, 0, c.shape), (a.id, 0, a.shape), (b.id, 0, b.shape)]
+    out_dims = broadcast_dims(broadcast_dims(realized_dims(c.shape), realized_dims(a.shape)), realized_dims(b.shape))
+    return add_op!(c.graph_ref, Select(), inputs, ShapeTracker(out_dims))
+end
+select(c::GraphTensor, a::Number, b::GraphTensor) = select(c, constant(c.graph_ref, a), b)
+select(c::GraphTensor, a::GraphTensor, b::Number) = select(c, a, constant(c.graph_ref, b))
+select(c::GraphTensor, a::Number, b::Number) = select(c, constant(c.graph_ref, a), constant(c.graph_ref, b))
+
 function Base.abs(a::GraphTensor)
     return relu(a) + relu(-a)
 end

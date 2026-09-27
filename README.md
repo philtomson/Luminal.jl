@@ -169,8 +169,9 @@ batch of 4 clips decodes in about the time of 2.
 ## Features
 
 ### Graph and compiler
-- **Primitive ops**: unary `Log2, Exp2, Sin, Sqrt, Recip, ReLU`; binary `Add, Mul,
-  Mod, Max, LessThan`; `SumReduce, MaxReduce`; movement ops (`Permute, Expand,
+- **Primitive ops**: unary `Log2, Exp2, Sin, Sqrt, Recip, ReLU`, rounding
+  `Floor, Ceil, Round, Trunc`; binary `Add, Mul, Mod, Max, LessThan`; ternary
+  `Select` (`select(c, a, b)`); `SumReduce, MaxReduce`; movement ops (`Permute, Expand,
   Reshape, Slice, Pad`); and `MatMul`. Everything else (softmax, norms, GELU,
   attention) is built from these in `HighLevelOps.jl`.
 - **Symbolic shapes**: dimensions may be symbols, for example a decode position,

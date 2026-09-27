@@ -42,6 +42,14 @@ end
         check(g, outs, [a, b], Any[randn(Float32, 16, 12), randn(Float32, 16, 12)])
     end
 
+    @testset "rounding and select" begin
+        g = Graph()
+        a = tensor(g, [16, 12]); c = tensor(g, [16, 1])
+        outs = [floor(a), ceil(a), round(a), trunc(a), select(c, a * a, a), select(a < 0f0, 0f0, a)]
+        av = randn(Float32, 16, 12) .* 3; av[1:4] .= Float32[2.5, -2.5, 0.5, -1.5]
+        check(g, outs, [a, c], Any[av, Float32.(rand(0:1, 16, 1))])
+    end
+
     @testset "views: permute, slice, pad, concat" begin
         g = Graph()
         a = tensor(g, [6, 5, 4]); b = tensor(g, [6, 3, 4])

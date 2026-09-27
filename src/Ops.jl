@@ -22,6 +22,15 @@ struct FusedMulAdd <: Op end
 struct FusedAddReLU <: Op end
 struct LessThan <: Op end
 
+# Rounding (A -> A); values stay Float32. Round is half to even.
+struct Floor <: Op end
+struct Ceil <: Op end
+struct Round <: Op end
+struct Trunc <: Op end
+
+# Ternary (C x A x B -> A): select(c, a, b) = c != 0 ? a : b, broadcasting
+struct Select <: Op end
+
 # Loop Ops
 struct LoopIn <: Op
     name::String
