@@ -51,6 +51,15 @@ end
         check(g, outs, [a, c], Any[av, Float32.(rand(0:1, 16, 1))])
     end
 
+    @testset "matmul ranks" begin
+        g = Graph()
+        a3 = tensor(g, [5, 7, 4]); b3 = tensor(g, [7, 3, 4]); w = tensor(g, [7, 3]); b4 = tensor(g, [7, 3, 4, 2])
+        a1 = tensor(g, [5, 7, 1, 2])
+        outs = [matmul(a3, b3), matmul(a3, w), matmul(a3, b4), matmul(a1, b4)]
+        check(g, outs, [a3, b3, w, b4, a1], Any[randn(Float32, 5, 7, 4), randn(Float32, 7, 3, 4), randn(Float32, 7, 3),
+                                              randn(Float32, 7, 3, 4, 2), randn(Float32, 5, 7, 1, 2)])
+    end
+
     @testset "dtypes" begin
         g = Graph()
         f = tensor(g, [6]); i = tensor(g, [6]; dtype=Int32); d = tensor(g, [6]; dtype=Float64)

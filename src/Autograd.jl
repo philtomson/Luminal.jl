@@ -73,9 +73,10 @@ Sum out dimensions that were broadcasted to reach the current gradient shape.
 function unbroadcast(grad::GraphTensor, target_shape::Vector{Luminal.DimType})
     res = grad
     
-    # 1. Reduce rank until matches target
+    # 1. Reduce rank until it matches the target. Broadcasting is left-aligned
+    #    (a lower-rank operand gains trailing dims), so the extra dims are the last.
     while length(realized_dims(res.shape)) > length(target_shape)
-        res = sum(res, 1)
+        res = sum(res, length(realized_dims(res.shape)))
     end
     
     # 2. Sum out broadcasted dimensions
@@ -88,9 +89,8 @@ function unbroadcast(grad::GraphTensor, target_shape::Vector{Luminal.DimType})
     curr_shape = realized_dims(res.shape)
     is_one(x) = (x isa Number && x == 1)
     
-    # Pre-pad target_shape with 1s to match curr_shape length if necessary
-    # (though step 1 should have handled this)
-    padded_target = [ones(Int, max(0, length(curr_shape) - length(target_shape)))..., target_shape...]
+    # (after step 1 the ranks match; pad defensively, left-aligned)
+    padded_target = [target_shape..., ones(Int, max(0, length(curr_shape) - length(target_shape)))...]
     
     # Iterate backwards so summing doesn't shift the indices we haven't processed yet
     for i in length(curr_shape):-1:1
@@ -427,8 +427,9 @@ function vjp_rules(op::MatMul, node_id::Int, node::Node, grad_out::GraphTensor, 
     rank_a = length(realized_dims(a.shape))
     rank_b = length(realized_dims(b.shape))
     
-    perm_a = [collect(1:rank_a-2)..., rank_a, rank_a-1]
-    perm_b = [collect(1:rank_b-2)..., rank_b, rank_b-1]
+    # transpose the matrix dims, which lead (batch dims trail)
+    perm_a = [2, 1, collect(3:rank_a)...]
+    perm_b = [2, 1, collect(3:rank_b)...]
     
     grad_a = matmul(grad_out, permute(b, perm_b))
     grad_b = matmul(permute(a, perm_a), grad_out)

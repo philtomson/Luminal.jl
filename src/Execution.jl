@@ -12,49 +12,16 @@ using KernelAbstractions.Extras: @unroll
 
 export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight, Q4Weight, Int4, dequantize
 
-# Helper for batch matrix multiplication
+# Functional batched matmul, left-aligned as the MatMul op: (M, K, batch...) *
+# (K, N, batch...) -> (M, N, batch...), batch dims broadcasting.
 function batch_matmul(A, B)
-    # ... (Keep existing implementation for interpreter) ...
-    # A: (..., M, K), B: (..., K, N)
-    
-    # Handle simple 2D case
-    if ndims(A) == 2 && ndims(B) == 2
-        return A * B
-    end
-    
-    # Handle 3D * 2D (Linear on batch): (B, S, D) * (D, V) -> (B, S, V)
-    if ndims(A) == 3 && ndims(B) == 2
-        B1, S, D = size(A)
-        res = similar(A, B1, S, size(B, 2))
-        for i in 1:B1
-            res[i, :, :] = A[i, :, :] * B
-        end
-        return res
-    end
-    
-    # Handle 3D batch case: (B, M, K) * (B, K, N) -> (B, M, N)
-    if ndims(A) == 3 && ndims(B) == 3
-        @assert size(A, 1) == size(B, 1) "Batch dimensions (3D) must match: $(size(A, 1)) vs $(size(B, 1))"
-        batch_size = size(A, 1)
-        res = similar(A, batch_size, size(A, 2), size(B, 3))
-        for i in 1:batch_size
-            res[i, :, :] = A[i, :, :] * B[i, :, :]
-        end
-        return res
-    end
-    
-    # Handle 4D (Llama attention): (B, H, S, D) * (B, H, D, S) -> (B, H, S, S)
-    if ndims(A) == 4 && ndims(B) == 4
-        @assert size(A, 1) == size(B, 1) && size(A, 2) == size(B, 2) "Batch and head dimensions must match: A $(size(A)), B $(size(B))"
-        B1, B2 = size(A, 1), size(A, 2)
-        res = similar(A, B1, B2, size(A, 3), size(B, 4))
-        for i in 1:B1, j in 1:B2
-            res[i, j, :, :] = A[i, j, :, :] * B[i, j, :, :]
-        end
-        return res
-    end
-    
-    error("Batch matmul not implemented for $(ndims(A))D and $(ndims(B))D (Shapes: $(size(A)) and $(size(B)))")
+    ndims(A) == 2 && ndims(B) == 2 && return A * B
+    bA, bB = size(A)[3:end], size(B)[3:end]
+    n = max(length(bA), length(bB))
+    get1(t, k) = k <= length(t) ? t[k] : 1
+    batch = ntuple(k -> max(get1(bA, k), get1(bB, k)), n)
+    C = similar(B, promote_type(eltype(A), eltype(B)), size(A, 1), size(B, 2), batch...)
+    return batch_matmul!(C, A, B)
 end
 
 function _ensure_contiguous(x)
@@ -922,62 +889,33 @@ function batch_matmul!(C, A, B)
     B = _ensure_contiguous(B)
     # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
     
-    # 2D * 2D
-    if ndims(A) == 2 && ndims(B) == 2
-        return _matmul2d!(C, A, B)
-    end
-    
-    # Linear: 2D * 3D (Out, In) * (In, S, B) -> (Out, S, B)
-    if ndims(A) == 2 && ndims(B) == 3
-        # Use single large gemm by flattening batch and sequence
-        out_dim, in_dim = size(A)
-        in_dim2, s, b = size(B)
-        @assert in_dim == in_dim2 "Inner dimensions must match: $in_dim vs $in_dim2"
-        
-        # mul! works on reshaped views
-        _matmul2d!(Base.reshape(C, out_dim, s * b), A, Base.reshape(B, in_dim, s * b))
+    # Left-aligned: (M, K, batch...) * (K, N, batch...) -> (M, N, batch...), the
+    # batch dims broadcasting (size 1 against k, or missing on one side).
+    ndims(A) == 2 && ndims(B) == 2 && return _matmul2d!(C, A, B)
+
+    # Unbatched left operand (a weight): B's batch folds into its columns, one GEMM
+    if ndims(A) == 2 && B isa DenseArray && C isa DenseArray
+        M, K = size(A)
+        _matmul2d!(Base.reshape(C, M, :), A, Base.reshape(B, K, :))
         return C
     end
 
-    # Linear: 3D * 2D (B, S, In) * (In, Out) -> (B, S, Out)
-    if ndims(A) == 3 && ndims(B) == 2
-        batch, s, in_dim = size(A)
-        in_dim2, out_dim = size(B)
-        @assert in_dim == in_dim2 "Inner dimensions must match: $in_dim vs $in_dim2"
-        
-        # mul! works on reshaped views
-        mul!(Base.reshape(C, batch * s, out_dim), Base.reshape(A, batch * s, in_dim), B)
-        return C
+    bC = size(C)[3:end]
+    n = length(bC)
+    pad(X) = Base.reshape(X, size(X, 1), size(X, 2), ntuple(k -> k + 2 <= ndims(X) ? size(X, k + 2) : 1, n)...)
+    A, B = pad(A), pad(B)
+    # Equal batch dims, dense: one strided-batched GEMM on GPU
+    if size(A)[3:end] == size(B)[3:end] == bC && A isa DenseArray && B isa DenseArray && C isa DenseArray
+        r3(X) = Base.reshape(X, size(X, 1), size(X, 2), :)
+        _batched_gemm!(r3(C), r3(A), r3(B)) === nothing || return C
     end
-    
-    # Attention: 3D * 3D (B, M, K) * (B, K, N) -> (B, M, N)
-    if ndims(A) == 3 && ndims(B) == 3
-        B1 = size(A, 1)
-        for i in 1:B1
-            mul!(view(C, i, :, :), view(A, i, :, :), view(B, i, :, :))
-        end
-        return C
+    # General: one GEMM per batch element, size-1 batch dims broadcast
+    for I in CartesianIndices(bC)
+        ia = ntuple(k -> size(A, k + 2) == 1 ? 1 : I[k], n)
+        ib = ntuple(k -> size(B, k + 2) == 1 ? 1 : I[k], n)
+        mul!(view(C, :, :, Tuple(I)...), view(A, :, :, ia...), view(B, :, :, ib...))
     end
-    
-    # Attention: 4D * 4D (H, B, S, D) * (H, B, D, S) -> (H, B, S, S)
-    # Note: In Julia column-major, (S, D) should be the fastest dimensions for efficient view matmul.
-    # So (S, D, H, B) or (D, S, H, B) are better.
-    if ndims(A) == 4 && ndims(B) == 4
-        # One strided-batched GEMM over all (head, batch) pairs when layouts allow
-        if size(A)[3:4] == size(B)[3:4] && A isa DenseArray && B isa DenseArray && C isa DenseArray
-            nb = size(A, 3) * size(A, 4)
-            r3(X) = Base.reshape(X, size(X, 1), size(X, 2), nb)
-            _batched_gemm!(r3(C), r3(A), r3(B)) === nothing || return C
-        end
-        # Loop over the last two dimensions
-        B1, B2 = size(A, 3), size(A, 4)
-        for i in 1:B1, j in 1:B2
-            mul!(view(C, :, :, i, j), view(A, :, :, i, j), view(B, :, :, i, j))
-        end
-        return C
-    end
-    
-    error("Batch matmul! not implemented for $(ndims(A))D and $(ndims(B))D (Shapes: $(size(A)) and $(size(B)))")
+    return C
 end
 
 function realize_view(data, st::ShapeTracker)

@@ -40,11 +40,24 @@ function Luminal.execute_op(::Luminal.RotaryEmbed, x::TA, c, s)
     return Base.reshape(cat(x1 .* c4 .- x2 .* s4, x2 .* c4 .+ x1 .* s4; dims=1), size(x))
 end
 
-# Left-aligned: (N, K) x (K, rest...), or batched (M, K, batch...) x (K, N, batch...)
-# with trailing batch dims, as one dot_general
+# Left-aligned: (M, K, batch...) x (K, N, batch...) -> (M, N, batch...), batch
+# dims broadcasting. An unbatched side folds the other's batch into one matmul;
+# otherwise one dot_general over the (broadcast) batch dims.
 function Luminal.execute_op(::Luminal.MatMul, a::TA, b::TA)
     ndims(a) == 2 && return Base.reshape(a * Base.reshape(b, size(b, 1), :), size(a, 1), size(b)[2:end]...)
-    nb = ndims(a) - 2
+    if ndims(b) == 2                                      # (M, K, batch...) x (K, N)
+        M, K = size(a, 1), size(a, 2); bs = size(a)[3:end]; nb = length(bs)
+        ap = permutedims(a, (1, 3:ndims(a)..., 2))        # (M, batch..., K)
+        r = Base.reshape(Base.reshape(ap, :, K) * b, M, bs..., size(b, 2))
+        return permutedims(r, (1, nb + 2, 2:nb+1...))
+    end
+    n = max(ndims(a), ndims(b)) - 2
+    pad(x) = Base.reshape(x, size(x, 1), size(x, 2), ntuple(k -> k + 2 <= ndims(x) ? size(x, k + 2) : 1, n)...)
+    a, b = _mat(pad(a)), _mat(pad(b))
+    batch = ntuple(k -> max(size(a, k + 2), size(b, k + 2)), n)
+    grow(x) = size(x)[3:end] == batch ? x : repeat(x, 1, 1, ntuple(k -> batch[k] ÷ size(x, k + 2), n)...)
+    a, b = _mat(grow(a)), _mat(grow(b))
+    nb = n
     r = Reactant.Ops.dot_general(a, b; contracting_dimensions=([2], [1]),
                                  batching_dimensions=(collect(3:ndims(a)), collect(3:ndims(b))))
     return permutedims(r, (nb + 1, nb + 2, 1:nb...))     # (batch..., M, N) -> (M, N, batch...)

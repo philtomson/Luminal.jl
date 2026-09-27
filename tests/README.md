@@ -24,6 +24,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 |------|--------|
 | `test_compilation.jl` | `compile()` against the interpreter |
 | `test_fusion.jl` | Elementwise fusion |
+| `test_matmul_shapes.jl` | `matmul` across ranks (2D to 4D, batch broadcasting, rank mismatch, non-contiguous operands): interpreter, functional form, `compile()` CPU and GPU; batched and rank-broadcast gradients |
 | `test_dtypes.jl` | Dtype inference and strict checks; every dtype through the interpreter and fused `compile()` (CPU and GPU); `cast`, `trunc_cast`, `trunc_div` / `trunc_rem` and their run-time refusals; Float64 constants; integer coordinates; gradients through casts; e-graph search. BFloat16 cases need `julia -C native,-avx512bf16` on AVX512-BF16 CPUs |
 | `test_gather_scatter.jl` | Coordinate gather, scatter (`:replace`, atomic `:add`, out of range), `iota`: interpreter, `compile()` CPU and GPU, gradients, e-graph search |
 | `test_elementwise_ops.jl` | Rounding, `select`, exact `Div` and `Exp`: interpreter, `compile()` (fused, CPU and GPU), e-graph search, gradients |
@@ -74,7 +75,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 
 `reactant/runtests.jl` compiles graphs through Reactant.jl / XLA
 (`ext/LuminalReactantExt.jl`) and compares them with the interpreter: matmul and
-softmax, elementwise ops and reductions, rounding, `select`, `Div` and `Exp`, gather / scatter / `iota`, views (permute,
+softmax, elementwise ops and reductions, matmul across ranks, rounding, `select`, `Div` and `Exp`, gather / scatter / `iota`, views (permute,
 slice, pad, concat), and a two-layer Llama prefill with weights as arguments and baked in as constants,
 plus its StableHLO. It has its own environment, so Reactant never enters
 Luminal's:
