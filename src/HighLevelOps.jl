@@ -60,7 +60,14 @@ Base.:-(a::GraphTensor, b::GraphTensor) = a + (-b)
 Base.:-(a::GraphTensor, b::Number) = a + (-b)
 Base.:-(a::Number, b::GraphTensor) = constant(b.graph_ref, a) - b
 
-Base.:/(a::GraphTensor, b::GraphTensor) = a * reciprocal(b)
+# Tensor / tensor is one exact Div; tensor / number stays a multiply by the
+# (rounded) reciprocal, the cheap form scaling paths rely on.
+function Base.:/(a::GraphTensor, b::GraphTensor)
+    @assert a.graph_ref === b.graph_ref "Tensors must be from the same graph"
+    inputs = [(a.id, 0, a.shape), (b.id, 0, b.shape)]
+    out_dims = broadcast_dims(realized_dims(a.shape), realized_dims(b.shape))
+    return add_op!(a.graph_ref, Div(), inputs, ShapeTracker(out_dims))
+end
 Base.:/(a::GraphTensor, b::Number) = a * (1.0f0 / Float32(b))
 Base.:/(a::Number, b::GraphTensor) = constant(b.graph_ref, a) / b
 
@@ -125,7 +132,8 @@ function Base.cos(a::GraphTensor)
 end
 
 function Base.exp(a::GraphTensor)
-    return exp2(a * (1.0f0 / log(2.0f0)))
+    inputs = [(a.id, 0, a.shape)]
+    return add_op!(a.graph_ref, Exp(), inputs, a.shape)
 end
 
 function Base.sqrt(a::GraphTensor)

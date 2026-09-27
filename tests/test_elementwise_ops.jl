@@ -1,4 +1,4 @@
-# Rounding (floor, ceil, round, trunc) and select: interpreter, compile() with
+# Rounding (floor, ceil, round, trunc), select, exact division and exp: interpreter, compile() with
 # fusion (CPU and GPU), and gradients.
 using Test
 using Luminal
@@ -55,7 +55,51 @@ Luminal.get_device() isa CPUDevice || push!(devices, Luminal.get_device())
     @test execute(g3, q.id, Dict(p.id => Float32[0, 0.5, 2]), CPUDevice()) == Float32[0, 0.5, Inf]
 end
 
+@testset "div and exp" begin
+    g = Graph(); a = tensor(g, [8, 6]); b = tensor(g, [8, 1])
+    q = a / b; e = exp(a); ch = exp(a / b) * (2f0 / b)
+    av = randn(Float32, 8, 6) .* 3; bv = randn(Float32, 8, 1) .+ 3f0
+    inputs = Dict(a.id => av, b.id => bv)
+    r = execute(g, [q.id, e.id, ch.id], inputs, CPUDevice())
+    @test r[q.id] == av ./ bv                                  # one rounding, not a * (1/b)
+    @test r[e.id] ≈ exp.(av)
+    @test g.nodes[q.id].op isa Div && g.nodes[e.id].op isa Exp
+    for dev in devices
+        cg = compile(g; device=dev, retain=[q.id, e.id, ch.id])
+        rc = cg(inputs; device=dev)
+        @test Array(rc[q.id]) ≈ av ./ bv
+        @test Array(rc[e.id]) ≈ exp.(av)
+        @test Array(rc[ch.id]) ≈ exp.(av ./ bv) .* (2f0 ./ bv)
+    end
+    g2 = Graph(); x = tensor(g2, [32]); y = tensor(g2, [32])
+    z = exp(x / y) / (y * y)
+    xv, yv = randn(Float32, 32), rand(Float32, 32) .+ 1f0
+    for dev in devices
+        cg = compile(g2; device=dev)
+        @test length(cg.steps) == 1
+        @test Array(cg(Dict(x.id => xv, y.id => yv); device=dev)[z.id]) ≈ exp.(xv ./ yv) ./ (yv .* yv)
+    end
+end
+
+function fd_grad(f, x; h=1f-2)
+    g = similar(x)
+    for i in eachindex(x)
+        xp = copy(x); xm = copy(x); xp[i] += h; xm[i] -= h
+        g[i] = (f(xp) - f(xm)) / 2h
+    end
+    g
+end
+
 @testset "gradients" begin
+    # div (with broadcasting) and exp against finite differences
+    g = Graph(); a = tensor(g, [3, 4]); b = tensor(g, [3, 1])
+    loss = sum(sum(exp(a * 0.3f0) / b, 2), 1)
+    mark_trainable!(a); mark_trainable!(b); gr = backward(loss)
+    av = randn(Float32, 3, 4); bv = Float32[1.5, -2.0, 3.0][:, :]
+    r = execute(g, [gr[a.id].id, gr[b.id].id], Dict(a.id => av, b.id => bv), CPUDevice())
+    @test r[gr[a.id].id] ≈ fd_grad(v -> sum(exp.(v .* 0.3f0) ./ bv), av) rtol=1e-2
+    @test r[gr[b.id].id] ≈ fd_grad(v -> sum(exp.(av .* 0.3f0) ./ v), bv) rtol=1e-2
+
     # select: the gradient follows the chosen branch, broadcast back to each input
     g = Graph(); c = tensor(g, [4, 1]); a = tensor(g, [4, 3])
     b = tensor(g, [1, 3])

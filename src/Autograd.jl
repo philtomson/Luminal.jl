@@ -193,6 +193,22 @@ function vjp_rules(op::Exp2, node_id::Int, node::Node, grad_out::GraphTensor, gr
     accumulate_grad!(grads, input_id, grad_x)
 end
 
+function vjp_rules(op::Exp, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # d(e^x)/dx = e^x, this node's output
+    out = GraphTensor(node_id, grad_out.graph_ref.shapes[node_id], grad_out.graph_ref)
+    accumulate_grad!(grads, node.inputs[1][1], grad_out * out)
+end
+
+function vjp_rules(op::Div, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # d(a/b)/da = 1/b, d(a/b)/db = -(a/b)/b
+    graph = grad_out.graph_ref
+    a = GraphTensor(node.inputs[1][1], node.inputs[1][3], graph)
+    b = GraphTensor(node.inputs[2][1], node.inputs[2][3], graph)
+    out = GraphTensor(node_id, graph.shapes[node_id], graph)
+    accumulate_grad!(grads, a.id, unbroadcast(grad_out / b, realized_dims(a.shape)))
+    accumulate_grad!(grads, b.id, unbroadcast(-(grad_out * out) / b, realized_dims(b.shape)))
+end
+
 function vjp_rules(op::Sin, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
     # d(sin(x))/dx = cos(x)
     input_id = node.inputs[1][1]

@@ -42,10 +42,11 @@ end
         check(g, outs, [a, b], Any[randn(Float32, 16, 12), randn(Float32, 16, 12)])
     end
 
-    @testset "rounding and select" begin
+    @testset "rounding, select, div, exp" begin
         g = Graph()
         a = tensor(g, [16, 12]); c = tensor(g, [16, 1])
-        outs = [floor(a), ceil(a), round(a), trunc(a), select(c, a * a, a), select(a < 0f0, 0f0, a)]
+        outs = [floor(a), ceil(a), round(a), trunc(a), select(c, a * a, a), select(a < 0f0, 0f0, a),
+                exp(a * 0.1f0) / (c + 2f0)]
         av = randn(Float32, 16, 12) .* 3; av[1:4] .= Float32[2.5, -2.5, 0.5, -1.5]
         check(g, outs, [a, c], Any[av, Float32.(rand(0:1, 16, 1))])
     end

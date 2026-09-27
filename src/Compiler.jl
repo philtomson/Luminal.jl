@@ -230,7 +230,8 @@ function is_elementwise(op)
            op isa Luminal.Cos || op isa Luminal.Sqrt || op isa Luminal.Recip || 
            op isa Luminal.ReLU || op isa Luminal.Constant ||
            op isa Luminal.Floor || op isa Luminal.Ceil || op isa Luminal.Round ||
-           op isa Luminal.Trunc || op isa Luminal.Select
+           op isa Luminal.Trunc || op isa Luminal.Select ||
+           op isa Luminal.Div || op isa Luminal.Exp
 end
 
 # Helper functions for fused kernels
@@ -266,6 +267,10 @@ function op_to_sym(op, inputs)
         return term(max, inputs[1] + inputs[2], 0.0f0; type=Real)
     elseif op isa Luminal.LessThan
         return term(ifelse, term(<, inputs[1], inputs[2]), 1.0f0, 0.0f0; type=Real)
+    elseif op isa Luminal.Div
+        return term(/, inputs[1], inputs[2]; type=Real)   # a term, so it stays one division
+    elseif op isa Luminal.Exp
+        return term(exp, inputs[1]; type=Real)
     elseif op isa Luminal.Floor
         return term(floor, inputs[1]; type=Real)
     elseif op isa Luminal.Ceil

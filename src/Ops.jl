@@ -28,6 +28,10 @@ struct Ceil <: Op end
 struct Round <: Op end
 struct Trunc <: Op end
 
+# Exact division (A x A -> A) and the natural exponential (A -> A)
+struct Div <: Op end
+struct Exp <: Op end
+
 # Ternary (C x A x B -> A): select(c, a, b) = c != 0 ? a : b, broadcasting
 struct Select <: Op end
 

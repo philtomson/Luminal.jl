@@ -24,7 +24,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 |------|--------|
 | `test_compilation.jl` | `compile()` against the interpreter |
 | `test_fusion.jl` | Elementwise fusion |
-| `test_elementwise_ops.jl` | Rounding and `select`: interpreter, `compile()` (fused, CPU and GPU), e-graph search, gradients |
+| `test_elementwise_ops.jl` | Rounding, `select`, exact `Div` and `Exp`: interpreter, `compile()` (fused, CPU and GPU), e-graph search, gradients |
 | `test_concat_views.jl` | Concatenation and strided-slice views |
 | `test_half_weights.jl` | Float16 and int8 weight storage, the weight cache |
 | `test_egraph_rewrite.jl` | Graph ⇄ e-graph, rewrite rules, kernel and precision variants, `compile(...; search=...)` |
@@ -72,7 +72,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 
 `reactant/runtests.jl` compiles graphs through Reactant.jl / XLA
 (`ext/LuminalReactantExt.jl`) and compares them with the interpreter: matmul and
-softmax, elementwise ops and reductions, rounding and `select`, views (permute,
+softmax, elementwise ops and reductions, rounding, `select`, `Div` and `Exp`, views (permute,
 slice, pad, concat), and a two-layer Llama prefill with weights as arguments and baked in as constants,
 plus its StableHLO. It has its own environment, so Reactant never enters
 Luminal's:
