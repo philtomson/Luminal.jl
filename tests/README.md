@@ -66,3 +66,22 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 |------|--------|
 | `test_autograd.jl` | Gradients of arithmetic, broadcasting, matmul, unary ops |
 | `test_optimizer.jl` | SGD and Adam |
+
+## Reactant extension
+
+`reactant/runtests.jl` compiles graphs through Reactant.jl / XLA
+(`ext/LuminalReactantExt.jl`) and compares them with the interpreter: matmul and
+softmax, elementwise ops and reductions, views (permute, slice, pad, concat), and
+a two-layer Llama prefill with weights as arguments and baked in as constants,
+plus its StableHLO. It has its own environment, so Reactant never enters
+Luminal's:
+
+```bash
+julia --project=tests/reactant -e 'using Pkg; Pkg.instantiate()'
+julia --project=tests/reactant tests/reactant/runtests.jl   # LUMINAL_REACTANT_BACKEND=gpu to try XLA's GPU backend
+```
+
+On a ROCm machine whose kernel the bundled runtime does not support (seen with
+gfx1151), Reactant needs the system HSA runtime preloaded, and its
+librocm_sysdeps libraries on the library path, e.g.
+`env -u LD_LIBRARY_PATH LD_PRELOAD=$ROCM/lib/libhsa-runtime64.so.1 LD_LIBRARY_PATH=$ROCM/lib/rocm_sysdeps/lib julia ...`.

@@ -41,6 +41,10 @@ export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice
 include("Execution.jl")
 export execute
 
+# XLA via Reactant.jl (methods in ext/LuminalReactantExt.jl, loaded with Reactant)
+include("ReactantStubs.jl")
+export reactant_function, reactant_compile, to_stablehlo
+
 # Weight Loading
 include("Weights.jl")
 export WeightRegistry, register_weight!, load_weights!, load_weights_hf!

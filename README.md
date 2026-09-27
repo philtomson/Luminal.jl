@@ -248,6 +248,32 @@ the reduced-precision weight formats have no gradients.
 - **CUDA** (CUDA.jl) has backends for the generic paths but has not been
   exercised in recent work.
 
+### XLA via Reactant.jl (optional)
+With [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) loaded, a Luminal graph
+(as a model builds it, before `compile`) can be traced into StableHLO and
+compiled by XLA, which opens it to the Reactant ecosystem (Enzyme, Lux, sharding,
+XLA's CPU/GPU/TPU backends):
+
+```julia
+using Luminal, Reactant
+f  = reactant_function(g, out, [inp])      # pure Julia function Reactant can trace
+fc = reactant_compile(g, out, [inp], toks)  # XLA executable; call with Reactant.to_rarray args
+to_stablehlo(g, out, [inp], toks)           # the MLIR text
+```
+
+Weights preloaded into the graph are baked in as constants; list them in the
+inputs to pass them as arguments instead. Covered: the primitive ops, gather,
+and the RMSNorm / softmax / rotary ops the model builders emit (Llama prefill
+matches the interpreter). Not covered: the compiled graph's kernels
+(reduced-precision weights, `DecodeAttention` with its in-place cache update).
+Reactant is a weak dependency (`ext/LuminalReactantExt.jl`); its tests have their
+own environment, `tests/reactant`.
+
+This is an interoperability route, not a faster one here: Reactant bundles its
+own ROCm, which cannot share a process with AMDGPU.jl's, and its XLA build has
+no GEMM kernels for gfx1151 (Radeon 8060S), so on this machine it runs on XLA's
+CPU backend.
+
 ### Not yet implemented
 - Multi-GPU or distributed execution
 - Tensor-core or matrix-core kernels, and generated (rather than hand-written) kernels
@@ -268,6 +294,14 @@ checks a real transcription against Hugging Face when `whisper_tiny/`
 
 ```bash
 python3 examples/whisper_reference.py whisper_tiny whisper_tiny/ref/audio.f32 whisper_tiny/ref
+```
+
+The Reactant extension is tested in its own environment (see
+[tests/README.md](tests/README.md)):
+
+```bash
+julia --project=tests/reactant -e 'using Pkg; Pkg.instantiate()'
+julia --project=tests/reactant tests/reactant/runtests.jl
 ```
 
 See [tests/README.md](tests/README.md).

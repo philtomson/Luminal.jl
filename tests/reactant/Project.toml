@@ -1,0 +1,7 @@
+[deps]
+Luminal = "222a9b07-3232-5822-9dfe-603b9586f401"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+Luminal = {path = "../.."}
