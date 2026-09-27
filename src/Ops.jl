@@ -116,6 +116,15 @@ end
 MatMulQ8(group::Integer) = MatMulQ8(group, 0)
 MatMulQ8() = MatMulQ8(DEFAULT_Q8_THREADS, 0)
 
+# MatMul with a 4-bit weight (Q4Weight: group-wise, weight-only). `group`: threads
+# per workgroup, `cols`: columns per pass (0: the kernel's per-shape defaults,
+# `_q4_threads` / `Q4_MAX_COLS`). Offered by the e-graph search with precision=:int4.
+struct MatMulQ4 <: Op
+    group::Int
+    cols::Int
+end
+MatMulQ4() = MatMulQ4(0, 0)
+
 # Rotary position embedding ("rotate half") in one kernel. Inputs: x (D, S, H, B),
 # cos and sin tables (D/2, S). For i <= D/2:
 #   out[i] = x[i] * cos[i] - x[i + D/2] * sin[i],  out[i + D/2] = x[i + D/2] * cos[i] + x[i] * sin[i]

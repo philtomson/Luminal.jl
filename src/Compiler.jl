@@ -136,7 +136,8 @@ end
 # 2D Float32 GPU array whose every use is as the left operand of a matmul, read
 # unchanged, and all uses must want the same storage:
 #   MatMulF16(_, :gemv) -> HalfWeight, MatMulF16(_, :gemm_ex) -> HalfWeightN,
-#   MatMulQ8 -> QuantWeight, MatMul -> per `weight_dtype` (Float16 / Int8 / Luminal.Int4).
+#   MatMulQ8 -> QuantWeight, MatMulQ4 -> Q4Weight, MatMul -> per `weight_dtype`
+#   (Float16 / Int8 / Luminal.Int4).
 # `weight_dtype` is one type for every weight, or a function of the weight's node id
 # (a per-tensor policy, e.g. int8 for sensitive tensors and 4-bit for the rest).
 _wdtype(weight_dtype, node_id) = weight_dtype isa Type ? weight_dtype : weight_dtype(node_id)
@@ -151,6 +152,7 @@ function _weight_storage(graph, node_id, data, consumers, retain, weight_dtype)
         c = graph.nodes[cid]
         want = c.op isa Luminal.MatMulF16 ? (c.op.impl === :gemm_ex ? Luminal.HalfWeightN : Luminal.HalfWeight) :
                c.op isa Luminal.MatMulQ8  ? Luminal.QuantWeight :
+               c.op isa Luminal.MatMulQ4  ? Luminal.Q4Weight :
                (c.op isa Luminal.MatMul && weight_dtype === Float16) ? Luminal.HalfWeight :
                (c.op isa Luminal.MatMul && weight_dtype === Int8)    ? Luminal.QuantWeight :
                (c.op isa Luminal.MatMul && weight_dtype === Luminal.Int4) ? Luminal.Q4Weight : nothing
@@ -372,7 +374,7 @@ function estimate_compile_bytes(graph::Luminal.Graph; retain::Vector{Int}=Int[],
             ops = [graph.nodes[c].op for c in cs]
             wd = _wdtype(weight_dtype, id)
             per = isempty(ops) ? 4.0 :
-                  all(op -> op isa Luminal.MatMul && wd === Luminal.Int4, ops) ? 0.63 :
+                  all(op -> op isa Luminal.MatMulQ4 || (op isa Luminal.MatMul && wd === Luminal.Int4), ops) ? 0.63 :
                   all(op -> op isa Luminal.MatMulQ8 || (op isa Luminal.MatMul && wd === Int8), ops) ? 1.04 :
                   all(op -> op isa Luminal.MatMulF16 || (op isa Luminal.MatMul && wd === Float16), ops) ? 2.0 : 4.0
             bytes += ceil(Int, per * k)
@@ -621,7 +623,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             (mid, _, mst) = node.inputs[k]
             (rid, _, rst) = node.inputs[3 - k]
             m = graph.nodes[mid]
-            (m.op isa Luminal.MatMul || m.op isa Luminal.MatMulQ8 ||
+            (m.op isa Luminal.MatMul || m.op isa Luminal.MatMulQ8 || m.op isa Luminal.MatMulQ4 ||
              (m.op isa Luminal.MatMulF16 && m.op.impl === :gemv)) || continue
             (persistent[mid] || processed_pads[mid] || mid in retain) && continue
             consumer_count[mid] == 1 && length(consumers[mid]) == 1 || continue

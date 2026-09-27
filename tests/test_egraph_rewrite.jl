@@ -153,3 +153,32 @@ end
         end
     end
 end
+
+# precision=:int8 / :int4: the static extraction chooses the quantized kernels,
+# and the measured search keeps only candidates that match it (the quantized
+# results, not Float32) -- they must equal the graph run on the dequantized weights.
+if get_device() isa Luminal.AMDDevice
+    @testset "search with int8 / int4 weights" begin
+        dev = get_device()
+        for (prec, T) in ((:int8, Luminal.QuantWeight), (:int4, Luminal.Q4Weight))
+            g = Graph()
+            # weights above the cost model's GEMV size threshold (64K elements)
+            x = Luminal.tensor(g, [256, 1, 1])
+            w1 = Luminal.tensor(g, [512, 256]); w2 = Luminal.tensor(g, [256, 512])
+            vals = [randn(Float32, 512, 256), randn(Float32, 256, 512)]
+            g.tensors[(w1.id, 1)] = Luminal.to_device(vals[1], dev)
+            g.tensors[(w2.id, 1)] = Luminal.to_device(vals[2], dev)
+            out = Luminal.matmul(w2, Luminal.matmul(w1, x))
+            inputs = Dict{Int,Any}(x.id => randn(Float32, 256, 1, 1))
+            for search in (:static, :measured)
+                ex = compile(g; device=dev, retain=[out.id, x.id], free_intermediates=false, search=search,
+                             precision=prec, search_inputs=inputs, search_cache=mktempdir())
+                got = Array(ex(inputs; device=dev)[out.id])[:, 1, 1]
+                stored = [v for v in ex.cg.results if v isa T]
+                @test length(stored) == 2
+                D1, D2 = (Array(Luminal.dequantize(T(Luminal.to_device(v, dev)))) for v in vals)
+                @test got ≈ D2 * (D1 * inputs[x.id][:, 1, 1]) rtol = 1e-4
+            end
+        end
+    end
+end

@@ -156,7 +156,7 @@ function _decode_graph(s::LlamaSession, B::Int)
             @info "Searching equivalent decode graphs ($(s.search), batch $B)..."
             compile(g; device=s.device, retain=retain, free_intermediates=false,
                     capture=capture, search=s.search,
-                    precision=wd === Int8 ? :int8 : wd === Float16 ? :weights : false)
+                    precision=wd === Luminal.Int4 ? :int4 : wd === Int8 ? :int8 : wd === Float16 ? :weights : false)
         end
         attn = s.model.layers[1].attention
         cache = LlamaKVCacheState(length(s.model.layers), attn.n_kv_heads, attn.head_dim;

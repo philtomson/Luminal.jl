@@ -839,7 +839,9 @@ function matmul_residual!(out, op, W, x, r)
     W isa QuantWeight && return _q8_matmul!(out, W, x; residual = r,
                                              group = op isa MatMulQ8 ? op.group : DEFAULT_Q8_THREADS,
                                              cols = op isa MatMulQ8 ? op.cols : 0)
-    W isa Q4Weight && return _q4_matmul!(out, W, x; residual = r)
+    W isa Q4Weight && return _q4_matmul!(out, W, x; residual = r,
+                                          group = op isa MatMulQ4 ? op.group : DEFAULT_Q4_THREADS,
+                                          cols = op isa MatMulQ4 ? op.cols : 0)
     W isa HalfWeight && return _half_matmul!(out, W, x; residual = r,
                                               group = op isa MatMulF16 ? op.group : DEFAULT_HALF_GROUP)
     error("matmul_residual!: unsupported weight storage $(typeof(W))")
@@ -1223,6 +1225,8 @@ function execute_op!(out, op::MatMulF16, a, b)   # `a` is a HalfWeight(N) once c
     a isa HalfWeightN && return batch_matmul!(out, Float32.(a.w), b)
     return batch_matmul!(out, a, b)
 end
+execute_op!(out, op::MatMulQ4, a, b) =   # `a` is a Q4Weight once compiled
+    a isa Q4Weight ? _q4_matmul!(out, a, b; group=op.group, cols=op.cols) : batch_matmul!(out, a, b)
 execute_op!(out, op::MatMulQ8, a, b) =   # `a` is a QuantWeight once compiled
     a isa QuantWeight ? _q8_matmul!(out, a, b; group=op.group, cols=op.cols) : batch_matmul!(out, a, b)
 execute_op!(out, op::MatMulT, a, b) = batch_matmul_t!(out, a, b, op.ta, op.tb)

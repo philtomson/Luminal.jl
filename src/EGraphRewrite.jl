@@ -108,7 +108,7 @@ function _make_dims(g, h, ch)
         (a === nothing || b === nothing) && return nothing
         r = _broadcast(a, b)
         return r === nothing ? nothing : Shp(r)
-    elseif h === :xMatMul || h === :xMatMulF16 || h === :xMatMulQ8 || h === :xMatMulT
+    elseif h === :xMatMul || h === :xMatMulF16 || h === :xMatMulQ8 || h === :xMatMulQ4 || h === :xMatMulT
         a, b = _dims(g, ch[2]), _dims(g, ch[3])
         (a === nothing || b === nothing) && return nothing
         if h === :xMatMulT
@@ -174,7 +174,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
     ctx = BridgeCtx(ShapeTracker[], Dict{Any,Int}(), Dict{Symbol,DataType}(),
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
-    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulT,
+    for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulQ4, Luminal.MatMulT,
               Luminal.Expand, Luminal.Pad, Luminal.Slice)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
@@ -290,23 +290,46 @@ const INT8_RULES = @theory q w x begin
     xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((0, 8)), $w, $x)) : nothing
 end
 
-# Verification tolerance floor with int8 weights. Against the Float32 reference,
+# precision=:int4 offers 4-bit weights (Q4Weight: symmetric, groups of 32 by
+# default). Variants are (threads per workgroup, columns per pass), 0 = the
+# kernel's per-shape defaults. Accuracy is a larger step than int8 (+5-8%
+# perplexity on Llama models): choose it deliberately, or per tensor with
+# `weight_dtype` policies (see `weight_preset`).
+const INT4_VARIANTS = ((0, 0), (128, 0), (256, 0), (0, 1))
+_int4_ok(g, w) = _half_ok(g, w) && w.data.dims[2] % 32 == 0
+const INT4_RULES = @theory q w x begin
+    xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((0, 0)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((128, 0)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((256, 0)), $w, $x)) : nothing
+    xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((0, 1)), $w, $x)) : nothing
+end
+
+# Gross verification tolerance for the static extraction with int8 weights (see
+# compile_searched: candidates are then checked against it). Against Float32,
 # int8 logits differ by ~2% on real inputs and ~12% on the default all-zero
 # search inputs (TinyLlama), so the check can only catch broken candidates
 # (layout or indexing errors are O(1)), not quantization quality: that is the
 # user's opt-in, measured by perplexity (examples/quant_eval.jl).
 const INT8_SEARCH_TOLERANCE = 0.25
+# int4 logits differ from Float32 by ~0.2 relative on real inputs, and by more than
+# 1 on the all-zero default search inputs (TinyLlama decode: near-flat logits), so
+# no tolerance separates correct int4 from broken output there. The static
+# extraction is only required to be finite; the int4 kernels' correctness is
+# covered by exact tests against dequantized weights, and every candidate must
+# still match the static extraction within `search_tolerance`.
+const INT4_SEARCH_TOLERANCE = Inf
 
 # `precision` enables reduced-precision alternatives: false (exact rewrites only);
 # true or :weights (Float16 weights, Float32 activations); :activations (also
-# Float16 activations); :int8 (int8 weights); or a collection, e.g. (:weights, :int8).
+# Float16 activations); :int8 (int8 weights); :int4 (4-bit weights); or a
+# collection, e.g. (:weights, :int8).
 function _precision_features(precision)
     precision === false && return Set{Symbol}()
     precision === true && return Set([:weights])
     precision isa Symbol && return _precision_features((precision,))
     f = Set{Symbol}()
     for p in precision
-        p in (:weights, :activations, :int8) || error("unknown precision $p (use :weights, :activations, :int8)")
+        p in (:weights, :activations, :int8, :int4) || error("unknown precision $p (use :weights, :activations, :int8, :int4)")
         push!(f, p)
         p === :activations && push!(f, :weights)
     end
@@ -336,7 +359,8 @@ function saturate_graph!(rw::Rewriter; precision=false, iterations::Int=16)
     theory = vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES,
                   :weights in f ? PRECISION_RULES : RewriteRule[],
                   :activations in f ? ACTIVATION_RULES : RewriteRule[],
-                  :int8 in f ? INT8_RULES : RewriteRule[])
+                  :int8 in f ? INT8_RULES : RewriteRule[],
+                  :int4 in f ? INT4_RULES : RewriteRule[])
     params = SaturationParams(timeout=iterations, eclasslimit=0, enodelimit=0)
     return saturate!(rw.g, theory, params)
 end
@@ -374,9 +398,16 @@ function static_cost(g, n::VecExpr)
     # while rocBLAS's Float32 GEMM stays bandwidth-bound far longer. Calibrated on
     # TinyLlama prefill (Radeon 8060S): f16/f32 time is ~0.55 at N=1, ~1 at N=16,
     # ~2.6 at N=64, ~3.3 at N=256.
-    wd = h in (:xMatMul, :xMatMulF16, :xMatMulQ8) ? _dims(g, ch[2]) : nothing
+    wd = h in (:xMatMul, :xMatMulF16, :xMatMulQ8, :xMatMulQ4) ? _dims(g, ch[2]) : nothing
     if wd !== nothing && length(wd) == 2 && all(x -> x isa Integer, wd) && ins[1] >= 1 << 16
         N = max(1, ins[2] ÷ max(1, wd[2]))
+        if h === :xMatMulQ4
+            # 4-bit GEMV: 0.5625 bytes per weight; instruction-bound with several
+            # columns (unpack and convert per weight and column), so each extra
+            # column costs relatively more than for int8
+            tie = _lit(g, ch[1]) == (0, 0) ? 0.0 : 1.0
+            return 0.5625 * ins[1] * (1 + N / 3) + 4.0 * ins[2] + LAUNCH_BYTES + tie
+        end
         if h === :xMatMulQ8
             # int8 GEMV: 1 byte per weight, same column scaling as the Float16 GEMV
             tie = _lit(g, ch[1]) == (0, 0) ? 0.0 : 1.0     # the model can't tell variants apart
@@ -678,6 +709,11 @@ function merge_projections!(rw::Rewriter; precision=false)
                 union!(g, y, addexpr!(g, Expr(:call, :xMatMulQ8, variant, g[wc], g[x])))
             end
         end
+        if :int4 in f && K % 32 == 0
+            for variant in INT4_VARIANTS
+                union!(g, y, addexpr!(g, Expr(:call, :xMatMulQ4, variant, g[wc], g[x])))
+            end
+        end
         rebuild!(g)
         rank = length(_dims(g, y))
         off = 0
@@ -919,7 +955,6 @@ function compile_searched(graph::Graph; search::Symbol, precision, search_inputs
                           device, retain::Vector{Int}, kwargs...)
     search in (:static, :measured) || error("search must be :none, :static or :measured")
     isempty(retain) && error("compile(...; search=$search) needs `retain`: the node ids to keep")
-    :int8 in _precision_features(precision) && (search_tolerance = max(search_tolerance, INT8_SEARCH_TOLERANCE))
     rw = to_egraph(graph, retain)
     saturate_graph!(rw; precision=precision)
     merge_projections!(rw; precision=precision)
@@ -965,14 +1000,34 @@ function compile_searched(graph::Graph; search::Symbol, precision, search_inputs
     ref = refcg(inputs; device=device)
     reference = Dict(o => Array{Float32}(ref[o]) for o in outs)
     Luminal.release!(refcg); ref = refcg = nothing; GC.gc()
+    relerr(got, want) = maximum(abs.(got .- want); init=0f0) / max(maximum(abs, want; init=0f0), 1f-6)
+    # Lossy weight precision (int8 / int4): the static extraction sets the precision.
+    # It is checked once against Float32 with a gross tolerance (catching broken
+    # output, not quantization quality), and then becomes the reference every
+    # candidate must match within `search_tolerance`: kernel variants, lowering
+    # choices and exact rewrites differ from it only in rounding.
+    feats = _precision_features(precision)
+    gross = :int4 in feats ? INT4_SEARCH_TOLERANCE : :int8 in feats ? INT8_SEARCH_TOLERANCE : nothing
+    if gross !== nothing
+        r0 = build(Dict{Any,String}(); budget=true)
+        r0 === nothing && error("compile(...; search): the static extraction does not fit in device memory")
+        res0 = r0(inputs; device=device)
+        for o in outs
+            got = Array{Float32}(res0[o])
+            all(isfinite, got) || error("measured_search: the static extraction produced non-finite output")
+            e = relerr(got, reference[o])
+            e < gross || error("measured_search: the static extraction differs from Float32 by $e (limit $gross)")
+        end
+        reference = Dict(o => Array{Float32}(res0[o]) for o in outs)
+        Luminal.release!(r0.cg); res0 = r0 = nothing
+    end
     function make_runner(choices)
         r = build(choices; budget=true)
         r === nothing && return nothing
         res = r(inputs; device=device)
         for o in outs
             got = Array{Float32}(res[o])
-            scale = max(maximum(abs, reference[o]; init=0f0), 1f-6)
-            if !(maximum(abs.(got .- reference[o]); init=0f0) / scale < search_tolerance)
+            if !(relerr(got, reference[o]) < search_tolerance)
                 Luminal.release!(r.cg)
                 return nothing
             end
