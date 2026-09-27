@@ -24,6 +24,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 |------|--------|
 | `test_compilation.jl` | `compile()` against the interpreter |
 | `test_fusion.jl` | Elementwise fusion |
+| `test_qwen3.jl` | Qwen3 architecture on a tiny random model (decoupled head size, QK-norm, tied head, eps 1e-6): prefill against a plain-Julia reference, cached decode against prefill (CPU and GPU), config parsing; the Qwen3 chat prompt's tokens when `qwen3_0.6b/` is present |
 | `test_matmul_shapes.jl` | `matmul` across ranks (2D to 4D, batch broadcasting, rank mismatch, non-contiguous operands): interpreter, functional form, `compile()` CPU and GPU; batched and rank-broadcast gradients |
 | `test_dtypes.jl` | Dtype inference and strict checks; every dtype through the interpreter and fused `compile()` (CPU and GPU); `cast`, `trunc_cast`, `trunc_div` / `trunc_rem` and their run-time refusals; Float64 constants; integer coordinates; gradients through casts; e-graph search. BFloat16 cases need `julia -C native,-avx512bf16` on AVX512-BF16 CPUs |
 | `test_gather_scatter.jl` | Coordinate gather, scatter (`:replace`, atomic `:add`, out of range), `iota`: interpreter, `compile()` CPU and GPU, gradients, e-graph search |

@@ -14,6 +14,10 @@ Models validated against Hugging Face `transformers`:
 - **Llama-3-8B-Instruct**: logits within 5e-6 of the reference at every prompt
   position. Greedy chat continuations are identical to HF's with Float32,
   Float16 and int8 decode weights.
+- **Qwen3-0.6B and Qwen3-4B**: logits within 5e-6 of the reference at every
+  prompt position; greedy chat continuations (thinking off) identical to HF's
+  with Float32, Float16 and int8 decode weights (4B), or all but one late token
+  at int8 (0.6B). Chat prompts tokenize exactly as upstream Luminal's benchmark.
 - **TinyLlama 1.1B**: prefill plus KV-cached decode. Perplexity in Float32
   matches the reference, and int8 weights cost +0.25%.
 - **Whisper** (tiny, and other sizes from their `config.json`): transcription
@@ -226,10 +230,15 @@ batch of 4 clips decodes in about the time of 2.
 ### Models and layers
 - Layers: `Linear`, `Conv1D`, `Embedding`, `LayerNorm`, `RMSNorm`, `Mlp`,
   `SelfAttention` (GQA, RoPE), `TransformerBlock`.
-- **Llama / TinyLlama / Llama-3**: models built from `config.json`
+- **Llama / TinyLlama / Llama-3 / Qwen3**: models built from `config.json`
   (`llama_config`), prefill, and a device-resident KV cache with one compiled
   decode graph for every position. `LlamaSession`/`generate` reuse them, and
-  `chat_prompt` produces the model's chat format.
+  `chat_prompt` produces the model's chat format (Llama-3, Zephyr, ChatML).
+  Qwen3's differences are options of the same model: a head size independent of
+  the hidden size, QK-norm (an RMSNorm per head of q and k before RoPE), RMSNorm
+  epsilon, and tied embeddings, where the output head is its own node loaded
+  from the embedding's array (`tie_weight!`), so it can still be stored in
+  reduced precision.
 - **Batched generation**: `llama_generate(model, tok, prompts::Vector{String}, dir)`
   runs one right-padded prefill for all prompts. It then decodes them together,
   each sequence at its own position, and stops each one independently. Its
@@ -243,8 +252,8 @@ batch of 4 clips decodes in about the time of 2.
 - **Weights**: safetensors (F32/F16/BF16) mapped by Hugging Face key through a
   `WeightRegistry`. They are converted to Float32 and transposed on the device.
 - **Tokenizers**: SentencePiece-style BPE (Llama-2, TinyLlama, Phi-3), byte-level BPE
-  (Llama-3, Whisper). Llama tokenizers match Hugging Face token for token, special
-  tokens included.
+  (Llama-3, Qwen3, Whisper). Llama tokenizers match Hugging Face token for token,
+  added tokens included (special or not, e.g. Qwen3's `<think>`).
 
 ### Training
 Reverse-mode autodiff (`backward`, `gradients`) with gradient rules for all 12 of

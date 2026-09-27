@@ -30,7 +30,9 @@ eos = set(eos if isinstance(eos, list) else [eos])
 index = {"prompts": []}
 with torch.no_grad():
     for i, p in enumerate(PROMPTS):
-        ids = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True)
+        # (thinking off, as chat_prompt: Qwen3's template reads enable_thinking, others ignore it)
+        ids = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True,
+                                      enable_thinking=False)
         ids = ids["input_ids"] if isinstance(ids, dict) or hasattr(ids, "keys") else ids
         out_ = model(torch.tensor([ids]), use_cache=True)
         logits = out_.logits[0]                                   # (S, V)

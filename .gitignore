@@ -5,3 +5,5 @@
 
 # Run logs
 /*.log
+/qwen3_0.6b/
+/qwen3_4b/

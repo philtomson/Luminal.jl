@@ -98,6 +98,43 @@ Upstream's figures here come from its own kernel inventory
 - **Prefill:** most dense projections use cuBLASLt, but some still run as
   generic multiply+reduce.
 
+## Qwen3-0.6B and Qwen3-4B, 128 in / 128 out, batch 1
+
+Same checkpoints and revisions on both sides: `Qwen/Qwen3-0.6B@c1899de2` and
+`Qwen/Qwen3-4B@1cfa9a72`, chat prompt with thinking off (the prompt tokenizes
+to exactly upstream's recorded 128 ids). Upstream: FP32, `cuda_lite`,
+`benchmark-128-2026-09-21`. Luminal.jl: `chat_benchmark.jl`, same protocol
+differences as above (upstream's TTFT includes one decode step).
+
+| | Upstream, FP32 (H200) | Luminal.jl, FP32 | Float16 | int8 | `:int4_mixed` | int4 |
+|---|---:|---:|---:|---:|---:|---:|
+| **Qwen3-0.6B** TTFT | 811 ms | **86.5 ms** | 91.9 ms | 108.8 ms | 97.9 ms | 94.1 ms |
+| TPOT | 40.5 ms | **15.4 ms** | 9.2 ms | 7.0 ms | 6.6 ms | 6.3 ms |
+| Decode throughput | 24.7 tok/s | 65.1 tok/s | 108.9 tok/s | 142.9 tok/s | 152.5 tok/s | 158.0 tok/s |
+| Full request | 5.95 s | **2.04 s** | 1.26 s | 1.00 s | 0.93 s | 0.90 s |
+| **Qwen3-4B** TTFT | 3,513 ms | **396 ms** | 406 ms | 396 ms | 411 ms | 401 ms |
+| TPOT | 144.1 ms | **77.0 ms** | 40.4 ms | 24.2 ms | 19.3 ms | 16.9 ms |
+| Decode throughput | 6.9 tok/s | 13.0 tok/s | 24.7 tok/s | 41.3 tok/s | 51.9 tok/s | 59.2 tok/s |
+| Full request | 21.8 s | **10.2 s** | 5.5 s | 3.5 s | 2.9 s | 2.6 s |
+
+Normalized to each machine (FP32 decode; bytes per token ≈ the FP32 weights,
+with the tied embedding / output head counted once: 2.38 GB and 16.09 GB):
+
+| | Upstream (H200) | Luminal.jl (8060S) |
+|---|---:|---:|
+| Qwen3-0.6B achieved bandwidth | 59 GB/s = 1.2% of peak | 155 GB/s = 61% of peak |
+| Qwen3-4B achieved bandwidth | 112 GB/s = 2.3% of peak | 209 GB/s = 82% of peak |
+
+The small model is further from bandwidth-bound on both sides: at 28 layers and
+15 ms per token, kernel launch overhead (even replayed from a HIP graph) is a
+visible share. Qwen3 ties the output head to the embedding; Luminal.jl keeps the
+head as its own graph node loaded from the same array (`tie_weight!`), so the
+reduced-precision columns above quantize the 622 MB (0.6B) / 1.56 GB (4B) head
+too, while the embedding lookup reads the Float32 original. Correctness: prefill
+logits within 5e-6 of Hugging Face `transformers` at every prompt position, and
+greedy continuations identical to HF's (Float32, Float16, int8 on 4B; one late
+token differs at int8 on 0.6B).
+
 ## Where Luminal.jl is ahead
 
 Measured unless marked otherwise.
@@ -183,7 +220,7 @@ These are ordered roughly by how much they limit Luminal.jl today.
 
 | Case | Luminal.jl | Upstream | To make it comparable |
 |---|---|---|---|
-| Qwen3-0.6B / 4B, Gemma3-4B | not supported | 128/128 benchmark published | implement the architectures (backlog #1) |
+| Gemma3-4B | not supported | 128/128 benchmark published | implement the architecture (backlog #1) |
 | TinyLlama 1.1B | 6.4 ms/token int8, 11 ms Float16 | no current example | run upstream's `llm_chat` with a Llama-2-style config, if its adapter accepts it |
 | Whisper (speech) | whisper-tiny: ~35 ms encoder, ~2.5 ms/token decode | no current example (the old Rust example is gone) | none upstream |
 | Same hardware | AMD only | NVIDIA/Apple only | run Luminal.jl's CUDA path on an NVIDIA GPU, or upstream on an H200 next to it |
@@ -196,7 +233,7 @@ the metrics above.
 
 | # | Item | Gain | Effort |
 |---:|---|---|---|
-| 1 | Model coverage: Qwen3 (Q/K norm, tied embeddings), Gemma3, Llama-3.1/3.2 RoPE scaling, templates from `tokenizer_config.json` | Makes 3 more of upstream's benchmarks comparable; basic usability | medium–large |
+| 1 | Model coverage: Gemma3, Llama-3.1/3.2 RoPE scaling, templates from `tokenizer_config.json` (Qwen3 done) | Makes the remaining upstream benchmark comparable; basic usability | medium |
 | 2 | Multi-turn KV reuse in `LlamaSession` (prefill only new tokens) | Follow-up TTFT becomes proportional to the new message, not the conversation | small–medium |
 | 3 | Faster measured search: prune dominated variants, early-stop groups, reuse across batch sizes | 12.7 min → minutes on 8B | medium |
 | 4 | Cold start: PrecompileTools workload, on-disk graph/kernel cache | 43–54 s first request → seconds | medium |
@@ -217,6 +254,10 @@ the metrics above.
 | 2026-09-26 | Luminal.jl | `b5ef9c0`+ | Radeon 8060S | Llama-3-8B / int4 | — | 23.5 ms | `batched_decode.jl`, decode step only |
 | 2026-09-26 | Luminal.jl | `b5ef9c0`+ | Radeon 8060S | Llama-3-8B / `:int4_mixed` | — | 29.0 ms | |
 | 2026-09-26 | Luminal.jl | `b5ef9c0`+ | Radeon 8060S | Llama-3-8B / `:int4_mixed_plus` | — | 33.7 ms | |
+| 2026-09-21 | upstream | `65824ef3` | H200 | Qwen3-0.6B / FP32 | 811 ms | 40.5 ms | `benchmark-128-2026-09-21` |
+| 2026-09-21 | upstream | `65824ef3` | H200 | Qwen3-4B / FP32 | 3,513 ms | 144.1 ms | |
+| 2026-09-27 | Luminal.jl | `5c34f4c`+ | Radeon 8060S | Qwen3-0.6B / FP32, F16, int8, int4_mixed, int4 | 86.5–108.8 ms | 15.4 / 9.2 / 7.0 / 6.6 / 6.3 ms | `chat_benchmark.jl` |
+| 2026-09-27 | Luminal.jl | `5c34f4c`+ | Radeon 8060S | Qwen3-4B / FP32, F16, int8, int4_mixed, int4 | 396–411 ms | 77.0 / 40.4 / 24.2 / 19.3 / 16.9 ms | |
 
 ## Reproduce
 
@@ -225,6 +266,7 @@ Luminal.jl (checkpoint in `llama3_8b_instruct/`):
 ```bash
 julia --project=. examples/chat_benchmark.jl llama3_8b_instruct f32    # also f16, int8
 julia --project=. examples/batched_decode.jl llama3_8b_instruct int8 1,4,8
+julia --project=. examples/chat_benchmark.jl qwen3_0.6b f32            # also qwen3_4b; f16, int8, int4, int4_mixed
 ```
 
 Upstream: see `~/devel/luminal/examples/llm_chat/validation/benchmark-128-2026-09-21/RESULTS.md`

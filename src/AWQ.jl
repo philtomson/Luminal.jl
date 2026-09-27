@@ -108,6 +108,9 @@ function awq_scales(model, tok, model_dir::String; text::String, policy=weight_p
     scales = Dict{String, Vector{Float32}}()
     for (key, members, absorber, kind) in _awq_groups(n_layers)
         all(haskey(xnode, mb) for mb in members) || continue
+        # (not in the checkpoint: tied to another tensor, e.g. Qwen3's lm_head, whose
+        # columns can't be rescaled without changing the embedding it shares)
+        all(haskey(W, mb) for mb in members) || continue
         x = xnode[members[1]]
         stat = Float32.(absum[x] ./ (nchunks * chunk))
         if kind === :rows_gqa                          # tie scales across heads sharing a KV head
@@ -163,6 +166,7 @@ function awq_apply!(W::AbstractDict, scales::AbstractDict, model)
     D, H, KVH = attn.head_dim, attn.n_heads, attn.n_kv_heads
     for (key, members, absorber, kind) in _awq_groups(length(model.layers))
         haskey(scales, key) || continue
+        all(haskey(W, mb) for mb in members) || continue
         s = scales[key]
         dev_s(v) = Luminal.to_device(v, Luminal.get_device())
         for mb in members

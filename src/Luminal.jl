@@ -50,7 +50,7 @@ export reactant_function, reactant_compile, to_stablehlo
 
 # Weight Loading
 include("Weights.jl")
-export WeightRegistry, register_weight!, load_weights!, load_weights_hf!
+export WeightRegistry, register_weight!, tie_weight!, load_weights!, load_weights_hf!
 
 include("NN.jl")
 export NN

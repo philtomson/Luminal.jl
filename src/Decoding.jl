@@ -256,22 +256,8 @@ end
 Clone the model architecture into a new `graph` with a fresh `reg`,
 using the same hyperparameters as the original. Supports `Llama` and `Phi3`.
 """
-function _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry;
-                            rope_base=model.rope_base)
-    attn   = model.layers[1].attention
-    n_h    = attn.n_heads
-    n_kv   = attn.n_kv_heads
-    hd     = attn.head_dim
-    hidden = n_h * hd
-    inter  = Luminal.realized_dims(model.layers[1].feed_forward.gate_proj.weight.shape)[1]
-    vsize  = Luminal.realized_dims(model.head.weight.shape)[1]
-    return Llama(graph, reg;
-                 vocab_size=vsize, hidden=hidden,
-                 n_layers=length(model.layers),
-                 n_heads=n_h, n_kv_heads=n_kv,
-                 intermediate=inter,
-                 rope_base=rope_base)
-end
+_rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry; rope_base=model.rope_base) =
+    Llama(graph, reg; model.config..., rope_base=rope_base)
 
 function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegistry;
                             rope_base=model.rope_base)

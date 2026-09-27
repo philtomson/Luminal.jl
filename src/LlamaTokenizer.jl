@@ -76,17 +76,21 @@ function LlamaTokenizer(model_dir::String)
     end
 
     # Merges: "a b" strings, or [a, b] pairs in newer tokenizer.json files
+    # (pairs are indexed, not collected: collect on a JSON3.Array is so slow that
+    # Qwen3's 151k pairs took over two minutes)
     for entry in model["merges"]
-        parts = entry isa AbstractString ? split(String(entry), ' ') : String.(collect(entry))
-        if length(parts) == 2
-            push!(merges, (String(parts[1]), String(parts[2])))
+        if entry isa AbstractString
+            parts = split(String(entry), ' ')
+            length(parts) == 2 && push!(merges, (String(parts[1]), String(parts[2])))
+        elseif length(entry) == 2
+            push!(merges, (String(entry[1]), String(entry[2])))
         end
     end
 
     id_to_token = Dict(v => k for (k, v) in vocab)
     merge_ranks = Dict(p => i for (i, p) in enumerate(merges))
 
-    # Added tokens (special tokens live here)
+    # Added tokens (special tokens, and e.g. Qwen3's <think>, live here)
     special_ids = Set{Int}()
     special_strs = String[]
     for st in _json_get(data, "added_tokens", [])
@@ -94,10 +98,11 @@ function LlamaTokenizer(model_dir::String)
         id = Int(st["id"])
         vocab[content] = id
         id_to_token[id] = content
-        if _json_get(st, "special", false)
-            push!(special_ids, id)
-            push!(special_strs, content)
-        end
+        # every added token is split out of the text before BPE, as Hugging Face
+        # does, special or not (Qwen3's <think> is "special": false); only the
+        # special ones are hidden when decoding
+        push!(special_strs, content)
+        _json_get(st, "special", false) && push!(special_ids, id)
     end
 
     # Byte-level pre-tokenization (Llama-3): a Split regex followed by ByteLevel
@@ -125,7 +130,9 @@ function LlamaTokenizer(model_dir::String)
     _name(x) = x isa AbstractString ? String(x) : x === nothing ? nothing : String(_json_get(x, "content", ""))
     bos_name = _name(_json_get(tcfg, "bos_token", nothing))
     eos_name = _name(_json_get(tcfg, "eos_token", nothing))
-    bos_id = bos_name !== nothing && haskey(vocab, bos_name) ? vocab[bos_name] : _id("<s>")
+    # an explicit `"bos_token": null` means none (Qwen, whose vocab has "<s>" as text)
+    no_bos = haskey(tcfg, :bos_token) && tcfg[:bos_token] === nothing
+    bos_id = no_bos ? -1 : bos_name !== nothing && haskey(vocab, bos_name) ? vocab[bos_name] : _id("<s>")
     eos_id = eos_name !== nothing && haskey(vocab, eos_name) ? vocab[eos_name] : _id("</s>")
     unk_id = _id("<unk>")
     pad_id = _id("<pad>")
@@ -334,14 +341,22 @@ function _decode_byte_level(tok::LlamaTokenizer, ids::AbstractVector{<:Integer})
 end
 
 """
-    chat_prompt(tok, message) -> String
+    chat_prompt(tok, message; thinking=false) -> String
 
 `message` as a single user turn in the model's chat format, ending where the
-assistant's reply begins: Llama-3's header format when the vocabulary has its
-header tokens, otherwise the Zephyr format TinyLlama-Chat uses. The BOS token is
-not included (`encode(...; bos=true)` and `generate` add it).
+assistant's reply begins: ChatML for Qwen (with an empty think block unless
+`thinking`, as Qwen3's template does), Llama-3's header format when the
+vocabulary has its header tokens, otherwise the Zephyr format TinyLlama-Chat
+uses. The BOS token is not included (`encode(...; bos=true)` and `generate` add
+it, for models that have one).
 """
-function chat_prompt(tok::LlamaTokenizer, message::AbstractString)
+function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Bool=false)
+    if haskey(tok.vocab, "<|im_start|>")
+        # ChatML (Qwen). Qwen3 thinks by default; with thinking off its template
+        # opens the reply with an empty think block.
+        think = haskey(tok.vocab, "<think>") && !thinking ? "<think>\n\n</think>\n\n" : ""
+        return "<|im_start|>user\n$message<|im_end|>\n<|im_start|>assistant\n" * think
+    end
     if haskey(tok.vocab, "<|start_header_id|>")
         return "<|start_header_id|>user<|end_header_id|>\n\n$(strip(message))<|eot_id|>" *
                "<|start_header_id|>assistant<|end_header_id|>\n\n"

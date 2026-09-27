@@ -13,7 +13,7 @@
 
 using SafeTensors
 
-export WeightRegistry, register_weight!, load_weights!, load_weights_hf!, load_weights_to_dict
+export WeightRegistry, register_weight!, tie_weight!, load_weights!, load_weights_hf!, load_weights_to_dict
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WeightRegistry
@@ -27,7 +27,27 @@ Build one alongside the model and pass it to `load_weights!`.
 """
 mutable struct WeightRegistry
     mapping::Dict{String, Int}  # safetensors key -> graph node_id
-    WeightRegistry() = new(Dict{String, Int}())
+    ties::Dict{String, String}  # name -> name it shares data with, when the file lacks it
+    WeightRegistry() = new(Dict{String, Int}(), Dict{String, String}())
+end
+
+"""
+    tie_weight!(reg, name, source)
+
+Tied weights: when the checkpoint has no tensor `name`, its node gets `source`'s
+data (the same array, no copy). The tied tensor stays a separate graph node, so
+e.g. a tied output head is still a matmul-only weight that `compile` can store
+in reduced precision, while the embedding keeps reading the Float32 original.
+"""
+tie_weight!(reg::WeightRegistry, name::String, source::String) = (reg.ties[name] = source; reg)
+
+# Fill tied nodes the checkpoint had no tensor for from their source's data
+function _apply_ties!(graph, reg)
+    for (name, src) in reg.ties
+        id = get(reg.mapping, name, 0); sid = get(reg.mapping, src, 0)
+        (id == 0 || sid == 0 || haskey(graph.tensors, (id, 1)) || !haskey(graph.tensors, (sid, 1))) && continue
+        graph.tensors[(id, 1)] = graph.tensors[(sid, 1)]
+    end
 end
 
 """
@@ -86,6 +106,8 @@ function load_weights!(graph::Luminal.Graph,
         end
     end
 
+    _apply_ties!(graph, reg)
+    loaded += count(n -> haskey(reg.mapping, n) && haskey(graph.tensors, (reg.mapping[n], 1)), keys(reg.ties))
     n_params = length(reg.mapping)
     @info "Loaded $loaded/$n_params weights" path=path
     if loaded < n_params
@@ -116,6 +138,7 @@ function load_weights!(graph::Luminal.Graph,
             loaded += 1
         end
     end
+    _apply_ties!(graph, reg)
     return graph
 end
 

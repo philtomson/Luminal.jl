@@ -304,20 +304,38 @@ struct SelfAttention
     n_heads::Int
     n_kv_heads::Int
     head_dim::Int
+    q_norm::Union{LayerNorm, Nothing}   # per-head RMSNorm of q and k before RoPE (Qwen3)
+    k_norm::Union{LayerNorm, Nothing}
 end
 
-function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Luminal.Graph, reg=nothing, prefix::String="self_attn")
-    head_dim = div(hidden, n_heads)
+"""
+    SelfAttention(hidden, n_heads, n_kv_heads, graph, reg, prefix; head_dim, qk_norm, epsilon)
+
+Grouped-query attention with RoPE. `head_dim` defaults to `hidden ÷ n_heads`;
+a model may set it independently (Qwen3: 16 heads of 128 on a 1024 hidden), in
+which case q and o map between `hidden` and `n_heads * head_dim`. `qk_norm`
+adds an RMSNorm over each head of q and k (weights `q_norm`, `k_norm`, of size
+`head_dim`) before RoPE.
+"""
+function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Luminal.Graph, reg=nothing, prefix::String="self_attn";
+                       head_dim::Int=div(hidden, n_heads), qk_norm::Bool=false, epsilon=1f-5)
     return SelfAttention(
-        _linear(hidden, hidden, graph, reg, "$(prefix).q_proj"; bias=false),
+        _linear(hidden, n_heads * head_dim, graph, reg, "$(prefix).q_proj"; bias=false),
         _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).k_proj"; bias=false),
         _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).v_proj"; bias=false),
-        _linear(hidden, hidden, graph, reg, "$(prefix).o_proj"; bias=false),
+        _linear(n_heads * head_dim, hidden, graph, reg, "$(prefix).o_proj"; bias=false),
         n_heads,
         n_kv_heads,
-        head_dim
+        head_dim,
+        qk_norm ? _rmsnorm(head_dim, graph, reg, "$(prefix).q_norm"; epsilon=epsilon) : nothing,
+        qk_norm ? _rmsnorm(head_dim, graph, reg, "$(prefix).k_norm"; epsilon=epsilon) : nothing,
     )
 end
+
+# q or k as (D, S, H, B), per-head normalized if the model has QK-norm (the fused
+# RMSNorm normalizes dim 1, the head dim)
+_qk_norm(norm::Nothing, t) = t
+_qk_norm(norm::LayerNorm, t) = norm(t)
 
 function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10000.0f0, return_kv::Bool=false)
     # x: (hidden, seq, batch)
@@ -332,6 +350,8 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
     
     keys = Luminal.reshape(sa.k_proj(x), [sa.head_dim, sa.n_kv_heads, seq, batch])
     keys = Luminal.permute(keys, [1, 3, 2, 4]) # (D, S, KV_H, B)
+    queries = _qk_norm(sa.q_norm, queries)
+    keys = _qk_norm(sa.k_norm, keys)
     
     values = Luminal.reshape(sa.v_proj(x), [sa.head_dim, sa.n_kv_heads, seq, batch])
     values = Luminal.permute(values, [1, 3, 2, 4]) # (D, S, KV_H, B)
@@ -372,9 +392,9 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
     v_t = Luminal.permute(values, [2, 1, 3, 4])
     out = Luminal.matmul(probs, v_t)
     
-    # (S, D, H, B) -> (D, H, S, B) -> (Hidden, S, Batch)
+    # (S, D, H, B) -> (D, H, S, B) -> (H * D, S, Batch)
     out = Luminal.permute(out, [2, 3, 1, 4])
-    out = Luminal.reshape(out, [hidden, seq, batch])
+    out = Luminal.reshape(out, [sa.n_heads * sa.head_dim, seq, batch])
     
     out = sa.o_proj(out)
     
@@ -392,12 +412,14 @@ struct TransformerBlock
     feed_forward_norm::LayerNorm
 end
 
-function TransformerBlock(hidden::Int, n_heads::Int, n_kv_heads::Int, intermediate::Int, graph::Luminal.Graph, reg=nothing, prefix::String="block")
+function TransformerBlock(hidden::Int, n_heads::Int, n_kv_heads::Int, intermediate::Int, graph::Luminal.Graph, reg=nothing, prefix::String="block";
+                          head_dim::Int=div(hidden, n_heads), qk_norm::Bool=false, epsilon=1f-5)
     return TransformerBlock(
-        SelfAttention(hidden, n_heads, n_kv_heads, graph, reg, "$(prefix).self_attn"),
-        _rmsnorm(hidden, graph, reg, "$(prefix).input_layernorm"),
+        SelfAttention(hidden, n_heads, n_kv_heads, graph, reg, "$(prefix).self_attn";
+                      head_dim=head_dim, qk_norm=qk_norm, epsilon=epsilon),
+        _rmsnorm(hidden, graph, reg, "$(prefix).input_layernorm"; epsilon=epsilon),
         Mlp(hidden, intermediate, graph, reg, "$(prefix).mlp"),
-        _rmsnorm(hidden, graph, reg, "$(prefix).post_attention_layernorm")
+        _rmsnorm(hidden, graph, reg, "$(prefix).post_attention_layernorm"; epsilon=epsilon)
     )
 end
 
@@ -425,8 +447,19 @@ struct Llama
     norm::LayerNorm
     head::Linear
     rope_base::Float32
+    config::NamedTuple      # the constructor's keywords, to rebuild the architecture
 end
 
+"""
+    Llama(graph, reg; vocab_size, hidden, n_layers, n_heads, n_kv_heads, intermediate,
+          rope_base, head_dim=hidden ÷ n_heads, qk_norm=false, rms_eps=1f-5,
+          tie_embeddings=false)
+
+A Llama-family decoder: Llama 2/3, TinyLlama, and Qwen3 (`head_dim` set
+independently, `qk_norm=true`, `rms_eps=1f-6`, `tie_embeddings=true`: the output
+head reuses the embedding matrix, and there is no `lm_head.weight`). Build it
+from a checkpoint with `Llama(graph, reg; llama_config(dir)...)`.
+"""
 function Llama(graph::Luminal.Graph, reg=nothing; 
                vocab_size=128256, 
                hidden=4096, 
@@ -434,22 +467,35 @@ function Llama(graph::Luminal.Graph, reg=nothing;
                n_heads=32, 
                n_kv_heads=8, 
                intermediate=14336,
-               rope_base=500000.0f0)
-    
+               rope_base=500000.0f0,
+               head_dim=div(hidden, n_heads),
+               qk_norm=false,
+               rms_eps=1f-5,
+               tie_embeddings=false)
+    config = (; vocab_size, hidden, n_layers, n_heads, n_kv_heads, intermediate, rope_base=Float32(rope_base),
+              head_dim, qk_norm, rms_eps=Float32(rms_eps), tie_embeddings)
     pfx = "model"
-    layers = [TransformerBlock(hidden, n_heads, n_kv_heads, intermediate, graph, reg, "$(pfx).layers.$(i-1)") for i in 1:n_layers]
+    layers = [TransformerBlock(hidden, n_heads, n_kv_heads, intermediate, graph, reg, "$(pfx).layers.$(i-1)";
+                               head_dim=head_dim, qk_norm=qk_norm, epsilon=rms_eps) for i in 1:n_layers]
     
     emb_weight = Luminal.tensor(graph, [vocab_size, hidden])
     if reg !== nothing
         register_weight!(reg, "$(pfx).embed_tokens.weight", emb_weight)
     end
+    # Tied (Qwen3): the head is the embedding matrix, (vocab, hidden) as a Linear
+    # weight. It stays its own node, loaded from the embedding's array: the
+    # embedding's Gather needs Float32, while the head can be stored in reduced
+    # precision like any other matmul weight.
+    head = _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
+    tie_embeddings && reg !== nothing && tie_weight!(reg, "lm_head.weight", "$(pfx).embed_tokens.weight")
     
     return Llama(
         Embedding(emb_weight),
         layers,
-        _rmsnorm(hidden, graph, reg, "$(pfx).norm"),
-        _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false),
-        rope_base
+        _rmsnorm(hidden, graph, reg, "$(pfx).norm"; epsilon=rms_eps),
+        head,
+        Float32(rope_base),
+        config
     )
 end
 
@@ -458,27 +504,33 @@ end
 
 `Llama` keyword arguments from a Hugging Face `config.json`, e.g.
 `Llama(graph, reg; llama_config(dir)...)`. Errors on features this
-implementation does not support (RoPE scaling, tied embeddings, attention
-biases, a norm epsilon other than 1e-5, activations other than SiLU), rather
-than building a model that would silently compute something else.
+implementation does not support (RoPE scaling, attention or MLP biases,
+activations other than SiLU), rather than building a model that would silently
+compute something else. Handles Llama 2/3, TinyLlama and Qwen3 (`model_type`
+"qwen3": QK-norm, `head_dim` from the config, tied embeddings).
 """
 function llama_config(model_dir::String)
     c = JSON3.read(read(joinpath(model_dir, "config.json"), String))
     get_(k, d) = haskey(c, k) && c[k] !== nothing ? c[k] : d
     unsupported = String[]
     get_(:rope_scaling, nothing) === nothing || push!(unsupported, "rope_scaling=$(c[:rope_scaling])")
-    get_(:tie_word_embeddings, false) && push!(unsupported, "tie_word_embeddings")
     get_(:attention_bias, false) && push!(unsupported, "attention_bias")
     get_(:mlp_bias, false) && push!(unsupported, "mlp_bias")
     get_(:hidden_act, "silu") == "silu" || push!(unsupported, "hidden_act=$(c[:hidden_act])")
-    Float32(get_(:rms_norm_eps, 1f-5)) == 1f-5 || push!(unsupported, "rms_norm_eps=$(c[:rms_norm_eps])")
+    mt = String(get_(:model_type, "llama"))
+    mt in ("llama", "qwen3") || push!(unsupported, "model_type=$mt")
+    get_(:use_sliding_window, false) && push!(unsupported, "use_sliding_window")
     isempty(unsupported) || error("unsupported Llama config in $model_dir: " * join(unsupported, ", "))
-    n_heads = Int(c[:num_attention_heads])
-    return (vocab_size=Int(c[:vocab_size]), hidden=Int(c[:hidden_size]),
+    n_heads = Int(c[:num_attention_heads]); hidden = Int(c[:hidden_size])
+    return (vocab_size=Int(c[:vocab_size]), hidden=hidden,
             n_layers=Int(c[:num_hidden_layers]), n_heads=n_heads,
             n_kv_heads=Int(get_(:num_key_value_heads, n_heads)),
             intermediate=Int(c[:intermediate_size]),
-            rope_base=Float32(get_(:rope_theta, 10000)))
+            rope_base=Float32(get_(:rope_theta, 10000)),
+            head_dim=Int(get_(:head_dim, div(hidden, n_heads))),
+            qk_norm=mt == "qwen3",
+            rms_eps=Float32(get_(:rms_norm_eps, 1f-5)),
+            tie_embeddings=Bool(get_(:tie_word_embeddings, false)))
 end
 
 function (l::Llama)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false)
@@ -645,8 +697,8 @@ function llama_self_attn_cached(sa::SelfAttention,
     q     = Luminal.permute(Luminal.reshape(sa.q_proj(x), [D, sa.n_heads, 1, batch]), [1, 3, 2, 4])
     k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
     v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
-    q     = apply_rotary_embeddings(q,     step_pos_tensor; base=rope_base)
-    k_new = apply_rotary_embeddings(k_new, step_pos_tensor; base=rope_base)
+    q     = apply_rotary_embeddings(_qk_norm(sa.q_norm, q),     step_pos_tensor; base=rope_base)
+    k_new = apply_rotary_embeddings(_qk_norm(sa.k_norm, k_new), step_pos_tensor; base=rope_base)
 
     # Attention over cache slots [0, pos) plus the current token, in one kernel
     # (see Luminal.DecodeAttention): scores, softmax and the weighted sum of V,
@@ -657,7 +709,7 @@ function llama_self_attn_cached(sa::SelfAttention,
     # The op also writes this token's K/V into the cache slot (write_cache=true).
     out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(scale, true), ins,
                           Luminal.ShapeTracker([D, sa.n_heads, batch]))
-    out = Luminal.reshape(out, [hidden, 1, batch])
+    out = Luminal.reshape(out, [D * sa.n_heads, 1, batch])
 
     return sa.o_proj(out), k_new, v_new
 end
