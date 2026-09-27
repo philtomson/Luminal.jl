@@ -51,6 +51,23 @@ end
         check(g, outs, [a, c], Any[av, Float32.(rand(0:1, 16, 1))])
     end
 
+    @testset "dtypes" begin
+        g = Graph()
+        f = tensor(g, [6]); i = tensor(g, [6]; dtype=Int32); d = tensor(g, [6]; dtype=Float64)
+        outs = [i * 3 + 1, cast(i, Int8), cast(f, Float16), cast(i, Float32) * f, f < 0, (f < 0) | (i == 2),
+                select(f < 0, i, -i), trunc_cast(f * 4, Int32), trunc_div(i, 4), trunc_rem(i, 4),
+                d + constant(g, 0.1, Float64), cast(f < 1, Float32)]
+        vals = Any[Float32[1.5, -2.25, 0, 3.75, -0.5, 7], Int32[2, -7, 300, 9, -130, 4], [1.0, 2, 3, 4, 5, 6]]
+        # compare exactly by type (check() uses a relative error, fine for these values)
+        ref = Luminal.execute(g, [o.id for o in outs], Dict{Int,Any}(zip([f.id, i.id, d.id], vals)), CPUDevice())
+        fc = reactant_compile(g, outs, [f, i, d], vals...)
+        got = fc(Reactant.to_rarray.(vals)...)
+        for (k, o) in enumerate(outs)
+            @test eltype(Array(got[k])) === eltype(ref[o.id])
+            @test Array(got[k]) == ref[o.id]
+        end
+    end
+
     @testset "gather, scatter, iota" begin
         g = Graph()
         A = tensor(g, [5, 4]); i = tensor(g, [6]); j = tensor(g, [6]); s = tensor(g, [6])

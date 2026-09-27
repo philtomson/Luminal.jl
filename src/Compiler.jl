@@ -58,6 +58,7 @@ end
 
 function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Symbol, Int}(), device::Luminal.AbstractDevice = Luminal.get_device())
     for (k, v) in inputs
+        v = Luminal._as_dtype(v, cg.graph.dtypes[k])     # values given as another dtype are converted
         if Luminal.to_device(v, device) === v
              # Already resident on the target device: alias it rather than copy.
              cg.results[k] = v
@@ -103,18 +104,18 @@ end
 # sized by a dynamic dim (e.g. decode context length) change size every run and
 # GPU allocation is slow, so they are served as a reshaped prefix of a backing
 # buffer that only regrows (with 50% headroom).
-function _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates)
+function _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, T=Float32)
     isassigned(res, node_id) && res[node_id] !== nothing && size(res[node_id]) == sz && return
     if free_intermediates || !(dev isa Luminal.AbstractGPUDevice)
         isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
-        res[node_id] = Luminal.zero_tensor(dev, Float32, sz...)
+        res[node_id] = Luminal.zero_tensor(dev, T, sz...)
     else
         n = prod(sz)
         if backing[] === nothing || length(backing[]) < n
             isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
             cap = backing[] === nothing ? n : cld(3n, 2)
             backing[] isa AnyGPUArray && GPUArrays.unsafe_free!(backing[])
-            backing[] = Luminal.zero_tensor(dev, Float32, cap)
+            backing[] = Luminal.zero_tensor(dev, T, cap)
         end
         res[node_id] = Base.reshape(view(backing[], 1:n), sz)
     end
@@ -173,12 +174,12 @@ end
 # RMSNorm in every layer) share one function and hence one GPU compilation.
 const _FUSED_KERNELS = Dict{String, Any}()
 
-function _fused_kernel(node_expr, n_args)
-    key = string(n_args, ":", node_expr)
+function _fused_kernel(node_expr, n_args, T=Float32)
+    key = string(n_args, ":", T, ":", node_expr)
     get!(_FUSED_KERNELS, key) do
         name = Symbol("global_fused_", length(_FUSED_KERNELS) + 1)
         args = [Expr(:(::), Symbol("in", i), :Real) for i in 1:n_args]
-        Core.eval(Luminal, :(function $name($(args...)); return Float32($node_expr); end))
+        Core.eval(Luminal, :(function $name($(args...)); return $T($node_expr); end))
     end
 end
 
@@ -231,18 +232,20 @@ function is_elementwise(op)
            op isa Luminal.ReLU || op isa Luminal.Constant ||
            op isa Luminal.Floor || op isa Luminal.Ceil || op isa Luminal.Round ||
            op isa Luminal.Trunc || op isa Luminal.Select ||
-           op isa Luminal.Div || op isa Luminal.Exp
+           op isa Luminal.Div || op isa Luminal.Exp || op isa Luminal.Cast
 end
 
 # Helper functions for fused kernels
 scalar_less(x, y) = Float32(x < y)
 
 # Robust mapping from Luminal Ops to symbolic expressions
-function op_to_sym(op, inputs)
+# T: the node's dtype. Arithmetic is built as plain terms (no symbolic
+# simplification), so each op keeps its operands' type, e.g. Int8 wraps.
+function op_to_sym(op, inputs, T=Float32)
     if op isa Luminal.Add
-        return inputs[1] + inputs[2]
+        return term(+, inputs[1], inputs[2]; type=Real)
     elseif op isa Luminal.Mul
-        return inputs[1] * inputs[2]
+        return term(*, inputs[1], inputs[2]; type=Real)
     elseif op isa Luminal.Mod
         return term(mod, inputs[1], inputs[2]; type=Real)
     elseif op isa Luminal.Log2
@@ -258,15 +261,17 @@ function op_to_sym(op, inputs)
     elseif op isa Luminal.Recip
         return term(/, 1.0f0, inputs[1]; type=Real)
     elseif op isa Luminal.ReLU
-        return term(max, inputs[1], 0.0f0; type=Real)
+        return term(max, inputs[1], zero(T); type=Real)
     elseif op isa Luminal.Max
         return term(max, inputs...; type=Real)
     elseif op isa Luminal.FusedMulAdd
-        return inputs[1] * inputs[2] + inputs[3]
+        return term(+, term(*, inputs[1], inputs[2]; type=Real), inputs[3]; type=Real)
     elseif op isa Luminal.FusedAddReLU
-        return term(max, inputs[1] + inputs[2], 0.0f0; type=Real)
+        return term(max, term(+, inputs[1], inputs[2]; type=Real), zero(T); type=Real)
     elseif op isa Luminal.LessThan
-        return term(ifelse, term(<, inputs[1], inputs[2]), 1.0f0, 0.0f0; type=Real)
+        return term(<, inputs[1], inputs[2]; type=Real)
+    elseif op isa Luminal.Cast
+        return term(Luminal.CastTo(op.dtype), inputs[1]; type=Real)
     elseif op isa Luminal.Div
         return term(/, inputs[1], inputs[2]; type=Real)   # a term, so it stays one division
     elseif op isa Luminal.Exp
@@ -280,9 +285,9 @@ function op_to_sym(op, inputs)
     elseif op isa Luminal.Trunc
         return term(trunc, inputs[1]; type=Real)
     elseif op isa Luminal.Select
-        return term(ifelse, term(!=, inputs[1], 0.0f0), inputs[2], inputs[3]; type=Real)
+        return term(ifelse, term(!=, inputs[1], false; type=Real), inputs[2], inputs[3]; type=Real)
     elseif op isa Luminal.Constant
-        return Float32(op.value)
+        return op.value
     else
         error("Unsupported element-wise op for fusion: $(typeof(op))")
     end
@@ -292,7 +297,7 @@ end
 function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, current_st)
     node = graph.nodes[node_id]
     op = node.op
-    op isa Luminal.Constant && return Float32(op.value)  # inline as a literal
+    op isa Luminal.Constant && return op.value  # inline as a literal (of its dtype)
 
     # If this node is NOT a fusible intermediate, it's a leaf for THIS fusion group
     if !(node_id in fusible_intermediates)
@@ -311,7 +316,7 @@ function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible
         push!(input_syms, build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st))
     end
 
-    return op_to_sym(op, input_syms)
+    return op_to_sym(op, input_syms, graph.dtypes[node_id])
 end
 
 function evaluate_op_shapes(op::Luminal.Op, sym_vals::Dict{Symbol, Int})
@@ -541,7 +546,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             none = Dict{Symbol,Int}()
             dims = [eval_dim(d) for d in realized_dims(graph.shapes[node_id])]
             args = [realize_view(results[id], evaluate_shapes(st, none)) for (id, _, st) in node.inputs]
-            out = Luminal.zero_tensor(compile_device, Float32, dims...)
+            out = Luminal.zero_tensor(compile_device, graph.dtypes[node_id], dims...)
             execute_op!(out, evaluate_op_shapes(node.op, none), args...)
             # Views made for the inputs hold references to whole input buffers until
             # the GC runs; drop them now (the inputs themselves keep theirs).
@@ -677,7 +682,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             owned[node_id] = true
             backing = Ref{Any}(nothing)
             push!(steps, (res, dev, sym_vals, live) -> begin
-                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates)
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
                 out = res[node_id]
                 for (k, (src, _, lo)) in enumerate(parts)
                     a = realize_view(res[src], src_sts[k])
@@ -703,7 +708,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             owned[node_id] = true
             backing = Ref{Any}(nothing)
             push!(steps, (res, dev, sym_vals, live) -> begin
-                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates)
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
                 x = realize_view(res[xid], sts[1])
                 r = realize_view(res[rid], sts[2])
                 Luminal.matmul_residual!(res[node_id], mop, res[wid], x, r)
@@ -828,7 +833,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         res[node_id] = nothing
                         aliased[] = false
                     end
-                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates)
+                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
                 end
 
                 # 3. Execute
@@ -850,8 +855,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 sym_cache = Dict{Any, Any}()
                 input_syms = [build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st)
                               for (in_id, _, in_st) in node.inputs]
-                node_expr = fix_gpu_ast!(toexpr(op_to_sym(op, input_syms)))
-                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", _fused_kernel(node_expr, length(group_inputs)))
+                node_expr = fix_gpu_ast!(toexpr(op_to_sym(op, input_syms, graph.dtypes[node_id])))
+                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", _fused_kernel(node_expr, length(group_inputs), graph.dtypes[node_id]))
 
                 node_shape = graph.shapes[node_id]
                 target_rank = length(realized_dims(node_shape))
@@ -871,7 +876,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
                     args = [align_rank(realize_view(res[id], in_sts[k]), target_rank) for (k, (id, _, _)) in enumerate(group_inputs)]
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
-                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates)
+                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates, graph.dtypes[node_id])
 
                     Base.invokelatest(execute_op!, res[node_id], fused_op, args...)
 

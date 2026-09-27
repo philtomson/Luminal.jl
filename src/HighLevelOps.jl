@@ -42,7 +42,10 @@ function Base.:+(a::GraphTensor, b::GraphTensor)
     output_shape = ShapeTracker(out_dims)
     return add_op!(a.graph_ref, Add(), inputs, output_shape)
 end
-Base.:+(a::GraphTensor, b::Number) = a + constant(a.graph_ref, b)
+# A number combined with a tensor becomes a constant of the tensor's dtype
+_lit(t::GraphTensor, v::Number) = constant(t.graph_ref, v, dtype(t))
+
+Base.:+(a::GraphTensor, b::Number) = a + _lit(a, b)
 Base.:+(a::Number, b::GraphTensor) = b + a
 
 function Base.:*(a::GraphTensor, b::GraphTensor)
@@ -52,13 +55,13 @@ function Base.:*(a::GraphTensor, b::GraphTensor)
     output_shape = ShapeTracker(out_dims)
     return add_op!(a.graph_ref, Mul(), inputs, output_shape)
 end
-Base.:*(a::GraphTensor, b::Number) = a * constant(a.graph_ref, b)
+Base.:*(a::GraphTensor, b::Number) = a * _lit(a, b)
 Base.:*(a::Number, b::GraphTensor) = b * a
 
-Base.:-(a::GraphTensor) = a * -1.0f0
+Base.:-(a::GraphTensor) = a * -1
 Base.:-(a::GraphTensor, b::GraphTensor) = a + (-b)
 Base.:-(a::GraphTensor, b::Number) = a + (-b)
-Base.:-(a::Number, b::GraphTensor) = constant(b.graph_ref, a) - b
+Base.:-(a::Number, b::GraphTensor) = _lit(b, a) - b
 
 # Tensor / tensor is one exact Div; tensor / number stays a multiply by the
 # (rounded) reciprocal, the cheap form scaling paths rely on.
@@ -68,8 +71,12 @@ function Base.:/(a::GraphTensor, b::GraphTensor)
     out_dims = broadcast_dims(realized_dims(a.shape), realized_dims(b.shape))
     return add_op!(a.graph_ref, Div(), inputs, ShapeTracker(out_dims))
 end
-Base.:/(a::GraphTensor, b::Number) = a * (1.0f0 / Float32(b))
-Base.:/(a::Number, b::GraphTensor) = constant(b.graph_ref, a) / b
+function Base.:/(a::GraphTensor, b::Number)
+    T = dtype(a)
+    _isfloat(T) || throw(ArgumentError("/ needs a floating-point tensor, got $T (for integers use trunc_div)"))
+    return a * (one(T) / convert(T, b))
+end
+Base.:/(a::Number, b::GraphTensor) = _lit(b, a) / b
 
 function Base.:%(a::GraphTensor, b::GraphTensor)
     @assert a.graph_ref === b.graph_ref "Tensors must be from the same graph"
@@ -78,7 +85,7 @@ function Base.:%(a::GraphTensor, b::GraphTensor)
     output_shape = ShapeTracker(out_dims)
     return add_op!(a.graph_ref, Mod(), inputs, output_shape)
 end
-Base.:%(a::GraphTensor, b::Number) = a % constant(a.graph_ref, b)
+Base.:%(a::GraphTensor, b::Number) = a % _lit(a, b)
 
 # Comparisons
 # -----------
@@ -90,24 +97,91 @@ function Base.:<(a::GraphTensor, b::GraphTensor)
     output_shape = ShapeTracker(out_dims)
     return add_op!(a.graph_ref, LessThan(), inputs, output_shape)
 end
-Base.:<(a::GraphTensor, b::Number) = a < constant(a.graph_ref, b)
-Base.:<(a::Number, b::GraphTensor) = constant(b.graph_ref, a) < b
+Base.:<(a::GraphTensor, b::Number) = a < _lit(a, b)
+Base.:<(a::Number, b::GraphTensor) = _lit(b, a) < b
 
+# The others from LessThan and select, all Bool. (As before, NaN compares
+# unordered only for <, >: NaN == NaN is true here.)
 Base.:>(a::GraphTensor, b::GraphTensor) = b < a
-Base.:>(a::GraphTensor, b::Number) = a > constant(a.graph_ref, b)
-Base.:>(a::Number, b::GraphTensor) = constant(b.graph_ref, a) > b
+Base.:>(a::GraphTensor, b::Number) = a > _lit(a, b)
+Base.:>(a::Number, b::GraphTensor) = _lit(b, a) > b
 
-Base.:<=(a::GraphTensor, b::GraphTensor) = (a > b) * -1.0f0 + 1.0f0
-Base.:<=(a::GraphTensor, b::Number) = a <= constant(a.graph_ref, b)
+Base.:<=(a::GraphTensor, b::GraphTensor) = !(b < a)
+Base.:<=(a::GraphTensor, b::Number) = a <= _lit(a, b)
+Base.:<=(a::Number, b::GraphTensor) = _lit(b, a) <= b
 
-Base.:>=(a::GraphTensor, b::GraphTensor) = (a < b) * -1.0f0 + 1.0f0
-Base.:>=(a::GraphTensor, b::Number) = a >= constant(a.graph_ref, b)
+Base.:>=(a::GraphTensor, b::GraphTensor) = !(a < b)
+Base.:>=(a::GraphTensor, b::Number) = a >= _lit(a, b)
+Base.:>=(a::Number, b::GraphTensor) = _lit(b, a) >= b
 
-Base.:!=(a::GraphTensor, b::GraphTensor) = (a < b) + (a > b)
-Base.:!=(a::GraphTensor, b::Number) = a != constant(a.graph_ref, b)
+Base.:!=(a::GraphTensor, b::GraphTensor) = (a < b) | (b < a)
+Base.:!=(a::GraphTensor, b::Number) = a != _lit(a, b)
 
-Base.:(==)(a::GraphTensor, b::GraphTensor) = (a != b) * -1.0f0 + 1.0f0
-Base.:(==)(a::GraphTensor, b::Number) = a == constant(a.graph_ref, b)
+Base.:(==)(a::GraphTensor, b::GraphTensor) = !(a != b)
+Base.:(==)(a::GraphTensor, b::Number) = a == _lit(a, b)
+
+# Logical ops on Bool tensors, as selects (fused like any elementwise op)
+function _bool(op, t::GraphTensor)
+    dtype(t) === Bool || throw(ArgumentError("$op needs Bool tensors, got $(dtype(t)); compare first, or cast(x, Bool)"))
+    return t
+end
+Base.:!(a::GraphTensor) = select(_bool(:!, a), false, true)
+Base.:&(a::GraphTensor, b::GraphTensor) = select(_bool(:&, a), _bool(:&, b), false)
+Base.:|(a::GraphTensor, b::GraphTensor) = select(_bool(:|, a), true, _bool(:|, b))
+
+# Casts
+# -----
+
+"""
+    cast(x, T)
+
+`x` converted to dtype `T`, elementwise: float -> float rounds (to nearest),
+integer -> integer wraps, integer or Bool -> float converts. Following upstream,
+cast stays lossless in kind: float -> integer is refused (use `trunc_cast`), and
+`cast(x, Bool)` is the projection `x != 0`, not a conversion.
+"""
+function cast(x::GraphTensor, T::Type)
+    S = dtype(x)
+    _check_dtype(T)
+    S === T && return x
+    if T === Bool
+        return x != 0
+    end
+    _isfloat(S) && _isint(T) &&
+        throw(ArgumentError("cast $S -> $T is refused: float -> integer loses the fraction; use trunc_cast(x, $T)"))
+    return add_op!(x.graph_ref, Cast(T), [(x.id, 0, x.shape)], x.shape)
+end
+
+"""
+    trunc_cast(x, T)
+
+Float -> integer conversion, truncating toward zero (as `trunc(T, x)`). NaN,
+±Inf and values outside `T`'s range are refused at run time (an error, on CPU
+and GPU alike).
+"""
+function trunc_cast(x::GraphTensor, T::Type)
+    _isfloat(dtype(x)) || throw(ArgumentError("trunc_cast needs a floating-point tensor, got $(dtype(x))"))
+    T in (Int8, Int32, Int64) || throw(ArgumentError("trunc_cast target must be Int8, Int32 or Int64, got $T"))
+    return add_op!(x.graph_ref, TruncCast(T), [(x.id, 0, x.shape)], x.shape)
+end
+
+"""
+    trunc_div(a, b), trunc_rem(a, b)
+
+Integer division truncated toward zero, and its remainder (with the sign of
+`a`): `div` and `rem` elementwise, broadcasting. A zero divisor is refused at
+run time; `typemin ÷ -1` wraps to `typemin`.
+"""
+function trunc_div(a::GraphTensor, b::GraphTensor)
+    inputs = [(a.id, 0, a.shape), (b.id, 0, b.shape)]
+    return add_op!(a.graph_ref, TruncDiv(), inputs, ShapeTracker(broadcast_dims(realized_dims(a.shape), realized_dims(b.shape))))
+end
+function trunc_rem(a::GraphTensor, b::GraphTensor)
+    inputs = [(a.id, 0, a.shape), (b.id, 0, b.shape)]
+    return add_op!(a.graph_ref, TruncRem(), inputs, ShapeTracker(broadcast_dims(realized_dims(a.shape), realized_dims(b.shape))))
+end
+trunc_div(a::GraphTensor, b::Number) = trunc_div(a, _lit(a, b))
+trunc_rem(a::GraphTensor, b::Number) = trunc_rem(a, _lit(a, b))
 
 # Unary Ops
 # ---------
@@ -128,7 +202,7 @@ function Base.sin(a::GraphTensor)
 end
 
 function Base.cos(a::GraphTensor)
-    return sin(Float32(pi/2) - a)
+    return sin(pi / 2 - a)
 end
 
 function Base.exp(a::GraphTensor)
@@ -196,12 +270,13 @@ end
     iota(graph, dims, f)
 
 A tensor of shape `dims` with `out[c_1, .., c_k] = f(c_1, .., c_k)` over its
-0-based coordinates (Int arguments; the result is stored as Float32). For
+0-based coordinates (Int arguments), stored as `dtype` (Float32 by default; e.g.
+`dtype=Int32` for integer coordinates). For
 example `iota(g, [n], i -> i)` is `0:n-1`, and `iota(g, [n, m], (i, j) -> i * m + j)`
 a row-major index. Evaluated on the host; `f` should be pure.
 """
-iota(graph::Graph, dims::AbstractVector, f) =
-    add_op!(graph, Iota(f), Tuple{Int, Int, ShapeTracker}[], ShapeTracker(collect(Luminal.DimType, dims)))
+iota(graph::Graph, dims::AbstractVector, f; dtype::Type=Float32) =
+    add_op!(graph, Iota(f, _check_dtype(dtype)), Tuple{Int, Int, ShapeTracker}[], ShapeTracker(collect(Luminal.DimType, dims)))
 
 # Rounding, elementwise; values stay Float32 (round: half to even)
 Base.floor(a::GraphTensor) = add_op!(a.graph_ref, Floor(), [(a.id, 0, a.shape)], a.shape)
@@ -212,8 +287,9 @@ Base.trunc(a::GraphTensor) = add_op!(a.graph_ref, Trunc(), [(a.id, 0, a.shape)],
 """
     select(cond, a, b)
 
-Elementwise `cond != 0 ? a : b`, broadcasting all three (`a` and `b` may be
-numbers). Unlike `cond * a + (1 - cond) * b`, the branch not taken never
+Elementwise `cond ? a : b`, broadcasting all three. `cond` is a Bool tensor
+(a Float32 mask also works, true where nonzero); `a` and `b` share a dtype (a
+number takes the other's; two Bools make a Bool result). Unlike `cond * a + (1 - cond) * b`, the branch not taken never
 reaches the result, so an Inf or NaN there does not leak through.
 """
 function select(c::GraphTensor, a::GraphTensor, b::GraphTensor)
@@ -222,9 +298,11 @@ function select(c::GraphTensor, a::GraphTensor, b::GraphTensor)
     out_dims = broadcast_dims(broadcast_dims(realized_dims(c.shape), realized_dims(a.shape)), realized_dims(b.shape))
     return add_op!(c.graph_ref, Select(), inputs, ShapeTracker(out_dims))
 end
-select(c::GraphTensor, a::Number, b::GraphTensor) = select(c, constant(c.graph_ref, a), b)
-select(c::GraphTensor, a::GraphTensor, b::Number) = select(c, a, constant(c.graph_ref, b))
-select(c::GraphTensor, a::Number, b::Number) = select(c, constant(c.graph_ref, a), constant(c.graph_ref, b))
+select(c::GraphTensor, a::Number, b::GraphTensor) = select(c, _lit(b, a), b)
+select(c::GraphTensor, a::GraphTensor, b::Number) = select(c, a, _lit(a, b))
+# two numbers: of the numbers' (promoted) type, Bool for Bools
+select(c::GraphTensor, a::Number, b::Number) =
+    (T = promote_type(typeof(a), typeof(b)); select(c, constant(c.graph_ref, a, T), constant(c.graph_ref, b, T)))
 
 function Base.abs(a::GraphTensor)
     return relu(a) + relu(-a)
@@ -376,14 +454,13 @@ end
 
 function maximum(a::GraphTensor, b::GraphTensor)
     @assert a.graph_ref === b.graph_ref "Tensors must be from the same graph"
-    # (a < b) * b + (b <= a) * a
-    return (a < b) * b + (b <= a) * a
+    return select(a < b, b, a)
 end
-maximum(a::GraphTensor, b::Number) = maximum(a, constant(a.graph_ref, b))
+maximum(a::GraphTensor, b::Number) = maximum(a, _lit(a, b))
 
 function mean(a::GraphTensor, dim::Int)
     dim_size = realized_dims(a.shape)[dim]
-    return sum(a, dim) * (1.0f0 / Float32(dim_size))
+    return sum(a, dim) * (1 / dim_size)
 end
 
 # Normalizations
@@ -464,7 +541,8 @@ function triu(graph::Graph, size::DimType, diagonal::Int=0)
     # h = expand(arange, 2, size) -> new dim is 2 (cols). so rows vary. h[i, j] = i-1
     # v = expand(arange, 1, size) -> new dim is 1 (rows). so cols vary. v[i, j] = j-1
     # We want Upper Triangle (col > row + diag - 1)
-    return v - Float32(diagonal - 1) > h
+    # a Float32 0/1 mask, as its users scale it
+    return cast(v - (diagonal - 1) > h, Float32)
 end
 
 function gather(matrix::GraphTensor, indexes::GraphTensor)

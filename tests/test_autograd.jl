@@ -155,7 +155,7 @@ end
 
     # LessThan: no gradient flows through the comparison, only through x itself
     g = Graph(); x = tensor(g, [3])
-    loss = sum((x < 0.5f0) * x, 1)
+    loss = sum(cast(x < 0.5f0, Float32) * x, 1)    # a Bool mask, cast to multiply
     mark_trainable!(x); gr = backward(loss)
     res = run(g, loss.id, [gr[x.id].id], Dict(x.id => Float32[0.2, 0.9, -1.0]))
     @test res[gr[x.id].id] ≈ Float32[1, 0, 1]

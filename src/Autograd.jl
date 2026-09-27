@@ -15,7 +15,8 @@ function gradients(loss::GraphTensor, params::Vector{GraphTensor})
     # Seed the loss gradient with 1.0 (assuming scalar loss)
     # We should handle different shapes if loss is not a scalar, 
     # but typically loss is a scalar.
-    grads[loss.id] = constant(graph, 1.0f0)
+    _isfloat(dtype(loss)) || throw(ArgumentError("gradients need a floating-point loss, got $(dtype(loss))"))
+    grads[loss.id] = constant(graph, 1, dtype(loss))
     if length(realized_dims(loss.shape)) > 0
          # If loss is not a scalar, we might need to expand the seeding gradient
          # OR just broad-multiply it. Luminal's constant is scalar.
@@ -235,7 +236,7 @@ function vjp_rules(op::ReLU, node_id::Int, node::Node, grad_out::GraphTensor, gr
     graph = grad_out.graph_ref
     x = GraphTensor(input_id, node.inputs[1][3], graph)
     
-    grad_x = grad_out * (x > 0.0f0)
+    grad_x = select(x > 0, grad_out, 0)
     accumulate_grad!(grads, input_id, grad_x)
 end
 
@@ -260,8 +261,8 @@ function vjp_rules(op::MaxReduce, node_id::Int, node::Node, grad_out::GraphTenso
     n = realized_dims(node.inputs[1][3])[op.dim]
     out = GraphTensor(node_id, graph.shapes[node_id], graph)
     is_max = x == expand(out, op.dim, n)
-    count = expand(sum(is_max, op.dim), op.dim, n)
-    accumulate_grad!(grads, input_id, expand(grad_out, op.dim, n) * is_max / count)
+    count = expand(sum(cast(is_max, dtype(x)), op.dim), op.dim, n)
+    accumulate_grad!(grads, input_id, select(is_max, expand(grad_out, op.dim, n) / count, 0))
 end
 
 # --- Piecewise ops ---
@@ -290,12 +291,12 @@ vjp_rules(op::Union{Floor, Ceil, Round, Trunc}, node_id::Int, node::Node, grad_o
 # scattered ones are gathered.
 
 _coords(node, first, graph) = [GraphTensor(id, st, graph) for (id, _, st) in node.inputs[first:end]]
-_zeros(graph, dims) = expand_to(constant(graph, 0.0f0), dims)
+_zeros(graph, dims, T) = expand_to(constant(graph, 0, T), dims)
 
 function vjp_rules(op::GatherND, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
     graph = grad_out.graph_ref
     data_id, _, data_st = node.inputs[1]
-    g = scatter(_zeros(graph, realized_dims(data_st)), grad_out, _coords(node, 2, graph); mode=:add)
+    g = scatter(_zeros(graph, realized_dims(data_st), dtype(grad_out)), grad_out, _coords(node, 2, graph); mode=:add)
     accumulate_grad!(grads, data_id, g)
 end
 
@@ -311,11 +312,20 @@ function vjp_rules(op::ScatterND, node_id::Int, node::Node, grad_out::GraphTenso
         accumulate_grad!(grads, init_id, grad_out)
     else
         # init: only where nothing was written
-        written = scatter(_zeros(graph, realized_dims(init_st)), expand_to(constant(graph, 1.0f0), realized_dims(src_st)),
+        T = dtype(grad_out)
+        written = scatter(_zeros(graph, realized_dims(init_st), T), expand_to(constant(graph, 1, T), realized_dims(src_st)),
                           coords; mode=:replace)
-        accumulate_grad!(grads, init_id, grad_out * (1.0f0 - written))
+        accumulate_grad!(grads, init_id, grad_out * (1 - written))
     end
 end
+
+function vjp_rules(op::Cast, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    # float -> float: the gradient converts back; from integers or Bool there is none
+    S = grad_out.graph_ref.dtypes[node.inputs[1][1]]
+    _isfloat(S) && accumulate_grad!(grads, node.inputs[1][1], cast(grad_out, S))
+end
+# integer results (trunc_cast, trunc_div, trunc_rem) carry no gradient
+vjp_rules(op::Union{TruncCast, TruncDiv, TruncRem}, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict) = nothing
 
 function vjp_rules(op::Select, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
     # the gradient goes to whichever branch was selected; none to the condition

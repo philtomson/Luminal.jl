@@ -1115,7 +1115,7 @@ end
 execute_op(op::Add, a, b) = begin (a_a, b_a) = align_broadcast_ranks(a, b); a_a .+ b_a end
 execute_op(op::Mul, a, b) = begin (a_a, b_a) = align_broadcast_ranks(a, b); a_a .* b_a end
 execute_op(op::Mod, a, b) = begin (a_a, b_a) = align_broadcast_ranks(a, b); a_a .% b_a end
-execute_op(op::LessThan, a, b) = begin (a_a, b_a) = align_broadcast_ranks(a, b); Float32.(a_a .< b_a) end
+execute_op(op::LessThan, a, b) = begin (a_a, b_a) = align_broadcast_ranks(a, b); a_a .< b_a end
 execute_op(op::FusedMulAdd, a, b, c) = (a .* b) .+ c
 execute_op(op::FusedAddReLU, a, b) = Base.max.(a .+ b, 0)
 execute_op(op::Log2, a) = log2.(a)
@@ -1127,6 +1127,13 @@ execute_op(op::Recip, a) = 1.0f0 ./ a
 execute_op(op::Div, a, b) = begin (a_a, b_a) = align_broadcast_ranks(a, b); a_a ./ b_a end
 execute_op(op::Exp, a) = exp.(a)
 execute_op(op::Floor, a) = floor.(a)
+execute_op(op::Cast, a) = CastTo(op.dtype).(a)
+execute_op(op::TruncCast, a) = (_check_trunc(op.dtype, a); _UTrunc{op.dtype}().(a))
+function execute_op(op::Union{TruncDiv, TruncRem}, a, b)
+    _anyf(iszero, b) && throw(DivideError())
+    (a_a, b_a) = align_broadcast_ranks(a, b)
+    return (op isa TruncDiv ? _trunc_div : _trunc_rem).(a_a, b_a)
+end
 execute_op(op::Ceil, a) = ceil.(a)
 execute_op(op::Round, a) = round.(a)
 execute_op(op::Trunc, a) = trunc.(a)
@@ -1200,7 +1207,7 @@ function execute_op!(out, op::Mul, a, b)
 end
 
 execute_op!(out, op::Mod, a, b) = broadcast!(%, out, _align_broadcast(a, out), _align_broadcast(b, out))
-execute_op!(out, op::LessThan, a, b) = broadcast!((x,y)->Float32(x<y), out, _align_broadcast(a, out), _align_broadcast(b, out))
+execute_op!(out, op::LessThan, a, b) = broadcast!(<, out, _align_broadcast(a, out), _align_broadcast(b, out))
 execute_op!(out, op::FusedMulAdd, a, b, c) = broadcast!((x,y,z)->x*y+z, out, _align_broadcast(a, out), _align_broadcast(b, out), _align_broadcast(c, out))
 execute_op!(out, op::FusedAddReLU, a, b) = broadcast!((x,y)->max(x+y, 0), out, _align_broadcast(a, out), _align_broadcast(b, out))
 execute_op!(out, op::Log2, a) = broadcast!(log2, out, a)
@@ -1211,6 +1218,16 @@ execute_op!(out, op::Sqrt, a) = broadcast!(sqrt, out, a)
 execute_op!(out, op::Div, a, b) = broadcast!(/, out, _align_broadcast(a, out), _align_broadcast(b, out))
 execute_op!(out, op::Exp, a) = broadcast!(exp, out, a)
 execute_op!(out, op::Floor, a) = broadcast!(floor, out, a)
+execute_op!(out, op::Cast, a) = broadcast!(CastTo(op.dtype), out, a)
+function execute_op!(out, op::TruncCast, a)
+    _check_trunc(op.dtype, a)
+    return broadcast!(_UTrunc{op.dtype}(), out, a)
+end
+function execute_op!(out, op::Union{TruncDiv, TruncRem}, a, b)
+    _anyf(iszero, b) && throw(DivideError())
+    f = op isa TruncDiv ? _trunc_div : _trunc_rem
+    return broadcast!(f, out, _align_broadcast(a, out), _align_broadcast(b, out))
+end
 execute_op!(out, op::Ceil, a) = broadcast!(ceil, out, a)
 execute_op!(out, op::Round, a) = broadcast!(round, out, a)
 execute_op!(out, op::Trunc, a) = broadcast!(trunc, out, a)
@@ -1263,10 +1280,10 @@ execute_op!(out, op::MatMulT, a, b) = batch_matmul_t!(out, a, b, op.ta, op.tb)
     acc = init
     k = lid
     while k <= r
-        @inbounds acc = op(acc, Float32(a[base + pre * (k - 1)]))
+        @inbounds acc = op(acc, convert(typeof(init), a[base + pre * (k - 1)]))
         k += G
     end
-    s = @localmem Float32 (256,)
+    s = @localmem typeof(init) (256,)
     @inbounds s[lid] = acc
     @synchronize
     stride = G ÷ 2
@@ -1283,17 +1300,22 @@ function _reduce_dim!(out, a, dim, op, init)
         pre = prod(size(a)[1:dim-1]; init=1)
         r = size(a, dim)
         G = r >= 256 ? 256 : max(32, nextpow(2, r))
+        # accumulated in out's type, 16-bit floats in Float32
+        acc_init = eltype(out) <: Union{Float16, Core.BFloat16} ? Float32(init) : init
         _reduce_dim_kernel!(KernelAbstractions.get_backend(out), G)(
-            out, a, pre, r, op, init; ndrange = length(out) * G)
+            out, a, pre, r, op, acc_init; ndrange = length(out) * G)
     else
         rsz = ntuple(d -> d == dim ? 1 : size(a, d), ndims(a))
-        op === (+) ? sum!(Base.reshape(out, rsz), a) : maximum!(Base.reshape(out, rsz), a)
+        # in out's type throughout (sum! widens small integers, then fails to
+        # narrow an overflowed Int8 sum instead of wrapping)
+        Base.mapreducedim!(identity, op, fill!(Base.reshape(out, rsz), init), a)
     end
     return out
 end
 
-execute_op!(out, op::SumReduce, a) = _reduce_dim!(out, a, op.dim, +, 0f0)
-execute_op!(out, op::MaxReduce, a) = _reduce_dim!(out, a, op.dim, max, -Inf32)
+execute_op!(out, op::SumReduce, a) = _reduce_dim!(out, a, op.dim, +, zero(eltype(out)))
+execute_op!(out, op::MaxReduce, a) = _reduce_dim!(out, a, op.dim, max, _max_neutral(eltype(out)))
+_max_neutral(T) = T <: AbstractFloat ? T(-Inf) : typemin(T)
 
 execute_op!(out, op::Slice, a) = execute_slice!(out, a, op.ranges)
 execute_op!(out, op::Pad, a) = execute_pad!(out, a, op.padding)
@@ -1557,16 +1579,42 @@ end
     end
 end
 
+# --- Casts --------------------------------------------------------------------
+# The scalar conversion Cast applies: integers wrap to a narrower integer, every
+# other conversion is T(x) (float rounding, int / Bool -> float).
+struct CastTo{T} end
+CastTo(T::Type) = CastTo{T}()
+(::CastTo{T})(x) where T = T(x)
+(::CastTo{T})(x::Integer) where T <: Integer = x % T
+(::CastTo{T})(x::Bool) where T <: Integer = T(x)
+
+# x truncates into T's range [typemin, -typemin) (bounds exact in Float64)
+_trunc_in_range(::Type{T}, x) where T = (y = trunc(Float64(x)); Float64(typemin(T)) <= y < -Float64(typemin(T)))
+# refused loudly, as upstream: NaN, ±Inf and values truncating outside T
+# (functors typed by T, not closures over it: a Type field can't reach a GPU kernel)
+struct _TruncBad{T} end
+(::_TruncBad{T})(x) where T = !(isfinite(x) && _trunc_in_range(T, x))
+_anyf(f, a) = mapreduce(f, |, a; init=false)     # (any(f, ::ROCArray) iterates on the host)
+_check_trunc(T, a) = _anyf(_TruncBad{T}(), a) && throw(DomainError("trunc_cast to $T: NaN, Inf or a value out of range"))
+struct _UTrunc{T} end
+(::_UTrunc{T})(x) where T = unsafe_trunc(T, x)
+(::_UTrunc{T})(x::Union{Float16, Core.BFloat16}) where T = unsafe_trunc(T, Float32(x))
+_trunc_div(a, b) = b == -one(b) ? -a : div(a, b)     # typemin ÷ -1 wraps instead of trapping
+_trunc_rem(a, b) = b == -one(b) ? zero(a) : rem(a, b)
+
 # --- Coordinate gather / scatter and iota -------------------------------------
 # One coordinate array per data axis, each with the output's (gather) or src's
 # (scatter) shape, holding 0-based indices as Float32 values.
 
 # Linear index of element i's coordinates into an array of size `dims`, and
 # whether they are in range
+_coord(c::Integer) = Int(c)
+_coord(c) = unsafe_trunc(Int, c)
+
 @inline function _coord_index(coords, i, dims)
     lin = 0; stride = 1; ok = true
     for k in 1:length(coords)
-        c = unsafe_trunc(Int, @inbounds coords[k][i])
+        c = _coord(@inbounds coords[k][i])
         ok &= (0 <= c) & (c < dims[k])
         lin += c * stride
         stride *= dims[k]
@@ -1620,7 +1668,7 @@ function execute_op!(out, op::ScatterND, init, src, coords...)
     return out
 end
 
-_iota_values(op::Iota, dims) = Float32[op.f((Tuple(I) .- 1)...) for I in CartesianIndices(Tuple(dims))]
+_iota_values(op::Iota, dims) = op.dtype[op.f((Tuple(I) .- 1)...) for I in CartesianIndices(Tuple(dims))]
 execute_op!(out, op::Iota) = copyto!(out, _iota_values(op, size(out)))
 
 function execute_op!(out, op::Function, inputs...)
@@ -1650,8 +1698,16 @@ function execute_op!(out, op::Function, inputs...)
     return out
 end
 
+# An input value as its node's dtype (a converting copy only when it differs)
+_as_dtype(x::AbstractArray, T) = eltype(x) === T ? x : T.(x)
+_as_dtype(x::Number, T) = convert(T, x)
+_as_dtype(x, T) = x                                   # weight formats (HalfWeight, ...)
+
 function execute(graph::Graph, output_ids::Vector{Int}, initial_inputs::Dict, device::AbstractDevice=get_device())
     results = to_device(initial_inputs, device)
+    for (id, v) in results
+        results[id] = _as_dtype(v, graph.dtypes[id])
+    end
     
     # Include pre-loaded weights from the graph
     for ((node_id, output_idx), data) in graph.tensors
@@ -1685,7 +1741,7 @@ function execute(graph::Graph, output_ids::Vector{Int}, initial_inputs::Dict, de
                  # Same in-place kernels as the compiled path, into an output of the
                  # node's shape (so every op compile() supports runs here too)
                  dims = Int[eval_dim(d) for d in realized_dims(node_shape)]
-                 current_result = zero_tensor(device, Float32, dims...)
+                 current_result = zero_tensor(device, graph.dtypes[node_id], dims...)
                  execute_op!(current_result, op, input_values...)
             else
                  current_result = execute_op(op, input_values...)

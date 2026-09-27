@@ -91,6 +91,17 @@ function Luminal.execute_op(op::Luminal.ScatterND, init::TA{T}, src, coords...) 
     return Base.reshape(_mat(r[1:L]), size(init))
 end
 
+# Casts and integer division. XLA gives no run-time refusals: trunc_cast of NaN /
+# Inf / out-of-range values and division by zero follow XLA's semantics here.
+Luminal.execute_op(op::Luminal.Cast, x::TA{S,N}) where {S,N} =
+    (S <: Integer && op.dtype <: Integer) || op.dtype <: AbstractFloat ?
+        Reactant.Ops.convert(TracedRArray{op.dtype,N}, x) : Luminal.CastTo(op.dtype).(x)
+Luminal.execute_op(op::Luminal.TruncCast, x::TA{S,N}) where {S,N} = Reactant.Ops.convert(TracedRArray{op.dtype,N}, x)
+function Luminal.execute_op(op::Union{Luminal.TruncDiv, Luminal.TruncRem}, a::TA, b)
+    a, b = Luminal.align_broadcast_ranks(a, b)
+    return op isa Luminal.TruncDiv ? div.(a, b) : rem.(a, b)
+end
+
 # W[ids, :] as onehot(ids) * W: token ids arrive as Float32 values
 function _gather(W, ids)
     V = size(W, 1)
@@ -111,7 +122,7 @@ function _realize(v, st)
     return v
 end
 
-_const(d::AbstractArray) = Array{Float32}(d)
+_const(d::AbstractArray) = Array(d)
 _const(d) = Array{Float32}(Luminal.dequantize(d))       # a HalfWeight / QuantWeight / Q4Weight
 
 _id(t::Luminal.GraphTensor) = t.id
@@ -157,7 +168,7 @@ function _evaluate(g::Luminal.Graph, outs::Vector{Int}, ins::Vector{Int}, xs)
         elseif op isa Luminal.Function && op.name == "Gather"
             _gather(vals...)
         elseif op isa Luminal.Constant
-            op.value isa Number ? Float32(op.value) : lift(_const(op.value))
+            op.value isa Number ? op.value : lift(_const(op.value))
         else
             Luminal.execute_op(op, vals...)
         end

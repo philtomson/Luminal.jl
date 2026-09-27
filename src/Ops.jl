@@ -51,7 +51,25 @@ end
 # evaluated on the host, so nothing is lost.)
 struct Iota <: Op
     f::Any
+    dtype::DataType
 end
+Iota(f) = Iota(f, Float32)
+
+# Dtype conversions (upstream's logical cast / trunc_cast). Cast is lossless by
+# policy except for width: float -> float rounds, int -> int wraps, int / Bool ->
+# float converts; float -> int is refused (use TruncCast, which truncates toward
+# zero and refuses NaN, Inf and out-of-range values at run time).
+struct Cast <: Op
+    dtype::DataType
+end
+struct TruncCast <: Op
+    dtype::DataType
+end
+
+# Integer division truncated toward zero and its remainder (sign of the
+# dividend); a zero divisor is refused at run time.
+struct TruncDiv <: Op end
+struct TruncRem <: Op end
 
 # Ternary (C x A x B -> A): select(c, a, b) = c != 0 ? a : b, broadcasting
 struct Select <: Op end

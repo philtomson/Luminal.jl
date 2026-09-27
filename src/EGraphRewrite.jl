@@ -190,8 +190,9 @@ function to_egraph(graph::Graph, roots::Vector{Int})
             ctx.optypes[h] = typeof(op)
             kids = [_edge(g, ctx, class_of[id], st, graph.shapes[id]) for (id, _, st) in node.inputs]
             # Ops without inputs (ARange, Constant) are defined by their output shape
-            # too; append it so e.g. ARange(32) and ARange(1) stay distinct.
-            params = isempty(kids) ? (_params(op)..., dims) : _params(op)
+            # and dtype too; append them so e.g. ARange(32) and ARange(1), or
+            # Constant(1) and Constant(1f0) (equal as values), stay distinct.
+            params = isempty(kids) ? (_params(op)..., dims, graph.dtypes[nid]) : _params(op)
             ex = Expr(:call, h, params, kids...)
         end
         id = addexpr!(g, ex)
@@ -629,7 +630,7 @@ function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
         dims = collect(DimType, g[cid].data.dims)
         if h === :xIn
             old = params[1]
-            t = Luminal.tensor(ng, dims)
+            t = Luminal.tensor(ng, dims; dtype=rw.graph.dtypes[old])
             haskey(rw.graph.tensors, (old, 1)) && (ng.tensors[(t.id, 1)] = rw.graph.tensors[(old, 1)])
             idmap[old] = t.id
             id = t.id

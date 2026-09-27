@@ -24,6 +24,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 |------|--------|
 | `test_compilation.jl` | `compile()` against the interpreter |
 | `test_fusion.jl` | Elementwise fusion |
+| `test_dtypes.jl` | Dtype inference and strict checks; every dtype through the interpreter and fused `compile()` (CPU and GPU); `cast`, `trunc_cast`, `trunc_div` / `trunc_rem` and their run-time refusals; Float64 constants; integer coordinates; gradients through casts; e-graph search. BFloat16 cases need `julia -C native,-avx512bf16` on AVX512-BF16 CPUs |
 | `test_gather_scatter.jl` | Coordinate gather, scatter (`:replace`, atomic `:add`, out of range), `iota`: interpreter, `compile()` CPU and GPU, gradients, e-graph search |
 | `test_elementwise_ops.jl` | Rounding, `select`, exact `Div` and `Exp`: interpreter, `compile()` (fused, CPU and GPU), e-graph search, gradients |
 | `test_concat_views.jl` | Concatenation and strided-slice views |

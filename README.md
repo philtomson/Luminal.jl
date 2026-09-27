@@ -178,6 +178,18 @@ batch of 4 clips decodes in about the time of 2.
   (`iota(g, dims, f)`, any function of the coordinates); `SumReduce, MaxReduce`; movement ops (`Permute, Expand,
   Reshape, Slice, Pad`); and `MatMul`. Everything else (softmax, norms, GELU,
   attention) is built from these in `HighLevelOps.jl`.
+- **Element types**: tensors are `Float32` by default; `tensor(g, dims; dtype=T)`
+  makes any of `Float32, Float64, Float16, BFloat16, Int8, Int32, Int64, Bool`.
+  Every node's dtype is inferred (`dtype(t)`) and typing is strict, as upstream's:
+  operands share a dtype, number literals take the tensor's, and conversions are
+  explicit: `cast(x, T)` (float rounding, integer wrapping, never float -> integer;
+  `cast(x, Bool)` is `x != 0`), `trunc_cast(x, T)` (float -> integer toward zero,
+  refusing NaN, Inf and out-of-range values), `trunc_div` / `trunc_rem` (refusing a
+  zero divisor), and `constant(g, v, Float64)` for exact double constants.
+  Comparisons return `Bool` (`!`, `&`, `|` combine them; cast a mask to multiply
+  with it). Buffers and fused kernels are typed on CPU and GPU. BFloat16 on x86
+  CPUs with AVX512-BF16 needs `julia -C native,-avx512bf16`: Julia 1.12's LLVM
+  fails on its vectorized conversions there, and Luminal says so rather than hang.
 - **Symbolic shapes**: dimensions may be symbols, for example a decode position,
   resolved at run time.
 - **`compile()`** performs:

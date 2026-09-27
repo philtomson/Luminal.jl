@@ -97,8 +97,8 @@ to_device(data::AbstractArray, ::CPUDevice) = data
 # to_device(data::AbstractArray, ::VulkanDevice) = data
  
 # Number placement (mostly for scalars in graphs)
-to_device(data::Number, ::CUDADevice) = CUDA.CuArray(fill(Float32(data)))
-to_device(data::Number, ::AMDDevice) = AMDGPU.ROCArray(fill(Float32(data)))
+to_device(data::Number, ::CUDADevice) = CUDA.CuArray(fill(data))
+to_device(data::Number, ::AMDDevice) = AMDGPU.ROCArray(fill(data))
  
 """
     from_device(data)
