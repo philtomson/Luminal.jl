@@ -742,10 +742,10 @@ Device-resident storage for past K/V tensors for one decode session.
 - `step_pos`: the common position, for batch 1 (or when all sequences agree);
   assigning it sets every sequence's position.
 """
-mutable struct LlamaKVCacheState{A<:AbstractArray{Float32,4}}
+mutable struct LlamaKVCacheState{T}
     positions::Vector{Int}
     max_seq::Int
-    self_cache::Vector{Tuple{A, A}}
+    self_cache::Vector{T}     # per layer: (K, V), or a recurrent layer's (conv, rec) states
 end
 
 function Base.getproperty(c::LlamaKVCacheState, name::Symbol)
@@ -773,6 +773,20 @@ function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
             for _ in 1:n_layers]
     return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
 end
+
+"""
+    LlamaKVCacheState(model; batch=1, max_seq=2048, device=CPUDevice())
+
+The decode-step state buffers of `model`: a K/V cache per attention layer, and
+the convolution and recurrent states of a recurrent (Gated DeltaNet) layer.
+"""
+function LlamaKVCacheState(model; batch::Int=1, max_seq::Int=2048,
+                           device::Luminal.AbstractDevice=Luminal.CPUDevice())
+    self = [Tuple(Luminal.zero_tensor(device, Float32, s...) for s in _state_shapes(l, max_seq, batch))
+            for l in model.layers]
+    return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
+end
+
 
 
 """
@@ -841,6 +855,7 @@ struct LlamaDecodeGraph
     new_self_k_ids::Vector{Int}   # this step's K slot per layer, (D, 1, KV_H, B)
     new_self_v_ids::Vector{Int}   # this step's V slot per layer, (D, 1, KV_H, B)
     step_pos::Luminal.DimType
+    lens_input_id::Int            # (B,) tokens each sequence consumes (recurrent layers); 0 if none
 end
 
 
@@ -859,19 +874,15 @@ function build_llama_decode_step!(model,
                                    max_seq::Int=2048,
                                    batch::Int=1,
                                    rope_base::Float32=500000f0)
-    n_layers  = length(model.layers)
-    first_attn = model.layers[1].attention
-    n_kv_heads = first_attn.n_kv_heads
-    head_dim   = first_attn.head_dim
-
     # ── Inputs ────────────────────────────────────────────────────────────────
     token_in = Luminal.tensor(graph, [1, batch])
     pos_tensor = Luminal.tensor(graph, [batch])   # each sequence's position
+    lens = _needs_lens(model) ? Luminal.tensor(graph, [batch]) : nothing
 
-    self_k_tensors = [Luminal.tensor(graph, [head_dim, max_seq, n_kv_heads, batch])
-                      for _ in 1:n_layers]
-    self_v_tensors = [Luminal.tensor(graph, [head_dim, max_seq, n_kv_heads, batch])
-                      for _ in 1:n_layers]
+    # per layer: the K/V cache, or a recurrent layer's two state buffers
+    shapes = [_state_shapes(l, max_seq, batch) for l in model.layers]
+    self_k_tensors = [Luminal.tensor(graph, s[1]) for s in shapes]
+    self_v_tensors = [Luminal.tensor(graph, s[2]) for s in shapes]
 
     # ── Embedding ─────────────────────────────────────────────────────────────
     x = _embed(model, token_in)  # (hidden, 1, batch)
@@ -881,7 +892,8 @@ function build_llama_decode_step!(model,
     new_v_tensors = Luminal.GraphTensor[]
 
     for (i, layer) in enumerate(model.layers)
-        x, nk, nv = _decode_block(layer, x, step_pos, pos_tensor, self_k_tensors[i], self_v_tensors[i], rope_base)
+        x, nk, nv = _decode_block(layer, x, step_pos, pos_tensor, self_k_tensors[i], self_v_tensors[i], rope_base;
+                                  lens=lens)
         push!(new_k_tensors, nk)
         push!(new_v_tensors, nv)
     end
@@ -898,13 +910,20 @@ function build_llama_decode_step!(model,
         logits.id,
         [t.id for t in new_k_tensors],
         [t.id for t in new_v_tensors],
-        step_pos)
+        step_pos,
+        lens === nothing ? 0 : lens.id)
 end
 
 
-# One decoder layer of the decode step, per block type
+# Model / block hooks of the decode step: the embedding, the per-layer state
+# buffers (a KV cache, or a recurrent layer's states), whether the step needs a
+# `lens` input, and one decoder layer.
 _embed(model, tokens) = model.embedding(tokens)
-function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base)
+_needs_lens(model) = false
+_is_state_layer(layer) = false
+_state_shapes(layer, max_seq, batch) =
+    (a = layer.attention; ([a.head_dim, max_seq, a.n_kv_heads, batch], [a.head_dim, max_seq, a.n_kv_heads, batch]))
+function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing)
     attn_out, nk, nv = llama_self_attn_cached(layer.attention, layer.attention_norm(x), step_pos, pos_tensor,
                                               pk, pv; rope_base=rope_base)
     x = x + attn_out
@@ -940,6 +959,7 @@ function llama_decode_step!(exec_fn,
     inputs = Dict{Int, Any}()
     inputs[idg.token_input_id] = Float32.(Base.reshape(tokens, 1, :))   # (1, B)
     inputs[idg.pos_input_id] = Float32.(pos)                            # (B,)
+    idg.lens_input_id == 0 || (inputs[idg.lens_input_id] = Float32.(advance))   # recurrent layers: 0 holds
 
     # The cache arrays already live on `device`; the compiled graph aliases them.
     for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
@@ -965,7 +985,7 @@ include("Gemma3.jl")
 export Gemma3, Gemma3Block, gemma3_config, model_template
 
 include("Qwen35.jl")
-export GatedDeltaNet, deltanet_state_shapes, qwen35_attention
+export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config
 
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,

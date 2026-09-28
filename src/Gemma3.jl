@@ -113,7 +113,7 @@ function (m::Gemma3)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=
     return return_kv ? (logits, kvs) : logits
 end
 
-function _decode_block(b::Gemma3Block, x, step_pos, pos_tensor, pk, pv, rope_base)
+function _decode_block(b::Gemma3Block, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing)
     attn_out, nk, nv = llama_self_attn_cached(b.attention, b.input_norm(x), step_pos, pos_tensor, pk, pv;
                                               rope_base=rope_base)
     x = x + b.post_attention_norm(attn_out)
@@ -171,11 +171,13 @@ end
 
 The architecture of a checkpoint, from its `config.json`, as an unregistered
 template model (for `LlamaSession`, `llama_generate`, `awq_scales`, ...):
-`Gemma3` for Gemma 3, otherwise `Llama` (Llama 2/3/3.x, TinyLlama, Qwen3).
+`Gemma3` for Gemma 3, `Qwen35` for Qwen3.5 / Qwen3.6, otherwise `Llama` (Llama
+2/3/3.x, TinyLlama, Qwen3).
 """
 function model_template(model_dir::String)
     c = JSON3.read(read(joinpath(model_dir, "config.json"), String))
     mt = String(get(c, :model_type, "llama"))
     startswith(mt, "gemma3") && return Gemma3(Luminal.Graph(), nothing; gemma3_config(model_dir)...)
+    startswith(mt, "qwen3_5") && return Qwen35(Luminal.Graph(), nothing; qwen35_config(model_dir)...)
     return Llama(Luminal.Graph(), nothing; llama_config(model_dir)...)
 end

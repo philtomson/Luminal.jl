@@ -70,7 +70,7 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
 """
 mutable struct LlamaSession{M, D}
     model::M
-    tokenizer::LlamaTokenizer
+    tokenizer::Union{LlamaTokenizer, Nothing}   # nothing: generate_ids only, no end-of-sequence ids
     weights::Dict{String, Any}       # Float32 weights on `device`, shared by every graph
     device::D
     max_seq::Int
@@ -81,7 +81,7 @@ mutable struct LlamaSession{M, D}
     decode::Dict{Int, Any}               # batch => compiled decode step and its cache
 end
 
-function LlamaSession(model, tokenizer::LlamaTokenizer, model_dir::String;
+function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_dir::String;
                       max_seq::Int=2048, rope_base::Real=model.rope_base, device=nothing,
                       search::Symbol=:none, decode_weights=nothing, awq=nothing)
     dev = device === nothing ? get_device() : device
@@ -108,7 +108,9 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
         g = Graph(); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
         input = Luminal.tensor(g, [slen, B])
-        out, kvs = m(input, 0; return_kv=true)
+        # recurrent layers (Qwen3.5) consume each prompt only up to its length
+        lens = NN._needs_lens(m) ? Luminal.tensor(g, [B]) : nothing
+        out, kvs = lens === nothing ? m(input, 0; return_kv=true) : m(input, 0; return_kv=true, lens=lens)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(out.id, [t.id for kv in kvs for t in kv])
         on_gpu = s.device isa Luminal.AbstractGPUDevice
@@ -123,7 +125,8 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
             compile(g; device=s.device, retain=vcat(retain, input.id), search=s.search,
                     precision=on_gpu, search_inputs=Dict{Int,Any}(input.id => ids))
         end
-        (exec=exec, input_id=input.id, out_id=out.id, kv_ids=[(k.id, v.id) for (k, v) in kvs])
+        (exec=exec, input_id=input.id, out_id=out.id, kv_ids=[(k.id, v.id) for (k, v) in kvs],
+         lens_id=lens === nothing ? 0 : lens.id)
     end
 end
 
@@ -135,7 +138,8 @@ function _decode_graph(s::LlamaSession, B::Int)
         idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
-                      idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids)
+                      idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
+                      idg.lens_input_id == 0 ? Int[] : [idg.lens_input_id])
         # The decode graph is shape-static (positions are data), so on AMD GPUs it is
         # captured once as a HIP graph and replayed each token.
         capture = s.device isa Luminal.AMDDevice
@@ -158,9 +162,7 @@ function _decode_graph(s::LlamaSession, B::Int)
                     capture=capture, search=s.search,
                     precision=wd === Luminal.Int4 ? :int4 : wd === Int8 ? :int8 : wd === Float16 ? :weights : false)
         end
-        attn = s.model.layers[1].attention
-        cache = LlamaKVCacheState(length(s.model.layers), attn.n_kv_heads, attn.head_dim;
-                                  batch=B, max_seq=s.max_seq, device=s.device)
+        cache = LlamaKVCacheState(s.model; batch=B, max_seq=s.max_seq, device=s.device)
         (exec=exec, idg=idg, cache=cache)
     end
 end
@@ -191,39 +193,49 @@ end
 
 """
     generate_ids(session, prompt_ids::Vector{Vector{Int}}; max_new_tokens=200,
-                 last_logits=nothing) -> Vector{Vector{Int}}
+                 last_logits=nothing, step_logits=nothing) -> Vector{Vector{Int}}
 
 `generate` on token ids (0-indexed, BOS included as wanted): each prompt's
 generated ids, the end-of-sequence token included if one was produced. With a
 `last_logits` vector, each prompt's prefill logits at its last position are
-appended to it (for validation).
+appended to it, and with `step_logits` each decode step's (vocab, B) logits
+(for validation).
 """
-function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200, last_logits=nothing)
+function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
+                      last_logits=nothing, step_logits=nothing)
     B = length(prompt_ids)
     B >= 1 || error("no prompts")
     plens = length.(prompt_ids)
     maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
 
-    # Prefill
+    # Prefill. Recurrent layers' states are bound straight to the decode cache's
+    # buffers, which the prefill leaves at each prompt's end.
     slen = _prefill_bucket(maximum(plens))
     pf = _prefill_graph(s, slen, B)
+    dc = _decode_graph(s, B)
+    cache = dc.cache
     ids = zeros(Float32, slen, B)
     for (b, p) in enumerate(prompt_ids)
         ids[1:plens[b], b] .= p
     end
-    res = pf.exec(Dict{Int,Any}(pf.input_id => ids); device=s.device)
+    pins = Dict{Int,Any}(pf.input_id => ids)
+    pf.lens_id == 0 || (pins[pf.lens_id] = Float32.(plens))
+    for (i, (a, b)) in enumerate(pf.kv_ids)
+        NN._is_state_layer(s.model.layers[i]) || continue
+        pins[a], pins[b] = cache.self_cache[i]
+    end
+    res = pf.exec(pins; device=s.device)
     logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B)
-    eos_ids = s.tokenizer.eos_ids
+    eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
     generated = [[argmax(view(logits, :, plens[b], b)) - 1] for b in 1:B]   # 0-indexed
     last_logits === nothing || append!(last_logits, [logits[:, plens[b], b] for b in 1:B])
     done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
     # KV cache: sequence b's next token goes to position plens[b]. Slots past a
     # sequence's position are never read, so the reused cache needs no clearing.
-    dc = _decode_graph(s, B)
-    cache = dc.cache
     cache.positions .= plens
     for (i, (k, v)) in enumerate(pf.kv_ids)
+        NN._is_state_layer(s.model.layers[i]) && continue                  # written in place
         # Prefill K/V (head_dim, slen, kv_heads, B) -> cache (head_dim, max_seq, kv_heads, B),
         # in place on the device; only each prompt's own positions.
         for b in 1:B
@@ -238,6 +250,7 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
         tokens = [g[end] for g in generated]
         out = llama_decode_step!(dc.exec, dc.idg, cache, tokens; advance=.!done, device=s.device)
         host = Array{Float32}(out)                                          # (vocab, 1, B)
+        step_logits === nothing || push!(step_logits, host[:, 1, :])
         for b in 1:B
             done[b] && continue
             next = argmax(view(host, :, 1, b)) - 1                          # 0-indexed
@@ -273,6 +286,8 @@ _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry; rop
     Llama(graph, reg; model.config..., rope_base=rope_base)
 _rebuild_model_like(model::Gemma3, graph::Luminal.Graph, reg::WeightRegistry; rope_base=model.rope_base) =
     Gemma3(graph, reg; model.config..., rope_base=rope_base)
+_rebuild_model_like(model::Qwen35, graph::Luminal.Graph, reg::WeightRegistry; rope_base=model.rope_base) =
+    Qwen35(graph, reg; model.config..., rope_base=rope_base)
 
 function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegistry;
                             rope_base=model.rope_base)

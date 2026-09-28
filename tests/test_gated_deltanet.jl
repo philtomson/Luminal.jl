@@ -30,9 +30,9 @@ function dn_graph(S, B, fresh)
     dn = GatedDeltaNet(TC[:hidden_size], g, reg, PFX; dn_kw...)
     cs, rs = deltanet_state_shapes(dn, B)
     x = Luminal.tensor(g, [TC[:hidden_size], S, B])
-    conv = Luminal.tensor(g, cs); rec = Luminal.tensor(g, rs)
-    y = dn(x, conv, rec; fresh=fresh)
-    return g, reg, x, conv, rec, y
+    conv = Luminal.tensor(g, cs); rec = Luminal.tensor(g, rs); lens = Luminal.tensor(g, [B])
+    y = dn(x, conv, rec, lens; fresh=fresh)
+    return g, reg, x, conv, rec, lens, y
 end
 
 W = load_weights_to_dict(REF; device=CPUDevice())
@@ -43,12 +43,13 @@ W = load_weights_to_dict(REF; device=CPUDevice())
     x0 = refarr("dn_in_0")                                   # (hidden, S, B)
     S = size(x0, 2)
     # states live on the device across calls, updated in place
-    gp, regp, xp, convp, recp, yp = dn_graph(S, B, true)
+    gp, regp, xp, convp, recp, lensp, yp = dn_graph(S, B, true)
     cs, rs = deltanet_state_shapes(GatedDeltaNet(TC[:hidden_size], Graph(), nothing; dn_kw...), B)
     conv_buf = Luminal.zero_tensor(dev, Float32, cs...); rec_buf = Luminal.zero_tensor(dev, Float32, rs...)
-    run(g, reg, x, conv, rec, y, xv) = begin
+    run(g, reg, x, conv, rec, lens, y, xv; n=size(xv, 2)) = begin
         load_weights!(g, reg, W; device=dev)
-        ins = Dict{Int,Any}(x.id => Luminal.to_device(xv, dev), conv.id => conv_buf, rec.id => rec_buf)
+        ins = Dict{Int,Any}(x.id => Luminal.to_device(xv, dev), conv.id => conv_buf, rec.id => rec_buf,
+                            lens.id => fill(Float32(n), B))
         mode === :interpreter ? execute(g, y.id, ins, CPUDevice()) :
             Array(compile(g; device=dev, retain=[y.id], free_intermediates=false)(ins; device=dev)[y.id])
     end
@@ -60,9 +61,19 @@ W = load_weights_to_dict(REF; device=CPUDevice())
         @test relerr(Array(rec_buf), refarr("rec_$step")) < 1e-4
     end
     fill!(conv_buf, 7f0); fill!(rec_buf, 7f0)                 # fresh must ignore the buffers' contents
-    check(0, run(gp, regp, xp, convp, recp, yp, x0))
+    check(0, run(gp, regp, xp, convp, recp, lensp, yp, x0))
     gd = dn_graph(1, B, false)
     for step in 1:3
         check(step, run(gd..., refarr("dn_in_$step")))
     end
+    # lens: a held sequence (0) keeps its states; padding past lens is ignored
+    c0, r0 = Array(conv_buf), Array(rec_buf)
+    yh = run(gd..., refarr("dn_in_1"); n=0)
+    @test all(iszero, yh) && Array(conv_buf) == c0 && Array(rec_buf) == r0
+    gpad = dn_graph(S + 3, B, true)
+    xpad = cat(x0, randn(Float32, size(x0, 1), 3, B); dims=2)
+    ypad = run(gpad..., xpad; n=S)
+    @test relerr(ypad[:, 1:S, :], refarr("dn_out_0")) < 1e-4 && all(iszero, ypad[:, S+1:end, :])
+    @test relerr(Array(rec_buf), refarr("rec_0")) < 1e-4
+    @test relerr(Array(conv_buf), permutedims(refarr("conv_0"), (2, 1, 3))) < 1e-5
 end

@@ -251,12 +251,15 @@ batch of 4 clips decodes in about the time of 2.
   (sliding-window, in prefill masks and the decode kernel) and global (scaled
   RoPE) layers. `model_template(dir)` picks Llama or Gemma3 from `config.json`, and
   `generate_ids` generates from token ids.
-- **Qwen3.5 / Qwen3.6 (in progress)**: both layer types match transformers on a
-  tiny random model through prefill and decode: the Gated DeltaNet
-  linear-attention layer (`GatedDeltaNet`, with the `CausalConv` and `DeltaRule`
-  ops keeping the convolution and recurrent states in place) and the gated full
-  attention (`qwen35_attention`: output gate, RoPE on a quarter of each head,
-  (1 + w) QK-norm). The hybrid cache, the whole model and int4 loading are next.
+- **Qwen3.5 / Qwen3.6 (dense; in progress)**: `Qwen35` (`qwen35_config`,
+  `model_template`) matches transformers on a tiny random model through
+  `LlamaSession`, prefill and decode, batched. Its Gated DeltaNet layers
+  (`GatedDeltaNet`; the `CausalConv` and `DeltaRule` ops keep the convolution and
+  recurrent states in place, consuming each sequence up to its `lens`) and gated
+  full attention (`qwen35_attention`: output gate, RoPE on a quarter of each head,
+  (1 + w) QK-norm) share one decode step with a hybrid cache: K/V for the full
+  layers, states for the linear ones. Next: loading the 27B checkpoint straight
+  into int4.
 - **Batched generation**: `llama_generate(model, tok, prompts::Vector{String}, dir)`
   runs one right-padded prefill for all prompts. It then decodes them together,
   each sequence at its own position, and stops each one independently. Its

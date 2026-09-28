@@ -199,15 +199,18 @@ end
 # Linear-attention building blocks (Gated DeltaNet: Qwen3.5 / Qwen3.6). Both
 # carry state across calls in a buffer they update in place, like
 # DecodeAttention's cache write; `fresh` starts from zeros (prefill) instead of
-# the buffer's contents (decode).
+# the buffer's contents (decode). A last input `lens` (B,) says how many of each
+# sequence's S tokens to consume: the state ends after token lens[b] (padding
+# after a shorter prompt, or a batched-decode sequence that holds its position
+# with lens 0, leaves it alone); outputs past lens[b] are zero.
 #
 # CausalConv: depthwise causal convolution then SiLU. Inputs x (C, S, B),
-#   state (C, K, B), w (C, 1, K); out[c, t] = silu(sum_j w[c, j] * u[c, t - K + j])
+#   state (C, K, B), w (C, 1, K), lens; out[c, t] = silu(sum_j w[c, j] * u[c, t - K + j])
 #   where u is the state's inputs followed by x. The state becomes the last K
 #   inputs.
 # DeltaRule: the gated delta rule. Inputs q, k (dk, nk, S, B) (L2-normalized),
 #   v (dv, nv, S, B), g, beta (nv, S, B), state (dv, dk, nv, B) holding S^T per
-#   head; value head h reads key head (h - 1) ÷ (nv ÷ nk) + 1. Per token:
+#   head, lens; value head h reads key head (h - 1) ÷ (nv ÷ nk) + 1. Per token:
 #   S <- S exp(g); S <- S + k ((v - S^T k) beta)^T; out = S^T (q * scale).
 #   Output (dv, nv, S, B); the state is left at the final S^T.
 struct CausalConv <: Op
