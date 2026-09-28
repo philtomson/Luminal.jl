@@ -159,6 +159,20 @@ positions; correctness at 1,300 tokens was checked separately against
 
 Measured unless marked otherwise.
 
+0. **Every published upstream `llm_chat` benchmark, FP32 against FP32:**
+
+   | Model | TTFT (upstream → ours) | TPOT (upstream → ours) | Decode bandwidth efficiency (upstream / ours) |
+   |---|---:|---:|---:|
+   | Llama-3-8B | 5,848 → 691 ms | 221.3 → 148.2 ms | 2.8% / 79% |
+   | Qwen3-4B | 3,513 → 396 ms | 144.1 → 77.0 ms | 2.3% / 82% |
+   | Gemma3-4B | 4,085 → 400 ms | 166.9 → 78.7 ms | 1.9% / 77% |
+   | Qwen3-0.6B | 811 → 86.5 ms | 40.5 → 15.4 ms | 1.2% / 61% |
+
+   The TTFT gap is mostly prefill strategy: upstream prefills in chunks of 8
+   tokens (`--prefill-chunk 8`), so a 128-token prompt passes through the weights
+   16 times with skinny, bandwidth-bound matmuls; we prefill it in one graph with
+   full rocBLAS GEMMs. The TPOT gap is kernel efficiency, below.
+
 1. **FP32 decode latency: 1.5× lower** (148 vs 221 ms/token) on hardware with
    1/19 the bandwidth. Normalized, that's 28× the bandwidth efficiency (79% vs
    2.8% of peak). This comes from hand-written GEMV and fused decode kernels
@@ -196,15 +210,14 @@ Measured unless marked otherwise.
 
 These are ordered roughly by how much they limit Luminal.jl today.
 
-1. **Model coverage.** Upstream runs Qwen3-0.6B/4B, Gemma3-4B (text) and
-   Llama-3-8B, has a Qwen3-30B-A3B MoE definition, and loads a chat template
-   from the checkpoint. We run Llama-family models only:
-   - `llama_config` rejects RoPE scaling (Llama-3.1/3.2), tied embeddings and
-     biases;
-   - there's no Qwen3 Q/K normalisation, no Gemma, no MoE;
-   - chat templates are hard-coded for two formats (`chat_prompt`).
-
-   Three of upstream's four benchmark models can't be compared yet.
+1. **Model coverage, the remaining gaps.** We now run all four of upstream's
+   benchmark models (Llama-3-8B, Qwen3-0.6B/4B, Gemma3-4B text) plus
+   Llama-3.1/3.2 (RoPE scaling), each validated against `transformers`. Still
+   missing:
+   - mixture-of-experts: upstream has a Qwen3-30B-A3B definition;
+   - chat templates read from the checkpoint: upstream loads them, while our
+     `chat_prompt` hard-codes four formats (Llama-3/3.1+, ChatML, Gemma, Zephyr);
+   - attention or MLP biases, and other RoPE scalings (YaRN, dynamic NTK).
 2. **Multi-turn KV reuse.** Upstream's chat session keeps the KV cache across
    turns and only prefills the new tokens. `LlamaSession.generate` prefills the
    whole prompt on every call, so a follow-up turn costs a full prefill of the
@@ -227,11 +240,16 @@ These are ordered roughly by how much they limit Luminal.jl today.
    AMD ROCm; the CUDA path is untested; there's no Metal.
 7. **Validation breadth.** Upstream checks full-vocabulary logits against Transformers
    for 3 models × 7 chat turns × prefill chunk sizes 1/4/8, with a stated
-   tolerance, including KV reuse and resets. Ours is 3 prompts on Llama-3-8B
-   (logits at every prompt position, greedy continuations) plus TinyLlama perplexity.
-8. **Long context.** Untested beyond a few hundred tokens here. `DecodeAttention`
-   caps the context at 8,192 (local-memory score buffer); prefill uses
-   materialised `S × S` attention scores, so memory grows quadratically.
+   tolerance, including KV reuse and resets. Ours covers more models but fewer
+   scenarios: 5 checkpoints (Llama-3-8B, Llama-3.2-1B, Qwen3-0.6B/4B, Gemma3-4B) ×
+   3 single-turn prompts, logits at every prompt position (all within 7e-6
+   relative) and greedy continuations in Float32/Float16/int8, plus one
+   1,300-token Gemma3 check and perplexity for the quantized formats. No
+   multi-turn checks, since we don't reuse KV across turns yet (#2).
+8. **Long context.** Checked against `transformers` at 1,300 tokens (Gemma3-4B,
+   past its 1,024-token sliding window), not beyond. `DecodeAttention` caps the
+   context at 8,192 (local-memory score buffer); prefill uses materialised
+   `S × S` attention scores, so memory grows quadratically.
 9. **Search generality.** Upstream's e-graph can discover implementations (views vs
    copies, GEMM+add) from primitive ops. Our speed comes mostly from hand-written
    kernels that the model code inserts, and fused ops the search can't derive.
