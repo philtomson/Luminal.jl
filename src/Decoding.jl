@@ -11,7 +11,7 @@ using ..Luminal.LlamaTokenization
 using AMDGPU
 using JSON3
 
-export greedy_decode, llama_generate, LlamaSession, generate, weight_preset
+export greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset
 
 """
     weight_preset(name) -> (weight name -> Type)
@@ -185,9 +185,22 @@ sequences.
 generate(s::LlamaSession, prompt::String; kwargs...) = only(generate(s, [prompt]; kwargs...))
 
 function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=200)
-    B = length(prompts)
-    B >= 1 || error("no prompts")
     prompt_ids = [LlamaTokenization.encode(s.tokenizer, p; bos=true) for p in prompts]
+    return [LlamaTokenization.decode(s.tokenizer, g) for g in generate_ids(s, prompt_ids; max_new_tokens)]
+end
+
+"""
+    generate_ids(session, prompt_ids::Vector{Vector{Int}}; max_new_tokens=200,
+                 last_logits=nothing) -> Vector{Vector{Int}}
+
+`generate` on token ids (0-indexed, BOS included as wanted): each prompt's
+generated ids, the end-of-sequence token included if one was produced. With a
+`last_logits` vector, each prompt's prefill logits at its last position are
+appended to it (for validation).
+"""
+function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200, last_logits=nothing)
+    B = length(prompt_ids)
+    B >= 1 || error("no prompts")
     plens = length.(prompt_ids)
     maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
 
@@ -202,6 +215,7 @@ function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=
     logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B)
     eos_ids = s.tokenizer.eos_ids
     generated = [[argmax(view(logits, :, plens[b], b)) - 1] for b in 1:B]   # 0-indexed
+    last_logits === nothing || append!(last_logits, [logits[:, plens[b], b] for b in 1:B])
     done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
     # KV cache: sequence b's next token goes to position plens[b]. Slots past a
@@ -232,8 +246,7 @@ function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=
                       cache.positions[b] >= s.max_seq
         end
     end
-
-    return [LlamaTokenization.decode(s.tokenizer, g) for g in generated]
+    return generated
 end
 
 """
@@ -258,6 +271,8 @@ using the same hyperparameters as the original. Supports `Llama` and `Phi3`.
 """
 _rebuild_model_like(model::Llama, graph::Luminal.Graph, reg::WeightRegistry; rope_base=model.rope_base) =
     Llama(graph, reg; model.config..., rope_base=rope_base)
+_rebuild_model_like(model::Gemma3, graph::Luminal.Graph, reg::WeightRegistry; rope_base=model.rope_base) =
+    Gemma3(graph, reg; model.config..., rope_base=rope_base)
 
 function _rebuild_model_like(model::Phi3, graph::Luminal.Graph, reg::WeightRegistry;
                             rope_base=model.rope_base)

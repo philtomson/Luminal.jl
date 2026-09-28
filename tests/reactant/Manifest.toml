@@ -667,7 +667,7 @@ uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
 
 [[deps.Luminal]]
-deps = ["AMDGPU", "BFloat16s", "BenchmarkTools", "CUDA", "FFTW", "GPUArrays", "JSON3", "KernelAbstractions", "LinearAlgebra", "Metatheory", "Random", "SafeTensors", "Serialization", "SymbolicUtils", "Vulkan"]
+deps = ["AMDGPU", "BFloat16s", "BenchmarkTools", "CUDA", "Dates", "FFTW", "GPUArrays", "JSON3", "KernelAbstractions", "LinearAlgebra", "Metatheory", "Random", "SafeTensors", "Serialization", "SymbolicUtils", "Vulkan"]
 path = "../.."
 uuid = "222a9b07-3232-5822-9dfe-603b9586f401"
 version = "0.1.0"

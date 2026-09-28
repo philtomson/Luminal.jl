@@ -10,8 +10,7 @@ wtypes = Dict("f32" => Float32, "f16" => Float16, "int8" => Int8)
 modes = split(get(ARGS, 3, "f32,f16,int8"), ",")
 idx = JSON3.read(read(joinpath(ref, "index.json"), String))
 tok = LlamaTokenizer(dir)
-cfg = llama_config(dir)
-model = Llama(Graph(), nothing; cfg...)
+model = model_template(dir)             # Llama, Qwen3 or Gemma3, from config.json
 dev = get_device()
 relerr(a, b) = maximum(abs.(a .- b)) / maximum(abs.(b))
 

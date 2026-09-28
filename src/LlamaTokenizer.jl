@@ -1,6 +1,7 @@
 module LlamaTokenization
 
 using JSON3
+using Dates
 import ..Luminal: encode, decode
 
 export LlamaTokenizer, encode, decode, chat_prompt
@@ -33,7 +34,39 @@ struct LlamaTokenizer
     byte_level::Bool              # byte-level BPE (Llama-3) rather than SentencePiece
     pattern::Union{Regex,Nothing} # byte-level pre-tokenizer split
     ignore_merges::Bool           # a whole pre-token found in the vocab is one token
-    specials::Union{Regex,Nothing}  # matches special tokens in the input text
+    specials::Any                 # _Trie of the added tokens split out of the text, or nothing
+    chat_template::String         # tokenizer_config.json's chat_template ("" if none)
+    sp_prefix::Bool               # SentencePiece mode: prepend "▁" (the normalizer's Prepend)
+end
+
+# A byte trie of the added tokens, for longest-match splitting. (A regex of
+# alternatives outgrows PCRE: Gemma3 has 6,415 added tokens.)
+struct _Trie
+    next::Vector{Dict{UInt8, Int32}}
+    term::Vector{Bool}
+end
+function _Trie(strs)
+    t = _Trie([Dict{UInt8, Int32}()], [false])
+    for s in strs
+        n = 1
+        for b in codeunits(s)
+            n = get!(t.next[n], b) do
+                push!(t.next, Dict{UInt8, Int32}()); push!(t.term, false); Int32(length(t.next))
+            end
+        end
+        t.term[n] = true
+    end
+    return t
+end
+# Last byte index of the longest token starting at byte i of s, or 0
+function _longest(t::_Trie, s::String, i::Int)
+    n = 1; best = 0; cu = codeunits(s)
+    @inbounds for j in i:length(cu)
+        n = get(t.next[n], cu[j], Int32(0))
+        n == 0 && break
+        t.term[n] && (best = j)
+    end
+    return best
 end
 
 # GPT-2's reversible byte <-> printable-character mapping.
@@ -120,8 +153,7 @@ function LlamaTokenizer(model_dir::String)
         # GPT-2's pattern, for ByteLevel with use_regex
         pattern = r"(*UCP)'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
     end
-    specials = isempty(special_strs) ? nothing :
-        Regex(join(map(t -> "\\Q" * t * "\\E", sort(special_strs; by=length, rev=true)), "|"))
+    specials = isempty(special_strs) ? nothing : _Trie(special_strs)
 
     # Special token ids
     _id(n) = get(vocab, n, -1)
@@ -149,7 +181,10 @@ function LlamaTokenizer(model_dir::String)
 
     return LlamaTokenizer(vocab, id_to_token, merges, merge_ranks, bos_id, eos_id, unk_id, pad_id,
                           eos_ids, special_ids, byte_level, pattern,
-                          Bool(_json_get(model, "ignore_merges", false)), specials)
+                          Bool(_json_get(model, "ignore_merges", false)), specials,
+                          (ct = _json_get(tcfg, "chat_template", ""); ct isa AbstractString ? String(ct) : ""),
+                          # Llama-2 / TinyLlama normalize with Prepend("▁"); Gemma only replaces spaces
+                          (nz = _json_get(data, "normalizer", nothing); nz === nothing || occursin("Prepend", JSON3.write(nz))))
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +269,7 @@ function encode(tok::LlamaTokenizer, text::String; bos::Bool=false, eos::Bool=fa
             _encode_byte_level!(ids, tok, seg)
         else
             # SentencePiece prepends "▁" to the text, not to text after a special token
-            _encode_sentencepiece!(ids, tok, seg; prefix = i == 1)
+            _encode_sentencepiece!(ids, tok, seg; prefix = i == 1 && tok.sp_prefix)
         end
     end
     eos && tok.eos_id != -1 && push!(ids, tok.eos_id)
@@ -247,10 +282,16 @@ function _split_specials(tok::LlamaTokenizer, text::String)
     segments = Tuple{String,Bool}[]
     pos = 1
     if tok.specials !== nothing
-        for m in eachmatch(tok.specials, text)
-            m.offset > pos && push!(segments, (text[pos:prevind(text, m.offset)], false))
-            push!(segments, (m.match, true))
-            pos = m.offset + ncodeunits(m.match)
+        i = 1
+        while i <= ncodeunits(text)
+            j = _longest(tok.specials, text, i)
+            if j == 0
+                i = nextind(text, i)
+            else
+                i > pos && push!(segments, (text[pos:prevind(text, i)], false))
+                push!(segments, (text[i:thisind(text, j)], true))
+                pos = i = j + 1
+            end
         end
     end
     pos <= ncodeunits(text) && push!(segments, (text[pos:end], false))
@@ -341,16 +382,20 @@ function _decode_byte_level(tok::LlamaTokenizer, ids::AbstractVector{<:Integer})
 end
 
 """
-    chat_prompt(tok, message; thinking=false) -> String
+    chat_prompt(tok, message; thinking=false, date=today()) -> String
 
 `message` as a single user turn in the model's chat format, ending where the
-assistant's reply begins: ChatML for Qwen (with an empty think block unless
-`thinking`, as Qwen3's template does), Llama-3's header format when the
-vocabulary has its header tokens, otherwise the Zephyr format TinyLlama-Chat
+assistant's reply begins: Llama-3's header format (with the system header
+Llama-3.1 / 3.2's template adds, carrying the knowledge cutoff and `date`),
+ChatML for Qwen (with an empty think block unless `thinking`, as Qwen3's
+template does), Gemma's turn format, otherwise the Zephyr format TinyLlama-Chat
 uses. The BOS token is not included (`encode(...; bos=true)` and `generate` add
 it, for models that have one).
 """
-function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Bool=false)
+function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Bool=false, date::Date=today())
+    if haskey(tok.vocab, "<start_of_turn>")                   # Gemma
+        return "<start_of_turn>user\n$message<end_of_turn>\n<start_of_turn>model\n"
+    end
     if haskey(tok.vocab, "<|im_start|>")
         # ChatML (Qwen). Qwen3 thinks by default; with thinking off its template
         # opens the reply with an empty think block.
@@ -358,7 +403,12 @@ function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Boo
         return "<|im_start|>user\n$message<|im_end|>\n<|im_start|>assistant\n" * think
     end
     if haskey(tok.vocab, "<|start_header_id|>")
-        return "<|start_header_id|>user<|end_header_id|>\n\n$(strip(message))<|eot_id|>" *
+        # Llama-3.1 / 3.2's template always opens with a system header stating the
+        # knowledge cutoff and today's date (strftime "%d %b %Y")
+        sys = occursin("Cutting Knowledge Date", tok.chat_template) ?
+            "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n" *
+            "Today Date: $(Dates.format(date, "dd u yyyy"))\n\n<|eot_id|>" : ""
+        return sys * "<|start_header_id|>user<|end_header_id|>\n\n$(strip(message))<|eot_id|>" *
                "<|start_header_id|>assistant<|end_header_id|>\n\n"
     end
     return "<|user|>\n$message</s>\n<|assistant|>\n"

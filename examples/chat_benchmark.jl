@@ -23,8 +23,7 @@ reps = parse(Int, get(ARGS, 5, "3"))
 
 tok = LlamaTokenizer(dir)
 empty!(tok.eos_ids)                      # generate exactly n_out tokens, as upstream does
-cfg = llama_config(dir)
-model = Llama(Graph(), nothing; cfg...)
+model = model_template(dir)             # Llama, Qwen3 or Gemma3, from config.json
 
 # A story request padded to exactly n_in tokens (BOS and chat template included).
 function padded_prompt()

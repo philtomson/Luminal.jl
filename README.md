@@ -18,6 +18,12 @@ Models validated against Hugging Face `transformers`:
   prompt position; greedy chat continuations (thinking off) identical to HF's
   with Float32, Float16 and int8 decode weights (4B), or all but one late token
   at int8 (0.6B). Chat prompts tokenize exactly as upstream Luminal's benchmark.
+- **Gemma3-4B** (text): logits within 7e-6 of the reference at every prompt
+  position, greedy continuations identical in Float32, Float16 and int8; at 1,300
+  tokens (past the 1,024-token sliding window) the last-position logits are within
+  6e-6 and the next 8 greedy tokens match.
+- **Llama-3.2-1B-Instruct** (RoPE scaling, tied head): logits within 6e-6, greedy
+  continuations identical in Float32, Float16 and int8.
 - **TinyLlama 1.1B**: prefill plus KV-cached decode. Perplexity in Float32
   matches the reference, and int8 weights cost +0.25%.
 - **Whisper** (tiny, and other sizes from their `config.json`): transcription
@@ -230,7 +236,7 @@ batch of 4 clips decodes in about the time of 2.
 ### Models and layers
 - Layers: `Linear`, `Conv1D`, `Embedding`, `LayerNorm`, `RMSNorm`, `Mlp`,
   `SelfAttention` (GQA, RoPE), `TransformerBlock`.
-- **Llama / TinyLlama / Llama-3 / Qwen3**: models built from `config.json`
+- **Llama / TinyLlama / Llama-3 / 3.1 / 3.2 / Qwen3**: models built from `config.json`
   (`llama_config`), prefill, and a device-resident KV cache with one compiled
   decode graph for every position. `LlamaSession`/`generate` reuse them, and
   `chat_prompt` produces the model's chat format (Llama-3, Zephyr, ChatML).
@@ -238,7 +244,13 @@ batch of 4 clips decodes in about the time of 2.
   the hidden size, QK-norm (an RMSNorm per head of q and k before RoPE), RMSNorm
   epsilon, and tied embeddings, where the output head is its own node loaded
   from the embedding's array (`tie_weight!`), so it can still be stored in
-  reduced precision.
+  reduced precision. RoPE scaling (`llama3`, `linear`) sets the frequencies
+  (`rope_inv_freqs`).
+- **Gemma3** (`Gemma3`, `gemma3_config`): scaled embeddings, (1 + w) RMSNorms
+  around both attention and MLP, QK-norm, GELU-tanh MLP, and interleaved local
+  (sliding-window, in prefill masks and the decode kernel) and global (scaled
+  RoPE) layers. `model_template(dir)` picks Llama or Gemma3 from `config.json`, and
+  `generate_ids` generates from token ids.
 - **Batched generation**: `llama_generate(model, tok, prompts::Vector{String}, dir)`
   runs one right-padded prefill for all prompts. It then decodes them together,
   each sequence at its own position, and stops each one independently. Its

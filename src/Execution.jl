@@ -185,7 +185,7 @@ end
 # of V with the workgroup split into G ÷ D slices over positions.
 const DECODE_ATTN_MAX_CTX = 8192
 @kernel function _decode_attn_kernel!(out, @Const(q), pk, pv, @Const(kn), @Const(vn),
-                                      @Const(posv), scale, Gq, write_cache)
+                                      @Const(posv), scale, Gq, write_cache, window)
     # Values shared across barriers must be @uniform (the CPU backend splits the
     # kernel into loops at each @synchronize); the softmax statistics go through
     # local memory (`stats`) for the same reason.
@@ -198,6 +198,7 @@ const DECODE_ATTN_MAX_CTX = 8192
     kv = @uniform (h - 1) ÷ Gq + 1
     pos = @uniform unsafe_trunc(Int, @inbounds posv[length(posv) == 1 ? 1 : b])
     n = @uniform pos + 1
+    lo = @uniform window > 0 ? max(1, n - window + 1) : 1   # first position attended to
     # write_cache: the first query head of each KV group stores this token's K/V in
     # slot pos + 1 (no workgroup reads that slot from the cache).
     if write_cache && (h - 1) % Gq == 0 && lid <= D
@@ -211,7 +212,9 @@ const DECODE_ATTN_MAX_CTX = 8192
     j = lid
     while j <= n
         acc = 0f0
-        if j <= pos
+        if j < lo
+            acc = -Inf32                                   # outside the window
+        elseif j <= pos
             for d in 1:D
                 @inbounds acc += q[d, 1, h, b] * pk[d, j, kv, b]
             end
@@ -220,7 +223,7 @@ const DECODE_ATTN_MAX_CTX = 8192
                 @inbounds acc += q[d, 1, h, b] * kn[d, 1, kv, b]
             end
         end
-        @inbounds sc[j] = acc * scale
+        @inbounds sc[j] = j < lo ? -Inf32 : acc * scale
         j += T
     end
     @synchronize
@@ -296,7 +299,8 @@ function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
         for b in 1:B, h in 1:H
             pos = Int(posv[length(posv) == 1 ? 1 : b])
             kv = (h - 1) ÷ G + 1
-            s = Float32[op.scale * sum(q[d, 1, h, b] * (j <= pos ? pk[d, j, kv, b] : kn[d, 1, kv, b]) for d in 1:D)
+            lo = op.window > 0 ? max(1, pos + 2 - op.window) : 1
+            s = Float32[j < lo ? -Inf32 : op.scale * sum(q[d, 1, h, b] * (j <= pos ? pk[d, j, kv, b] : kn[d, 1, kv, b]) for d in 1:D)
                         for j in 1:pos+1]
             p = exp.(s .- maximum(s)); p ./= sum(p)
             for d in 1:D
@@ -316,7 +320,7 @@ function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
     (D <= 256 && 256 % D == 0) || error("DecodeAttention: head_dim must divide 256")
     o3 = Base.reshape(out, D, H, B)
     _decode_attn_kernel!(KernelAbstractions.get_backend(o3), 256)(
-        o3, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH, op.write_cache; ndrange = H * B * 256)
+        o3, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH, op.write_cache, op.window; ndrange = H * B * 256)
     return out
 end
 

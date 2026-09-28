@@ -204,11 +204,15 @@ end
 # With `write_cache`, the op also stores k_new/v_new into past_k/past_v at slot
 # pos + 1, in place: the decode step then updates its KV cache without separate
 # launches. (Other slots are untouched, and attention reads only slots <= pos.)
+# With `window` > 0 (sliding-window attention, Gemma3's local layers) only the
+# last `window` positions, the new token included, are attended to.
 struct DecodeAttention <: Op
     scale::Float32
     write_cache::Bool
+    window::Int
 end
-DecodeAttention(scale) = DecodeAttention(scale, false)
+DecodeAttention(scale) = DecodeAttention(scale, false, 0)
+DecodeAttention(scale, write_cache) = DecodeAttention(scale, write_cache, 0)
 
 # op(A) * op(B), where op transposes the first two dims when its flag is set:
 # a matmul that reads a permuted operand through BLAS transpose flags instead of

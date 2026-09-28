@@ -135,6 +135,26 @@ logits within 5e-6 of Hugging Face `transformers` at every prompt position, and
 greedy continuations identical to HF's (Float32, Float16, int8 on 4B; one late
 token differs at int8 on 0.6B).
 
+## Gemma3-4B, 128 in / 128 out, batch 1
+
+Same checkpoint and revision on both sides: `unsloth/gemma-3-4b-it@bf46152c`
+(text model only; the prompt tokenizes to exactly upstream's recorded 128 ids).
+Upstream: FP32, `cuda_lite`, `benchmark-128-2026-09-21`.
+
+| | Upstream, FP32 (H200) | Luminal.jl, FP32 | Float16 | int8 | `:int4_mixed` | int4 |
+|---|---:|---:|---:|---:|---:|---:|
+| TTFT | 4,085 ms | **400 ms** | 411 ms | 393 ms | 400 ms | 398 ms |
+| TPOT | 166.9 ms | **78.7 ms** | 41.9 ms | 26.6 ms | 23.0 ms | 19.6 ms |
+| Decode throughput | 6.0 tok/s | 12.7 tok/s | 23.9 tok/s | 37.6 tok/s | 43.5 tok/s | 51.0 tok/s |
+| Full request | 25.3 s | **10.4 s** | 5.7 s | 3.8 s | 3.3 s | 2.9 s |
+
+FP32 decode reads ≈15.5 GB per token (upstream's `fp32_weight_bytes`; the tied
+embedding / head counted once): 197 GB/s here (77% of peak) against 93 GB/s on
+the H200 (1.9%). Local layers attend over a 1,024-token sliding window (masked in
+prefill, bounded in the decode kernel), irrelevant at this benchmark's 256
+positions; correctness at 1,300 tokens was checked separately against
+`transformers` (last-position logits within 6e-6, next 8 greedy tokens identical).
+
 ## Where Luminal.jl is ahead
 
 Measured unless marked otherwise.
@@ -220,7 +240,6 @@ These are ordered roughly by how much they limit Luminal.jl today.
 
 | Case | Luminal.jl | Upstream | To make it comparable |
 |---|---|---|---|
-| Gemma3-4B | not supported | 128/128 benchmark published | implement the architecture (backlog #1) |
 | TinyLlama 1.1B | 6.4 ms/token int8, 11 ms Float16 | no current example | run upstream's `llm_chat` with a Llama-2-style config, if its adapter accepts it |
 | Whisper (speech) | whisper-tiny: ~35 ms encoder, ~2.5 ms/token decode | no current example (the old Rust example is gone) | none upstream |
 | Same hardware | AMD only | NVIDIA/Apple only | run Luminal.jl's CUDA path on an NVIDIA GPU, or upstream on an H200 next to it |
@@ -233,7 +252,7 @@ the metrics above.
 
 | # | Item | Gain | Effort |
 |---:|---|---|---|
-| 1 | Model coverage: Gemma3, Llama-3.1/3.2 RoPE scaling, templates from `tokenizer_config.json` (Qwen3 done) | Makes the remaining upstream benchmark comparable; basic usability | medium |
+| 1 | Chat templates from `tokenizer_config.json` (Jinja) instead of hand-coded formats; more architectures as upstream adds them (Qwen3, Gemma3, Llama-3.1/3.2 RoPE scaling done: every upstream `llm_chat` benchmark is now comparable) | Any model's chat format; usability | medium |
 | 2 | Multi-turn KV reuse in `LlamaSession` (prefill only new tokens) | Follow-up TTFT becomes proportional to the new message, not the conversation | small–medium |
 | 3 | Faster measured search: prune dominated variants, early-stop groups, reuse across batch sizes | 12.7 min → minutes on 8B | medium |
 | 4 | Cold start: PrecompileTools workload, on-disk graph/kernel cache | 43–54 s first request → seconds | medium |
@@ -258,6 +277,8 @@ the metrics above.
 | 2026-09-21 | upstream | `65824ef3` | H200 | Qwen3-4B / FP32 | 3,513 ms | 144.1 ms | |
 | 2026-09-27 | Luminal.jl | `5c34f4c`+ | Radeon 8060S | Qwen3-0.6B / FP32, F16, int8, int4_mixed, int4 | 86.5–108.8 ms | 15.4 / 9.2 / 7.0 / 6.6 / 6.3 ms | `chat_benchmark.jl` |
 | 2026-09-27 | Luminal.jl | `5c34f4c`+ | Radeon 8060S | Qwen3-4B / FP32, F16, int8, int4_mixed, int4 | 396–411 ms | 77.0 / 40.4 / 24.2 / 19.3 / 16.9 ms | |
+| 2026-09-21 | upstream | `65824ef3` | H200 | Gemma3-4B / FP32 | 4,085 ms | 166.9 ms | `benchmark-128-2026-09-21` |
+| 2026-09-28 | Luminal.jl | `b458f9a`+ | Radeon 8060S | Gemma3-4B / FP32, F16, int8, int4_mixed, int4 | 393–411 ms | 78.7 / 41.9 / 26.6 / 23.0 / 19.6 ms | `chat_benchmark.jl` |
 
 ## Reproduce
 
@@ -266,7 +287,7 @@ Luminal.jl (checkpoint in `llama3_8b_instruct/`):
 ```bash
 julia --project=. examples/chat_benchmark.jl llama3_8b_instruct f32    # also f16, int8
 julia --project=. examples/batched_decode.jl llama3_8b_instruct int8 1,4,8
-julia --project=. examples/chat_benchmark.jl qwen3_0.6b f32            # also qwen3_4b; f16, int8, int4, int4_mixed
+julia --project=. examples/chat_benchmark.jl qwen3_0.6b f32            # also qwen3_4b, gemma3_4b; f16, int8, int4, int4_mixed
 ```
 
 Upstream: see `~/devel/luminal/examples/llm_chat/validation/benchmark-128-2026-09-21/RESULTS.md`
