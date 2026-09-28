@@ -1,13 +1,14 @@
 """Dump Hugging Face reference outputs for a Llama-family checkpoint.
 
-Usage: python3 examples/llama_reference.py <model_dir> <out_dir> [max_new_tokens]
+Usage: python3 examples/llama_reference.py <model_dir> <out_dir> [max_new_tokens] [dtype]
 
 For each chat prompt below (formatted with the tokenizer's chat template), writes:
 - the prompt token ids and HF's greedy continuation (argmax, no sampling or
   logit processors) to index.json, with the decoded text;
 - the Float32 logits at every prompt position as raw little-endian float32
   (C order (S, V), which reads as a column-major Julia (V, S) array).
-The model runs in Float32 on the CPU.
+The model runs on the CPU in Float32, or `dtype` (e.g. bfloat16 for models too
+large for Float32 in memory: Qwen3.6-27B); logits are written as Float32.
 """
 import json, os, sys
 import numpy as np
@@ -16,13 +17,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_dir, out = sys.argv[1], sys.argv[2]
 max_new = int(sys.argv[3]) if len(sys.argv) > 3 else 40
+dtype = getattr(torch, sys.argv[4]) if len(sys.argv) > 4 else torch.float32
 os.makedirs(out, exist_ok=True)
 PROMPTS = ["What is the capital of France? Answer in one sentence.",
            "Write a haiku about a lighthouse.",
            "Explain in two sentences why the sky is blue."]
 
 tok = AutoTokenizer.from_pretrained(model_dir)
-model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32).eval()
+model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=dtype).eval()
 gen = json.load(open(os.path.join(model_dir, "generation_config.json")))
 eos = gen["eos_token_id"]
 eos = set(eos if isinstance(eos, list) else [eos])

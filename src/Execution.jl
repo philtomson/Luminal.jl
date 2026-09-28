@@ -557,6 +557,25 @@ Base.getindex(w::QuantWeight, i::Int, j::Int) = Float32(w.q[j, i]) * w.scale[(j 
 
 # The (residual, Val(has_residual)) kernel arguments; without a residual the
 # output array stands in (never read).
+# Many columns (prefill) on a GEMV-stored weight: the GEMV kernels read the
+# weight once per few columns, so instead dequantize it to a temporary Float32
+# matrix, run one GEMM (rocBLAS on GPU) and free the temporary at once (the peak
+# is one weight's Float32 size, not the model's). CPU arrays always go this way
+# (the GEMV kernels are GPU kernels).
+const QUANT_GEMM_COLS = 16
+function _dequant_gemm!(C, W, B, residual)
+    M, K = size(W)
+    N = length(B) ÷ K
+    W32 = dequantize(W)
+    Bc = B isa DenseArray ? B : copy(B)
+    C2 = Base.reshape(C, M, N)
+    mul!(C2, W32, Base.reshape(Bc, K, N))
+    residual === nothing || (C2 .+= Base.reshape(residual isa DenseArray ? residual : copy(residual), M, N))
+    _free_now!(W32)
+    Bc === B || _free_now!(Bc)
+    return C
+end
+
 function _residual_arg(residual, C, M, N)
     residual === nothing && return (Base.reshape(C, M, N), Val(false))
     length(residual) == M * N || error("residual has $(length(residual)) elements, expected $(M * N)")
@@ -634,6 +653,7 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, cols
                      residual = nothing)
     K, M = size(W.q)
     N = length(B) ÷ K
+    (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R = iseven(M) ? 2 : 1
@@ -839,6 +859,7 @@ function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::I
                      residual = nothing)
     M, K = size(W)
     N = length(B) ÷ K
+    (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R = iseven(M) ? 2 : 1
@@ -928,6 +949,7 @@ end
 function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP, residual = nothing)
     K, M = size(W.t)
     N = length(B) ÷ K
+    (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     group <= 256 || error("Float16 GEMV: at most 256 threads per workgroup")
@@ -957,6 +979,17 @@ end
 # WeakRef to its source and only counts as a hit if it still points to `W`.
 const _HALF_WEIGHTS = Dict{UInt, Tuple{WeakRef, Any}}()
 const _HALF_WEIGHTS_LOCK = ReentrantLock()
+# Reduced-precision weight formats are built on their device and moved as they
+# are: the generic AbstractArray path would expand them to dense Float32.
+for D in (CPUDevice, AMDDevice, CUDADevice)
+    @eval Device.to_device(w::Union{HalfWeight, HalfWeightN, QuantWeight, Q4Weight}, ::$D) = w
+end
+
+# The storage format for a weight dtype (see compile's weight_dtype), or nothing
+# for Float32; and whether a weight with input dimension K fits it
+storage_type(T) = T === Int4 ? Q4Weight : T === Int8 ? QuantWeight : T === Float16 ? HalfWeight : nothing
+storage_fits(S, K) = K % (S === Q4Weight ? 32 : S === QuantWeight ? 16 : 8) == 0
+
 function half_weight(W, ::Type{T} = HalfWeight) where {T}
     key = hash(T, objectid(W))
     lock(_HALF_WEIGHTS_LOCK) do

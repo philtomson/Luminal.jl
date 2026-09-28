@@ -67,6 +67,12 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
                     a Symbol names a preset (`weight_preset`: `:int4_mixed`, ...).
 - `awq`           : AWQ scales from `awq_scales`, folded into the weights at load
                     (improves 4-bit accuracy; Float32 results are unchanged).
+- `weight_storage`: load the matmul weights straight into reduced precision
+                    (`Luminal.Int4`, `Int8`, `Float16`, a preset Symbol or a function
+                    of the name), never holding the model in Float32; prefill runs
+                    on them too (dequantized per matmul into one GEMM). For models
+                    too large for Float32 in memory, e.g. Qwen3.6-27B.
+- `weights`       : a preloaded weight dict (as from `load_weights_to_dict`).
 """
 mutable struct LlamaSession{M, D}
     model::M
@@ -83,13 +89,22 @@ end
 
 function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_dir::String;
                       max_seq::Int=2048, rope_base::Real=model.rope_base, device=nothing,
-                      search::Symbol=:none, decode_weights=nothing, awq=nothing)
+                      search::Symbol=:none, decode_weights=nothing, awq=nothing,
+                      weight_storage=nothing, weights=nothing)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
+    # weight_storage: load straight into reduced precision (prefill and decode both
+    # use it; decode_weights follows it unless given)
+    ws = weight_storage isa Symbol ? weight_preset(weight_storage) :
+         weight_storage isa Type ? (T = weight_storage; _ -> T) : weight_storage
+    ws !== nothing && awq !== nothing && error("awq needs Float32 weights to fold into; don't combine it with weight_storage")
+    decode_weights === nothing && weight_storage !== nothing && (decode_weights = weight_storage)
     wdtype = decode_weights isa Symbol ? weight_preset(decode_weights) :
              decode_weights !== nothing ? decode_weights : (on_gpu ? Float16 : Float32)
-    @info "Loading weights..." model_dir
-    weights = load_weights_to_dict(model_dir; device=dev)
+    if weights === nothing
+        @info "Loading weights..." model_dir
+        weights = load_weights_to_dict(model_dir; device=dev, quantize=ws)
+    end
     awq === nothing || awq_apply!(weights, awq, model)
     return LlamaSession(model, tokenizer, weights, dev, max_seq, Float32(rope_base), search, wdtype,
                         Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}())

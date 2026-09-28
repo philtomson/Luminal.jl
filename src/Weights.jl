@@ -169,18 +169,27 @@ function _load_tensor(fio::IO, entry, header_length::Integer, device::Luminal.Ab
 end
 
 """
-    load_weights_to_dict(path; device=get_device()) -> Dict{String, Any}
+    load_weights_to_dict(path; device=get_device(), quantize=nothing) -> Dict{String, Any}
 
 Load all weights from a safetensors file (or directory) into a dictionary of
 device-resident arrays. This is useful for sharing weights across multiple
 graphs (e.g., prefill vs. decode).
+
+With `quantize` (a function of the weight name returning `Float32`, `Float16`,
+`Int8` or `Luminal.Int4`, e.g. `weight_preset(:int4)`), each 2-D weight
+(the embedding table excepted) is converted to that storage as it is read and
+its Float32 copy freed at once, so a model never sits in memory in Float32:
+Qwen3.6-27B takes ~15 GB in int4 instead of 108 GB. Weights whose input
+dimension doesn't fit the format's blocks stay Float32.
 """
 function load_weights_to_dict(path::String;
-                             device::Luminal.AbstractDevice=Luminal.get_device())
+                             device::Luminal.AbstractDevice=Luminal.get_device(),
+                             quantize=nothing)
     files = _collect_safetensors_files(path)
     isempty(files) && error("No safetensors files found at: $path")
 
     tensors = Dict{String, Any}()
+    converted = 0
     for file in files
         open(file, "r") do fio
             header, header_length = SafeTensors.load_header(fio)
@@ -194,6 +203,16 @@ function load_weights_to_dict(path::String;
                 !haskey(entry, :dtype) && continue # Skip if not a tensor entry
                 data = _load_tensor(fio, entry, header_length, device)
                 data === nothing && continue       # unsupported dtype
+                if quantize !== nothing && ndims(data) == 2 && !occursin("embed_tokens", key)
+                    S = Luminal.storage_type(quantize(key))
+                    if S !== nothing && Luminal.storage_fits(S, size(data, 2))
+                        q = S(data)
+                        converted += sizeof(data)
+                        Luminal._free_now!(data)   # never hold the model in Float32
+                        data = q
+                        converted >= 2^31 && (Luminal.reclaim!(device); converted = 0)
+                    end
+                end
                 tensors[key] = data
             end
         end

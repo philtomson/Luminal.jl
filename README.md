@@ -258,8 +258,12 @@ batch of 4 clips decodes in about the time of 2.
   recurrent states in place, consuming each sequence up to its `lens`) and gated
   full attention (`qwen35_attention`: output gate, RoPE on a quarter of each head,
   (1 + w) QK-norm) share one decode step with a hybrid cache: K/V for the full
-  layers, states for the linear ones. Next: loading the 27B checkpoint straight
-  into int4.
+  layers, states for the linear ones.
+- **Loading straight into reduced precision** (`LlamaSession(...; weight_storage=Luminal.Int4)`,
+  or `load_weights_to_dict(...; quantize=...)`): each matmul weight is converted
+  as it is read, so a model never sits in memory in Float32 (Qwen3.6-27B: ~15 GB
+  int4 instead of 108 GB). Prefill runs on these weights too, dequantizing one
+  matrix at a time into a GEMM.
 - **Batched generation**: `llama_generate(model, tok, prompts::Vector{String}, dir)`
   runs one right-padded prefill for all prompts. It then decodes them together,
   each sequence at its own position, and stops each one independently. Its
