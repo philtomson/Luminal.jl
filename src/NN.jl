@@ -355,7 +355,31 @@ struct SelfAttention
     rope_theta::Union{Float32, Nothing} # this layer's RoPE base, if not the model's
     scale::Float32                      # score scale, 1/sqrt(head_dim) unless the model says otherwise
     window::Int                         # sliding-window size (Gemma3 local layers); 0: full causal
+    rotary_dim::Int                     # RoPE on the first rotary_dim dims of each head (Qwen3.5: a quarter)
+    output_gate::Bool                   # q_proj also yields a gate per head: out * sigmoid(gate) (Qwen3.5)
 end
+
+# RoPE on `t` (D, S, H, B): all of each head, or its first rotary_dim dims (the
+# rest pass through; frequencies over rotary_dim, as HF's partial rotary)
+function _rope(sa::SelfAttention, t, pos, base)
+    D = sa.head_dim; rd = sa.rotary_dim
+    (rd == 0 || rd == D) && return apply_rotary_embeddings(t, pos; base=base, scaling=sa.rope_scaling)
+    rot = apply_rotary_embeddings(Luminal.slice_along(t, 1, 0, rd), pos; base=base, scaling=sa.rope_scaling)
+    return Luminal.concat_along(rot, Luminal.slice_along(t, 1, rd, D), 1)
+end
+
+# q_proj's output (as (rows, H, S, B)) split into the query and, with an output
+# gate, the gate: each head's rows are [query; gate]
+function _query_and_gate(sa::SelfAttention, qp, S, B)
+    D, H = sa.head_dim, sa.n_heads
+    sa.output_gate || return Luminal.reshape(qp, [D, H, S, B]), nothing
+    r = Luminal.reshape(qp, [2D, H, S, B])
+    return Luminal.slice_along(r, 1, 0, D), Luminal.slice_along(r, 1, D, 2D)
+end
+
+# attention output (H * D, S, B), gated if the layer has an output gate
+_gate_output(sa::SelfAttention, out, gate, S, B) =
+    gate === nothing ? out : out * Luminal.sigmoid(Luminal.reshape(gate, [sa.head_dim * sa.n_heads, S, B]))
 
 _rope_base(sa::SelfAttention, model_base) = sa.rope_theta === nothing ? model_base : sa.rope_theta
 
@@ -370,9 +394,10 @@ adds an RMSNorm over each head of q and k (weights `q_norm`, `k_norm`, of size
 """
 function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Luminal.Graph, reg=nothing, prefix::String="self_attn";
                        head_dim::Int=div(hidden, n_heads), qk_norm::Bool=false, epsilon=1f-5,
-                       rope_scaling=nothing, rope_theta=nothing, scale=1 / sqrt(head_dim), window::Int=0)
+                       rope_scaling=nothing, rope_theta=nothing, scale=1 / sqrt(head_dim), window::Int=0,
+                       rotary_dim::Int=0, output_gate::Bool=false)
     return SelfAttention(
-        _linear(hidden, n_heads * head_dim, graph, reg, "$(prefix).q_proj"; bias=false),
+        _linear(hidden, n_heads * head_dim * (output_gate ? 2 : 1), graph, reg, "$(prefix).q_proj"; bias=false),
         _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).k_proj"; bias=false),
         _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).v_proj"; bias=false),
         _linear(n_heads * head_dim, hidden, graph, reg, "$(prefix).o_proj"; bias=false),
@@ -385,6 +410,8 @@ function SelfAttention(hidden::Int, n_heads::Int, n_kv_heads::Int, graph::Lumina
         rope_theta === nothing ? nothing : Float32(rope_theta),
         Float32(scale),
         window,
+        rotary_dim,
+        output_gate,
     )
 end
 
@@ -401,7 +428,7 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
     # Llama weights are packed as (Heads * HeadDim, In). 
     # In Julia column-major matrix W(Out, In), HeadDim is the faster dimension.
     # W * x -> (Heads * HeadDim, Seq, Batch)
-    queries = Luminal.reshape(sa.q_proj(x), [sa.head_dim, sa.n_heads, seq, batch])
+    queries, gate = _query_and_gate(sa, sa.q_proj(x), seq, batch)
     queries = Luminal.permute(queries, [1, 3, 2, 4]) # (D, S, H, B)
     
     keys = Luminal.reshape(sa.k_proj(x), [sa.head_dim, sa.n_kv_heads, seq, batch])
@@ -414,8 +441,8 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
     
     # RoPE
     base = _rope_base(sa, rope_base)
-    queries = apply_rotary_embeddings(queries, prev_seq; base=base, scaling=sa.rope_scaling)
-    keys = apply_rotary_embeddings(keys, prev_seq; base=base, scaling=sa.rope_scaling)
+    queries = _rope(sa, queries, prev_seq, base)
+    keys = _rope(sa, keys, prev_seq, base)
     
     # Save keys/values before repeatability expansion for GQA
     new_keys = keys
@@ -457,6 +484,7 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
     # (S, D, H, B) -> (D, H, S, B) -> (H * D, S, Batch)
     out = Luminal.permute(out, [2, 3, 1, 4])
     out = Luminal.reshape(out, [sa.n_heads * sa.head_dim, seq, batch])
+    out = _gate_output(sa, out, gate, seq, batch)
     
     out = sa.o_proj(out)
     
@@ -776,12 +804,13 @@ function llama_self_attn_cached(sa::SelfAttention,
     max_seq = Luminal.realized_dims(past_k.shape)[2]
 
     # Project current token: (Hidden, 1, B) -> (D, 1, H, B), then RoPE
-    q     = Luminal.permute(Luminal.reshape(sa.q_proj(x), [D, sa.n_heads, 1, batch]), [1, 3, 2, 4])
+    q, gate = _query_and_gate(sa, sa.q_proj(x), 1, batch)
+    q     = Luminal.permute(q, [1, 3, 2, 4])
     k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
     v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
     base = _rope_base(sa, rope_base)
-    q     = apply_rotary_embeddings(_qk_norm(sa.q_norm, q),     step_pos_tensor; base=base, scaling=sa.rope_scaling)
-    k_new = apply_rotary_embeddings(_qk_norm(sa.k_norm, k_new), step_pos_tensor; base=base, scaling=sa.rope_scaling)
+    q     = _rope(sa, _qk_norm(sa.q_norm, q),     step_pos_tensor, base)
+    k_new = _rope(sa, _qk_norm(sa.k_norm, k_new), step_pos_tensor, base)
 
     # Attention over cache slots [0, pos) plus the current token, in one kernel
     # (see Luminal.DecodeAttention): scores, softmax and the weighted sum of V,
@@ -792,6 +821,7 @@ function llama_self_attn_cached(sa::SelfAttention,
     out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(sa.scale, true, sa.window), ins,
                           Luminal.ShapeTracker([D, sa.n_heads, batch]))
     out = Luminal.reshape(out, [D * sa.n_heads, 1, batch])
+    out = _gate_output(sa, out, gate, 1, batch)
 
     return sa.o_proj(out), k_new, v_new
 end
@@ -935,7 +965,7 @@ include("Gemma3.jl")
 export Gemma3, Gemma3Block, gemma3_config, model_template
 
 include("Qwen35.jl")
-export GatedDeltaNet, deltanet_state_shapes
+export GatedDeltaNet, deltanet_state_shapes, qwen35_attention
 
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,

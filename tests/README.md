@@ -25,6 +25,7 @@ Tests that have GPU variants run them when `get_device()` finds a GPU, next to t
 | `test_compilation.jl` | `compile()` against the interpreter |
 | `test_fusion.jl` | Elementwise fusion |
 | `test_gated_deltanet.jl` | Gated DeltaNet (Qwen3.5/3.6 linear attention) against transformers on the tiny model in `data/qwen35_tiny` (from `examples/qwen35_reference.py`): output, convolution and recurrent state after a batch-2 prefill and 3 decode steps; interpreter and `compile()`, CPU and GPU |
+| `test_qwen35_attention.jl` | Qwen3.5/3.6 gated full attention (output gate, partial RoPE, (1 + w) QK-norm) against transformers on the tiny model: prefill and 3 cached decode steps, CPU and GPU |
 | `test_gemma3.jl` | Gemma3 architecture on a tiny random model with a 3-token window: prefill against a plain-Julia reference, windowed cached decode against it (CPU and GPU), config parsing; the chat prompt's tokens when `gemma3_4b/` is present |
 | `test_rope_scaling.jl` | `llama3` / `linear` RoPE scaling: frequencies against transformers' values, config parsing, a scaled model's decode against its prefill |
 | `test_qwen3.jl` | Qwen3 architecture on a tiny random model (decoupled head size, QK-norm, tied head, eps 1e-6): prefill against a plain-Julia reference, cached decode against prefill (CPU and GPU), config parsing; the Qwen3 chat prompt's tokens when `qwen3_0.6b/` is present |

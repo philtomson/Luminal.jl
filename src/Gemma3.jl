@@ -69,7 +69,8 @@ function Gemma3(graph::Luminal.Graph, reg=nothing;
             is_global ? rope_scaling : nothing,                 # local layers: unscaled
             is_global ? nothing : Float32(rope_local_base),     # global: the model's base
             Float32(scale),
-            is_global ? 0 : sliding_window)
+            is_global ? 0 : sliding_window,
+            0, false)                                          # full RoPE, no output gate
         Gemma3Block(attn,
                     _gemma_rmsnorm(hidden, graph, reg, "$(p).input_layernorm"; epsilon=rms_eps),
                     _gemma_rmsnorm(hidden, graph, reg, "$(p).post_attention_layernorm"; epsilon=rms_eps),

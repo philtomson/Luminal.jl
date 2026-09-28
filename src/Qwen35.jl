@@ -87,3 +87,28 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
     o = dn.norm(o) * Luminal.silu(z)
     return dn.out_proj(Luminal.reshape(o, [nv * dv, S, B]))
 end
+
+"""
+    qwen35_attention(hidden, graph, reg, prefix; n_heads, n_kv_heads, head_dim,
+                     rotary_dim, rope_theta, epsilon) -> SelfAttention
+
+Qwen3.5 / Qwen3.6's gated full attention: q_proj yields each head's query and
+an output gate (the output is multiplied by sigmoid(gate) before o_proj),
+(1 + w) RMSNorms on q and k per head, and RoPE on each head's first
+`rotary_dim` dims only. (Its "interleaved mRoPE" differs from plain RoPE only
+for image / video positions; for text the three position streams coincide.)
+"""
+function qwen35_attention(hidden::Int, graph::Luminal.Graph, reg, prefix::String;
+                          n_heads::Int, n_kv_heads::Int, head_dim::Int, rotary_dim::Int,
+                          rope_theta, epsilon=1f-6)
+    return SelfAttention(
+        _linear(hidden, 2n_heads * head_dim, graph, reg, "$(prefix).q_proj"; bias=false),
+        _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).k_proj"; bias=false),
+        _linear(hidden, n_kv_heads * head_dim, graph, reg, "$(prefix).v_proj"; bias=false),
+        _linear(n_heads * head_dim, hidden, graph, reg, "$(prefix).o_proj"; bias=false),
+        n_heads, n_kv_heads, head_dim,
+        _gemma_rmsnorm(head_dim, graph, reg, "$(prefix).q_norm"; epsilon=epsilon),
+        _gemma_rmsnorm(head_dim, graph, reg, "$(prefix).k_norm"; epsilon=epsilon),
+        nothing, Float32(rope_theta), Float32(1 / sqrt(head_dim)), 0,
+        rotary_dim, true)
+end

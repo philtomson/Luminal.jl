@@ -11,6 +11,8 @@ Float32 on the CPU:
 - layer 0's Gated DeltaNet input and output for each of those calls
   (`dn_in_*`, `dn_out_*`) and its states after each (`conv_*`: the last
   kernel-size pre-convolution inputs, `rec_*`: the recurrent state);
+- layer 3's gated full attention input and output for each call (`at_in_*`,
+  `at_out_*`);
 - the model's logits for each call (`logits_*`).
 Arrays are raw little-endian float32 in C order; `index.json` lists names and
 shapes (a C-order (a, b, c) array reads as a column-major Julia (c, b, a)).
@@ -57,6 +59,8 @@ def put(name, t):
 dn = model.model.layers[0].linear_attn
 cap = {}
 dn.register_forward_hook(lambda m, args, kwargs, o: cap.update(x=kwargs["hidden_states"], y=o), with_kwargs=True)
+at = model.model.layers[3].self_attn
+at.register_forward_hook(lambda m, args, kwargs, o: cap.update(ax=kwargs["hidden_states"], ay=o[0]), with_kwargs=True)
 
 ids = torch.randint(0, cfg.vocab_size, (2, 7))
 steps = []
@@ -65,6 +69,7 @@ with torch.no_grad():
     cache = o.past_key_values
     put("ids", ids.float()); put("logits_0", o.logits)
     put("dn_in_0", cap["x"]); put("dn_out_0", cap["y"])
+    put("at_in_0", cap["ax"]); put("at_out_0", cap["ay"])
     put("conv_0", cache.layers[0].conv_states); put("rec_0", cache.layers[0].recurrent_states)
     nxt = o.logits[:, -1].argmax(-1, keepdim=True)
     for s in range(1, 4):
@@ -73,6 +78,7 @@ with torch.no_grad():
         cache = o.past_key_values
         put(f"logits_{s}", o.logits)
         put(f"dn_in_{s}", cap["x"]); put(f"dn_out_{s}", cap["y"])
+        put(f"at_in_{s}", cap["ax"]); put(f"at_out_{s}", cap["ay"])
         put(f"conv_{s}", cache.layers[0].conv_states); put(f"rec_{s}", cache.layers[0].recurrent_states)
         nxt = o.logits[:, -1].argmax(-1, keepdim=True)
 
