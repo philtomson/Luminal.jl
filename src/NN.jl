@@ -934,6 +934,9 @@ export LlamaKVCacheState, LlamaDecodeGraph, build_llama_decode_step!, llama_deco
 include("Gemma3.jl")
 export Gemma3, Gemma3Block, gemma3_config, model_template
 
+include("Qwen35.jl")
+export GatedDeltaNet, deltanet_state_shapes
+
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,
        DecoderTransformerBlock, TextDecoder,

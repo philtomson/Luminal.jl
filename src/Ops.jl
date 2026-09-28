@@ -196,6 +196,28 @@ struct RMSNormOp <: Op
     epsilon::Float32
 end
 
+# Linear-attention building blocks (Gated DeltaNet: Qwen3.5 / Qwen3.6). Both
+# carry state across calls in a buffer they update in place, like
+# DecodeAttention's cache write; `fresh` starts from zeros (prefill) instead of
+# the buffer's contents (decode).
+#
+# CausalConv: depthwise causal convolution then SiLU. Inputs x (C, S, B),
+#   state (C, K, B), w (C, 1, K); out[c, t] = silu(sum_j w[c, j] * u[c, t - K + j])
+#   where u is the state's inputs followed by x. The state becomes the last K
+#   inputs.
+# DeltaRule: the gated delta rule. Inputs q, k (dk, nk, S, B) (L2-normalized),
+#   v (dv, nv, S, B), g, beta (nv, S, B), state (dv, dk, nv, B) holding S^T per
+#   head; value head h reads key head (h - 1) ÷ (nv ÷ nk) + 1. Per token:
+#   S <- S exp(g); S <- S + k ((v - S^T k) beta)^T; out = S^T (q * scale).
+#   Output (dv, nv, S, B); the state is left at the final S^T.
+struct CausalConv <: Op
+    fresh::Bool
+end
+struct DeltaRule <: Op
+    scale::Float32
+    fresh::Bool
+end
+
 # Single-token (decode) attention over a KV cache, in one kernel. Inputs:
 #   q (D, 1, H, B), past_k and past_v (D, max_seq, KVH, B), k_new and v_new
 #   (D, 1, KVH, B), pos (1,) -- the number of valid cache slots (slots >= pos are

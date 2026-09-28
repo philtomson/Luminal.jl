@@ -324,6 +324,126 @@ function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
     return out
 end
 
+# --- Linear attention: causal convolution and the gated delta rule -------------
+# (see CausalConv and DeltaRule in Ops.jl)
+
+_silu(x) = x / (1 + exp(-x))
+
+@kernel function _causal_conv_kernel!(out, @Const(x), state, @Const(w), ::Val{K}, fresh) where K
+    I = @index(Global, Linear)
+    C = size(x, 1); S = size(x, 2)
+    c = (I - 1) % C + 1; b = (I - 1) ÷ C + 1
+    # the last K inputs, oldest first
+    win = ntuple(j -> fresh ? 0f0 : @inbounds(Float32(state[c, j, b])), Val(K))
+    for t in 1:S
+        @inbounds xt = Float32(x[c, t, b])
+        win = (Base.tail(win)..., xt)
+        acc = 0f0
+        for j in 1:K
+            @inbounds acc += Float32(w[c, 1, j]) * win[j]
+        end
+        @inbounds out[c, t, b] = _silu(acc)
+    end
+    for j in 1:K
+        @inbounds state[c, j, b] = win[j]
+    end
+end
+
+function execute_op!(out, op::CausalConv, x, state, w)
+    C, S, B = size(x, 1), size(x, 2), size(x, 3)
+    K = size(w, 3)
+    if !(out isa AnyGPUArray)
+        for b in 1:B, c in 1:C
+            win = op.fresh ? zeros(Float32, K) : Float32[state[c, j, b] for j in 1:K]
+            for t in 1:S
+                win = vcat(win[2:end], Float32(x[c, t, b]))
+                out[c, t, b] = _silu(sum(Float32(w[c, 1, j]) * win[j] for j in 1:K))
+            end
+            state[c, :, b] .= win
+        end
+        return out
+    end
+    _causal_conv_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x), state, _dense(w), Val(K), op.fresh;
+                                                                    ndrange = C * B)
+    return out
+end
+
+# One workgroup per (value head, batch), one thread per value dim j, owning
+# column j of S (row j of the stored S^T, so a step's accesses are coalesced).
+const DELTA_MAX_DK = 256
+@kernel function _delta_rule_kernel!(out, @Const(q), @Const(k), @Const(v), @Const(g), @Const(beta), st,
+                                     scale, G, fresh)
+    j = @index(Local, Linear)
+    T = @uniform @groupsize()[1]
+    dk = @uniform size(q, 1); dv = @uniform size(v, 1)
+    nv = @uniform size(v, 2); S = @uniform size(v, 3)
+    # (@uniform values are computed from @index directly: they're hoisted)
+    h = @uniform (@index(Group, Linear) - 1) % size(v, 2) + 1
+    b = @uniform (@index(Group, Linear) - 1) ÷ size(v, 2) + 1
+    hk = @uniform (h - 1) ÷ G + 1
+    qs = @localmem Float32 (DELTA_MAX_DK,)
+    ks = @localmem Float32 (DELTA_MAX_DK,)
+    if fresh && j <= dv
+        for i in 1:dk
+            @inbounds st[j, i, h, b] = 0f0
+        end
+    end
+    for t in 1:S
+        i = j
+        while i <= dk
+            @inbounds qs[i] = Float32(q[i, hk, t, b]) * scale
+            @inbounds ks[i] = Float32(k[i, hk, t, b])
+            i += T
+        end
+        @synchronize
+        if j <= dv
+            @inbounds dec = exp(Float32(g[h, t, b]))
+            kv = 0f0
+            for i in 1:dk                                   # decay, and S^T k
+                @inbounds s_ = st[j, i, h, b] * dec
+                @inbounds st[j, i, h, b] = s_
+                @inbounds kv += s_ * ks[i]
+            end
+            @inbounds delta = (Float32(v[j, h, t, b]) - kv) * Float32(beta[h, t, b])
+            o = 0f0
+            for i in 1:dk                                   # rank-1 update, and S^T q
+                @inbounds s_ = st[j, i, h, b] + ks[i] * delta
+                @inbounds st[j, i, h, b] = s_
+                @inbounds o += s_ * qs[i]
+            end
+            @inbounds out[j, h, t, b] = o
+        end
+        @synchronize
+    end
+end
+
+function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st)
+    dk, nk = size(q, 1), size(q, 2)
+    dv, nv, S, B = size(v, 1), size(v, 2), size(v, 3), size(v, 4)
+    G = nv ÷ nk
+    if !(out isa AnyGPUArray)
+        for b in 1:B, h in 1:nv
+            hk = (h - 1) ÷ G + 1
+            M = op.fresh ? zeros(Float32, dv, dk) : Float32.(st[:, :, h, b])     # S^T
+            for t in 1:S
+                kt = Float32.(k[:, hk, t, b]); qt = Float32.(q[:, hk, t, b]) .* op.scale
+                M .*= exp(Float32(g[h, t, b]))
+                delta = (Float32.(v[:, h, t, b]) .- M * kt) .* Float32(beta[h, t, b])
+                M .+= delta * kt'
+                out[:, h, t, b] .= M * qt
+            end
+            st[:, :, h, b] .= M
+        end
+        return out
+    end
+    (dk <= DELTA_MAX_DK && dv <= 256) || error("DeltaRule: head dims must be <= 256 (key $dk, value $dv)")
+    gs = min(256, max(32, nextpow(2, max(dv, dk))))
+    _delta_rule_kernel!(KernelAbstractions.get_backend(out), gs)(
+        out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, op.scale, G, op.fresh;
+        ndrange = nv * B * gs)
+    return out
+end
+
 # --- Float16 matmul weights ---------------------------------------------------
 # A matmul weight stored as Float16, transposed to (In, Out) so that each output
 # row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps

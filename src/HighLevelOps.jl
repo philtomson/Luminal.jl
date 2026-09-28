@@ -315,6 +315,16 @@ function sigmoid(a::GraphTensor)
     return 1.0f0 / (1.0f0 + exp2(-a * (1.0f0 / log(2.0f0))))
 end
 
+Base.log(a::GraphTensor) = log2(a) * log(2)
+
+"""
+    softplus(a; threshold=20)
+
+`log(1 + exp(a))`, and `a` itself above `threshold` (as PyTorch's softplus,
+which also keeps exp from overflowing there).
+"""
+softplus(a::GraphTensor; threshold=20) = select(a > threshold, a, log(1 + exp(a)))
+
 function swish(a::GraphTensor)
     return a * sigmoid(a)
 end
