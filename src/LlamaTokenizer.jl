@@ -2,7 +2,7 @@ module LlamaTokenization
 
 using JSON3
 using Dates
-import ..Luminal: encode, decode
+import ..Luminal: encode, decode, GGUFFile
 
 export LlamaTokenizer, encode, decode, chat_prompt
 
@@ -185,6 +185,38 @@ function LlamaTokenizer(model_dir::String)
                           (ct = _json_get(tcfg, "chat_template", ""); ct isa AbstractString ? String(ct) : ""),
                           # Llama-2 / TinyLlama normalize with Prepend("▁"); Gemma only replaces spaces
                           (nz = _json_get(data, "normalizer", nothing); nz === nothing || occursin("Prepend", JSON3.write(nz))))
+end
+
+"""
+    LlamaTokenizer(f::GGUFFile)
+
+The byte-level BPE tokenizer stored in a llama.cpp GGUF file (`tokenizer.ggml.*`),
+with Qwen's pre-tokenizer split. Control and user-defined tokens are split out of
+the text; only the control ones are hidden when decoding.
+"""
+function LlamaTokenizer(f::GGUFFile)
+    md = f.metadata
+    get(md, "tokenizer.ggml.model", "") == "gpt2" || error("only GGUF byte-level BPE (gpt2) tokenizers are supported")
+    toks = String.(md["tokenizer.ggml.tokens"])
+    types = get(md, "tokenizer.ggml.token_type", zeros(Int32, length(toks)))
+    vocab = Dict{String,Int}(t => i - 1 for (i, t) in enumerate(toks))
+    id_to_token = Dict{Int,String}(i - 1 => t for (i, t) in enumerate(toks))
+    merges = Tuple{String,String}[]
+    for m in md["tokenizer.ggml.merges"]
+        parts = split(String(m), ' ')
+        length(parts) == 2 && push!(merges, (String(parts[1]), String(parts[2])))
+    end
+    merge_ranks = Dict(p => i for (i, p) in enumerate(merges))
+    special_strs = [toks[i] for i in eachindex(toks) if types[i] in (3, 4)]
+    special_ids = Set{Int}(i - 1 for i in eachindex(toks) if types[i] == 3)
+    pattern = r"(*UCP)(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+    eos = Int(get(md, "tokenizer.ggml.eos_token_id", -1))
+    pad = Int(get(md, "tokenizer.ggml.padding_token_id", -1))
+    ct = get(md, "tokenizer.chat_template", "")
+    return LlamaTokenizer(vocab, id_to_token, merges, merge_ranks, -1, eos, -1, pad,
+                          eos < 0 ? Int[] : [eos], special_ids, true, pattern, false,
+                          isempty(special_strs) ? nothing : _Trie(special_strs),
+                          ct isa AbstractString ? String(ct) : "", false)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────

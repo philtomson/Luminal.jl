@@ -266,6 +266,34 @@ function qwen35_config(model_dir::String)
             prefix=prefix)
 end
 
+"""
+    qwen35_config(f::GGUFFile) -> NamedTuple
+
+`Qwen35` keyword arguments from a llama.cpp GGUF file's metadata (dense
+`qwen35` architecture only), for files that come without a `config.json`. The
+weights are named as `load_qwen35_gguf` returns them.
+"""
+function qwen35_config(f::Luminal.GGUFFile)
+    md = f.metadata
+    arch = String(get(md, "general.architecture", "?"))
+    arch == "qwen35" || error("unsupported GGUF architecture \"$arch\" (need the dense qwen35)")
+    g(k, d=nothing) = (v = get(md, "qwen35.$k", d); v === nothing ? error("GGUF metadata qwen35.$k is missing") : v)
+    n_layers = Int(g("block_count")); hidden = Int(g("embedding_length"))
+    n_heads = Int(g("attention.head_count")); head_dim = Int(g("attention.key_length"))
+    interval = Int(g("full_attention_interval", 4))
+    nv = Int(g("ssm.time_step_rank"))
+    return (vocab_size=length(md["tokenizer.ggml.tokens"]), hidden=hidden, n_layers=n_layers,
+            n_heads=n_heads, n_kv_heads=Int(g("attention.head_count_kv")), head_dim=head_dim,
+            intermediate=Int(g("feed_forward_length")),
+            layer_types=[(i + 1) % interval == 0 ? "full_attention" : "linear_attention" for i in 0:n_layers-1],
+            linear_nk=Int(g("ssm.group_count")), linear_nv=nv,
+            linear_dk=Int(g("ssm.state_size")), linear_dv=Int(g("ssm.inner_size")) ÷ nv,
+            conv_kernel=Int(g("ssm.conv_kernel")),
+            rope_base=Float32(g("rope.freq_base", 1f7)), rotary_dim=Int(g("rope.dimension_count")),
+            rms_eps=Float32(g("attention.layer_norm_rms_epsilon", 1f-6)),
+            tie_embeddings=!haskey(f.tensors, "output.weight"), prefix="model")
+end
+
 # ── Loading llama.cpp GGUF files ──────────────────────────────────────────────
 
 # Row order of a V-head dimension: llama.cpp stores Qwen3.5's value heads tiled
