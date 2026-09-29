@@ -265,3 +265,105 @@ function qwen35_config(model_dir::String)
             tie_embeddings=Bool(get(c0, :tie_word_embeddings, get_(:tie_word_embeddings, false))),
             prefix=prefix)
 end
+
+# ── Loading llama.cpp GGUF files ──────────────────────────────────────────────
+
+# Row order of a V-head dimension: llama.cpp stores Qwen3.5's value heads tiled
+# ([K0, K1, ...] repeated) where Hugging Face groups them by key head
+# ([K0's G heads, K1's, ...]). p[o] is the GGUF index of HF index o (1-based).
+function _untile_perm(nk::Int, G::Int, hd::Int)
+    p = Vector{Int}(undef, nk * G * hd)
+    for k in 0:nk-1, g in 0:G-1, d in 0:hd-1
+        p[(k * G + g) * hd + d + 1] = (g * nk + k) * hd + d + 1
+    end
+    return p
+end
+
+"""
+    load_qwen35_gguf(path, cfg; device=get_device(), quantize=nothing) -> Dict{String, Any}
+
+The weights of a Qwen3.5 / Qwen3.6 (dense) llama.cpp GGUF file under Hugging
+Face names, for `Qwen35(graph, reg; cfg...)` / `LlamaSession(...; weights=...)`
+(`cfg` from `qwen35_config` on the model's `config.json`). Each tensor is
+dequantized to Float32 (any GGUF type `gguf_tensor` reads: F32/F16/BF16, Q8_0,
+Q4_K/Q5_K/Q6_K), transposed to HF's (out, in), un-transformed from llama.cpp's
+conversion (norm weights stored as 1 + w, A as -exp(A_log), and the linear
+layers' value heads reordered from grouped to tiled when there are fewer key
+heads than value heads), moved to `device` and, with `quantize` (as
+`load_weights_to_dict`), converted to reduced precision one tensor at a time.
+"""
+function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quantize=nothing)
+    f = Luminal.read_gguf(path)
+    p = cfg.prefix
+    nk, nv, dk, dv = cfg.linear_nk, cfg.linear_nv, cfg.linear_dk, cfg.linear_dv
+    G = nv ÷ nk
+    pv = G > 1 ? _untile_perm(nk, G, dv) : nothing         # value-head channels
+    p1 = G > 1 ? _untile_perm(nk, G, 1) : nothing          # one value per head
+    W = Dict{String, Any}()
+    converted = 0
+    # Matrices go to the device in GGUF's (in, out) order and are transposed to
+    # HF's (out, in) there, and reordered there (as are their row permutations):
+    # permuting tens of GB on one CPU thread would dominate the load.
+    dperm(perm) = perm === nothing ? nothing : Luminal.to_device(perm, device)
+    pvd, p1d = dperm(pv), dperm(p1)
+    function mat(name)
+        A = Luminal.to_device(Luminal.gguf_tensor(f, name), device)
+        B = permutedims(A, (2, 1))
+        Luminal._free_now!(A)
+        return B                                                     # HF (out, in), on the device
+    end
+    vec_(name) = vec(Luminal.gguf_tensor(f, name))
+    function rows(A, perm)                                           # A[perm, :] on the device
+        perm === nothing && return A
+        B = A[perm, :]
+        Luminal._free_now!(A)
+        return B
+    end
+    function store!(key, A)
+        data = A isa Array ? Luminal.to_device(Array{Float32}(A), device) : A
+        data, n = Luminal._quantize_loaded(key, data, quantize)
+        W[key] = data
+        converted += n
+        converted >= 2^31 && (Luminal.reclaim!(device); GC.gc(false); converted = 0)
+    end
+    store!("$p.embed_tokens.weight", mat("token_embd.weight"))
+    store!("lm_head.weight", haskey(f.tensors, "output.weight") ? mat("output.weight") : mat("token_embd.weight"))
+    store!("$p.norm.weight", vec_("output_norm.weight") .- 1f0)
+    for i in 0:cfg.n_layers-1
+        b = "blk.$i"; h = "$p.layers.$i"
+        store!("$h.input_layernorm.weight", vec_("$b.attn_norm.weight") .- 1f0)
+        store!("$h.post_attention_layernorm.weight", vec_("$b.post_attention_norm.weight") .- 1f0)
+        for (g, hf) in (("ffn_gate", "gate_proj"), ("ffn_up", "up_proj"), ("ffn_down", "down_proj"))
+            store!("$h.mlp.$hf.weight", mat("$b.$g.weight"))
+        end
+        if cfg.layer_types[i+1] == "linear_attention"
+            la = "$h.linear_attn"
+            qkv = mat("$b.attn_qkv.weight")
+            qk = 2nk * dk
+            store!("$la.in_proj_qkv.weight", vcat(qkv[1:qk, :], rows(qkv[qk+1:end, :], pvd)))
+            Luminal._free_now!(qkv)
+            store!("$la.in_proj_z.weight", rows(mat("$b.attn_gate.weight"), pvd))
+            store!("$la.in_proj_a.weight", rows(mat("$b.ssm_alpha.weight"), p1d))
+            store!("$la.in_proj_b.weight", rows(mat("$b.ssm_beta.weight"), p1d))
+            A = vec_("$b.ssm_a")                                             # -exp(A_log)
+            store!("$la.A_log", log.(-(p1 === nothing ? A : A[p1])))
+            dt = vec_("$b.ssm_dt.bias")
+            store!("$la.dt_bias", p1 === nothing ? dt : dt[p1])
+            cw = permutedims(Luminal.gguf_tensor(f, "$b.ssm_conv1d.weight"), (2, 1))   # (C, K)
+            cw = vcat(cw[1:qk, :], rows(cw[qk+1:end, :], pv))
+            store!("$la.conv1d.weight", Base.reshape(cw, size(cw, 1), 1, size(cw, 2)))
+            store!("$la.norm.weight", vec_("$b.ssm_norm.weight"))              # plain weight, not 1 + w
+            op = mat("$b.ssm_out.weight")
+            store!("$la.out_proj.weight", pvd === nothing ? op : (o2 = op[:, pvd]; Luminal._free_now!(op); o2))
+        else
+            sa = "$h.self_attn"
+            for (g, hf) in (("attn_q", "q_proj"), ("attn_k", "k_proj"), ("attn_v", "v_proj"), ("attn_output", "o_proj"))
+                store!("$sa.$hf.weight", mat("$b.$g.weight"))
+            end
+            store!("$sa.q_norm.weight", vec_("$b.attn_q_norm.weight") .- 1f0)
+            store!("$sa.k_norm.weight", vec_("$b.attn_k_norm.weight") .- 1f0)
+        end
+    end
+    Luminal.reclaim!(device)
+    return W
+end

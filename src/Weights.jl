@@ -168,6 +168,19 @@ function _load_tensor(fio::IO, entry, header_length::Integer, device::Luminal.Ab
     return length(shape) > 1 ? permutedims(f, length(shape):-1:1) : f
 end
 
+# A just-loaded weight in the storage `quantize(key)` asks for (2-D weights only,
+# the embedding table excepted, and only where the format's blocks fit), freeing
+# the Float32 copy at once. Returns the weight and the Float32 bytes converted.
+function _quantize_loaded(key, data, quantize)
+    (quantize === nothing || ndims(data) != 2 || occursin("embed_tokens", key)) && return data, 0
+    S = Luminal.storage_type(quantize(key))
+    (S === nothing || !Luminal.storage_fits(S, size(data, 2))) && return data, 0
+    q = S(data)
+    n = sizeof(data)
+    Luminal._free_now!(data)            # never hold the model in Float32
+    return q, n
+end
+
 """
     load_weights_to_dict(path; device=get_device(), quantize=nothing) -> Dict{String, Any}
 
@@ -203,16 +216,9 @@ function load_weights_to_dict(path::String;
                 !haskey(entry, :dtype) && continue # Skip if not a tensor entry
                 data = _load_tensor(fio, entry, header_length, device)
                 data === nothing && continue       # unsupported dtype
-                if quantize !== nothing && ndims(data) == 2 && !occursin("embed_tokens", key)
-                    S = Luminal.storage_type(quantize(key))
-                    if S !== nothing && Luminal.storage_fits(S, size(data, 2))
-                        q = S(data)
-                        converted += sizeof(data)
-                        Luminal._free_now!(data)   # never hold the model in Float32
-                        data = q
-                        converted >= 2^31 && (Luminal.reclaim!(device); converted = 0)
-                    end
-                end
+                data, n = _quantize_loaded(key, data, quantize)
+                converted += n
+                converted >= 2^31 && (Luminal.reclaim!(device); converted = 0)
                 tensors[key] = data
             end
         end

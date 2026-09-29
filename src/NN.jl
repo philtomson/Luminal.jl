@@ -985,7 +985,7 @@ include("Gemma3.jl")
 export Gemma3, Gemma3Block, gemma3_config, model_template
 
 include("Qwen35.jl")
-export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config
+export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config, load_qwen35_gguf
 
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,
