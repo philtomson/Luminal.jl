@@ -45,6 +45,72 @@ struct ScatterND <: Op
     mode::Symbol
 end
 
+# Column gather with a straight-through surrogate gradient, for models whose
+# input connections are selected discretely (typically argmax of a score
+# matrix) while the scores themselves must stay trainable. Inputs:
+#   x (B, In), scores W (In, C), indices (C,) holding 1-based Int32/Int64
+#   column numbers of x.
+#   forward:  out[b, c] = x[b, indices[c]]
+#   backward: dx = dy @ softmax(W ./ tau, dim 1)',   dW = (2x - 1)' dy
+# i.e. the forward is a discrete gather while the gradient routes through a
+# softmax "router" over W at temperature `tau`, as if the output had been
+# x times that router (the straight-through rule of DiffLUT-Net's
+# `_LearnableMappingFunction`). The scores input exists only for the backward
+# pass; indices get no gradient.
+struct MappingGather <: Op
+    tau::Float32
+end
+
+# Fused K-input LUT layer (DiffLUT-Net): the multilinear extension of a
+# per-neuron truth table over K binary-ish inputs, in one kernel. Two input
+# forms:
+#   gathered  — inputs (pins (B, K*out), W (out, 2^K)); pins[b, (k-1)*out + n]
+#               is input k of neuron n (as produced by MappingGather).
+#   indexed   — inputs (x (B, In), W (out, 2^K), indices (K*out,) 1-based
+#               Int32/Int64, pin-major); the kernel reads x directly.
+# Forward: out[b, n] = multilinear extension of W[n, :] at the K pins, i.e.
+# Σ_e W[n, e] * Π_k (pins or 1-pins by bit k of e-1, v1 the MSB) — the same
+# entry order as the Verilog export of DiffLUT-Net.
+# Backward ops (created by vjp_rules, no rules of their own):
+#   LutKBwdPinsOp: pin gradients (B, K*out) via the interpolation tree in
+#     reverse, dv_k = g * (c_hi - c_lo) summed per level.
+#   LutKDWOp: truth-table gradient (out, 2^K) = Σ_b dy .* path products,
+#     accumulated with atomics (the output buffer is zeroed each run).
+struct LutKOp <: Op
+    K::Int
+end
+struct LutKBwdPinsOp <: Op
+    K::Int
+end
+struct LutKDWOp <: Op
+    K::Int
+end
+
+# Compact top-K sparse router for DiffLUT-Net's learnable mapping. After a
+# dense warmup + prune, each pin keeps only its top-K' candidate inputs; the
+# score matrix shrinks from (in_dim × pins) to (K' × pins).
+#   SparseMapGather:  out[b, c] = x[b, cand[c, argmax_k S[c, k]]]
+#     (S (C=pins, K'), cand (C, K') 1-based Int64; forward argmax over the
+#      pin's own candidate scores)
+#   Backward ops (created by vjp_rules, no rules of their own):
+#     SparseMapBwdSOp: dS[c, k] = Σ_b (2x[b,cand[c,k]]−1)·dy[b,c]
+#       (straight-through to the kept scores, no softmax weight — same as the
+#        dense dW = (2x−1)'·dy restricted to kept candidates)
+#     SparseMapBwdXOp: dx[b, i] += Σ_(k: cand[c,k]=i) dy[b,c]·p[c,k]
+#       with p[c,k] = softmax_k(S[c,k]/tau) — the softmax-weighted scatter
+#       that dense dx = dy·p' computes over all candidates.
+struct SparseMapGather <: Op
+    K::Int
+    tau::Float32
+end
+struct SparseMapBwdS <: Op
+    K::Int
+end
+struct SparseMapBwdX <: Op
+    K::Int
+    tau::Float32
+end
+
 # A source: out[c_1, .., c_k] = f(c_1, .., c_k) over the 0-based output
 # coordinates (upstream's iota, with any Julia function as the expression).
 # (Untyped field: one op type for every function, as the e-graph bridge needs;

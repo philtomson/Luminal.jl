@@ -300,6 +300,100 @@ function vjp_rules(op::GatherND, node_id::Int, node::Node, grad_out::GraphTensor
     accumulate_grad!(grads, data_id, g)
 end
 
+function vjp_rules(op::MappingGather, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    graph = grad_out.graph_ref
+    x = GraphTensor(node.inputs[1][1], node.inputs[1][3], graph)
+    W = GraphTensor(node.inputs[2][1], node.inputs[2][3], graph)
+    # dx = dy @ softmax(W ./ tau, dim 1)'  -- the soft router's backward.
+    # softmax1 (the fused single-kernel SoftmaxOp) is safe here even though it
+    # has no autograd rules: this node is created inside a vjp pass, so no
+    # gradient is ever taken through it.
+    p = softmax1(W / op.tau)
+    accumulate_grad!(grads, x.id, matmul(grad_out, permute(p, [2, 1])))
+    # dW = (2x - 1)' dy  -- straight through to the scores
+    u = x * 2 - 1
+    accumulate_grad!(grads, W.id, matmul(permute(u, [2, 1]), grad_out))
+    # indices are discrete: no gradient
+end
+
+function vjp_rules(op::LutKOp, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    graph = grad_out.graph_ref
+    gathered = length(node.inputs) == 2
+    a_id, a_st = node.inputs[1][1], node.inputs[1][3]      # pins (gathered) or x (indexed)
+    W_id, W_st = node.inputs[2][1], node.inputs[2][3]
+    a = GraphTensor(a_id, a_st, graph)
+    W = GraphTensor(W_id, W_st, graph)
+    if gathered
+        dpins = add_op!(graph, LutKBwdPinsOp(op.K),
+                        [(a_id, 0, a_st), (W_id, 0, W_st), (grad_out.id, 0, grad_out.shape)],
+                        a_st)
+        accumulate_grad!(grads, a_id, dpins)
+        dW = add_op!(graph, LutKDWOp(op.K),
+                     [(a_id, 0, a_st), (W_id, 0, W_st), (grad_out.id, 0, grad_out.shape)],
+                     W_st)
+        accumulate_grad!(grads, W_id, dW)
+    else
+        idx_id, idx_st = node.inputs[3][1], node.inputs[3][3]
+        idx = GraphTensor(idx_id, idx_st, graph)
+        dpins_shape = ShapeTracker([realized_dims(a_st)[1], realized_dims(idx_st)[1]])
+        dpins = add_op!(graph, LutKBwdPinsOp(op.K),
+                        [(a_id, 0, a_st), (W_id, 0, W_st), (idx_id, 0, idx_st),
+                         (grad_out.id, 0, grad_out.shape)],
+                        dpins_shape)
+        # scatter the pin gradients back through the (1-based Int) indices:
+        # dx[b, indices[p]] += dpins[b, p]
+        B, In = realized_dims(a_st)
+        P = realized_dims(idx_st)[1]
+        T = dtype(grad_out)
+        rows = expand(iota(graph, [B], i -> i), 2, P)
+        cols = expand(cast(idx - 1, Float32), 1, B)
+        dx = scatter(_zeros(graph, Luminal.DimType[B, In], T), dpins, [rows, cols]; mode=:add)
+        accumulate_grad!(grads, a_id, dx)
+        dW = add_op!(graph, LutKDWOp(op.K),
+                     [(a_id, 0, a_st), (W_id, 0, W_st), (idx_id, 0, idx_st),
+                      (grad_out.id, 0, grad_out.shape)],
+                     W_st)
+        accumulate_grad!(grads, W_id, dW)
+    end
+    return nothing
+end
+
+function vjp_rules(op::SparseMapGather, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    graph = grad_out.graph_ref
+    x_id, x_st = node.inputs[1][1], node.inputs[1][3]
+    S_id, S_st = node.inputs[2][1], node.inputs[2][3]
+    c_id, c_st = node.inputs[3][1], node.inputs[3][3]
+    x = GraphTensor(x_id, x_st, graph)
+    S = GraphTensor(S_id, S_st, graph)
+    cand = GraphTensor(c_id, c_st, graph)
+    B, In = realized_dims(x_st)
+    C, K = realized_dims(S_st)
+
+    # p[c, k] = softmax_k(S[c, k] / tau) over each pin's kept candidates
+    P = softmax(S / op.tau, 2)                               # (C, K)
+
+    # dx: scatter-add dy weighted by P at each pin's candidate inputs.
+    # src3[b, c, k] = dy[b, c] * P[c, k], flattened to (B, C*K)
+    src3 = reshape(reshape(grad_out, [B, C, 1]) * reshape(P, [1, C, K]), [B, C * K])
+    rows = expand(iota(graph, [B], i -> i), 2, C * K)
+    cols = expand(cast(reshape(cand, [C * K]), Float32) - 1, 1, B)
+    dx = scatter(_zeros(graph, DimType[B, In], Float32), src3, [rows, cols]; mode = :add)
+    accumulate_grad!(grads, x_id, dx)
+
+    # dS[c, k] = Σ_b (2x[b,cand[c,k]]−1) · dy[b, c] — straight-through to the
+    # kept scores, no softmax weight (mirrors dense dW = (2x−1)'·dy restricted
+    # to the kept candidates)
+    u = x * 2 - 1
+    rows2 = expand(expand(iota(graph, [B], i -> i), 2, K), 3, C)
+    cols2 = expand(cast(permute(cand, [2, 1]), Float32) - 1, 1, B)  # (B, K, C), 0-based
+    gath = gather(u, [rows2, cols2])                         # (B, K, C)
+    dy_rows = expand(grad_out, 2, K)                         # (B, K, C)
+    dS = reshape(sum(gath * dy_rows, 1), [K, C])
+    dS_t = permute(dS, [2, 1])                               # (C, K) to match S
+    accumulate_grad!(grads, S_id, dS_t)
+    return nothing
+end
+
 function vjp_rules(op::ScatterND, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
     graph = grad_out.graph_ref
     init_id, _, init_st = node.inputs[1]

@@ -1735,6 +1735,11 @@ end
     @inbounds out[i] = ok ? data[j] : zero(eltype(out))
 end
 
+@kernel function _mapping_gather_kernel!(out, @Const(x), @Const(indices))
+    b, c = @index(Global, NTuple)
+    @inbounds out[b, c] = x[b, indices[c]]
+end
+
 @kernel function _scatter_nd_kernel!(out, @Const(src), coords, dims, ::Val{ADD}) where ADD
     i = @index(Global, Linear)
     ok, j = _coord_index(coords, i, dims)
@@ -1765,8 +1770,260 @@ function execute_op!(out, op::GatherND, data, coords...)
     return out
 end
 
+function execute_op!(out, op::MappingGather, x, scores, indices)
+    d = _dense(x)
+    i = _dense(indices)
+    length(out) == 0 && return out
+    _mapping_gather_kernel!(KernelAbstractions.get_backend(out), 256)(out, d, i;
+                                                                      ndrange=size(out))
+    return out
+end
+
+# --- LutKOp: K-input LUT layer, tree unrolled in registers -----------------
+#
+# The truth table for one neuron is a tuple of 2^K entries; one level of the
+# interpolation tree halves it: c2[j] = c[j]*(1-v) + c[j + m]*v. Everything is
+# Val-unrolled (K <= 6 at the call sites), so the recursion is fully inlined
+# and the tree lives in registers.
+
+# Generated straight-line unrolling (no runtime type construction — the GPU
+# cannot compile Val/apply_type calls inside kernels). Level k output entries
+# are named c{k}_{j}; the backward walks the levels in reverse.
+# Both are emitted at load time as concrete, fully unrolled methods for
+# K = 1..6 (plain functions — @generated bodies run into Julia 1.12's
+# generated-body purity check for this pattern).
+function _lut_unroll_body(E::Int, K::Int; backward::Bool)
+    stmts = Any[]
+    cur = Any[:(w[$j]) for j in 1:E]
+    width = E
+    for k in 1:K
+        m = width ÷ 2
+        prev = cur
+        cur = Any[Symbol(:c, k, :_, j) for j in 1:m]
+        for j in 1:m
+            push!(stmts, :($(cur[j]) = $(prev[j]) * (1 - vs[$k]) + $(prev[j + m]) * vs[$k]))
+        end
+        width = m
+    end
+    push!(stmts, :(y = $(cur[1])))
+    backward || return quote $(stmts...); y end
+    gcur = Any[:gz]
+    for k in K:-1:1
+        m = 2^(K - k)
+        prev = k == 1 ? Any[:(w[$j]) for j in 1:(2m)] :
+               Any[Symbol(:c, k - 1, :_, j) for j in 1:(2m)]
+        dv = :(0.0f0)
+        for j in 1:m
+            dv = :($dv + $(gcur[j]) * ($(prev[j + m]) - $(prev[j])))
+        end
+        push!(stmts, :($(Symbol(:dv, k)) = $dv))
+        newg = Any[Symbol(:g, k, :_, j) for j in 1:(2m)]
+        for j in 1:(2m)
+            src = j <= m ? gcur[j] : gcur[j - m]
+            f = j <= m ? :(1 - vs[$k]) : :(vs[$k])
+            push!(stmts, :($(newg[j]) = $src * $f))
+        end
+        gcur = newg
+    end
+    for j in 1:E
+        push!(stmts, :($(Symbol(:dw_, j)) = $(gcur[j])))
+    end
+    dvt = Expr(:tuple, Any[Symbol(:dv, k) for k in 1:K]...)
+    dwt = Expr(:tuple, Any[Symbol(:dw_, j) for j in 1:E]...)
+    return quote $(stmts...); y, $dvt, $dwt end
+end
+
+for _K in 1:6
+    _E = 2^_K
+    @eval @inline function _lut_fwd_gen(w::NTuple{$_E,T}, vs::NTuple{$_K,T}) where {T}
+        $(_lut_unroll_body(_E, _K; backward=false))
+    end
+    @eval @inline function _lut_fwbw_gen(w::NTuple{$_E,T}, vs::NTuple{$_K,T}, gz::T) where {T}
+        $(_lut_unroll_body(_E, _K; backward=true))
+    end
+end
+@kernel function _lutk_fwd_kernel!(out, @Const(pins), @Const(W), ::Val{K}, ::Val{E}) where {K, E}
+    b, n = @index(Global, NTuple)
+    if b <= size(pins, 1) && n <= size(W, 1)
+        out_dim = size(W, 1)
+        w = ntuple(e -> @inbounds(W[n, e]), Val(E))
+        vs = ntuple(k -> @inbounds(pins[b, (k - 1) * out_dim + n]), Val(K))
+        @inbounds out[b, n] = _lut_fwd_gen(w, vs)
+    end
+end
+
+@kernel function _lutk_fwd_idx_kernel!(out, @Const(x), @Const(W), @Const(idx), ::Val{K}, ::Val{E}) where {K, E}
+    b, n = @index(Global, NTuple)
+    if b <= size(x, 1) && n <= size(W, 1)
+        out_dim = size(W, 1)
+        w = ntuple(e -> @inbounds(W[n, e]), Val(E))
+        vs = ntuple(k -> @inbounds(x[b, idx[(k - 1) * out_dim + n]]), Val(K))
+        @inbounds out[b, n] = _lut_fwd_gen(w, vs)
+    end
+end
+
+@kernel function _lutk_bwd_pins_kernel!(dpins, @Const(pins), @Const(W), @Const(dy), ::Val{K}, ::Val{E}) where {K, E}
+    b, n = @index(Global, NTuple)
+    if b <= size(pins, 1) && n <= size(W, 1)
+        out_dim = size(W, 1)
+        w = ntuple(e -> @inbounds(W[n, e]), Val(E))
+        vs = ntuple(k -> @inbounds(pins[b, (k - 1) * out_dim + n]), Val(K))
+        _, dvs, _ = _lut_fwbw_gen(w, vs, dy[b, n])
+        ntuple(k -> @inbounds(dpins[b, (k - 1) * out_dim + n] = dvs[k]), Val(K))
+    end
+end
+
+@kernel function _lutk_bwd_pins_idx_kernel!(dpins, @Const(x), @Const(W), @Const(idx), @Const(dy), ::Val{K}, ::Val{E}) where {K, E}
+    b, n = @index(Global, NTuple)
+    if b <= size(x, 1) && n <= size(W, 1)
+        out_dim = size(W, 1)
+        w = ntuple(e -> @inbounds(W[n, e]), Val(E))
+        vs = ntuple(k -> @inbounds(x[b, idx[(k - 1) * out_dim + n]]), Val(K))
+        _, dvs, _ = _lut_fwbw_gen(w, vs, dy[b, n])
+        ntuple(k -> @inbounds(dpins[b, (k - 1) * out_dim + n] = dvs[k]), Val(K))
+    end
+end
+
+@kernel function _lutk_dw_kernel!(dW, @Const(pins), @Const(W), @Const(dy), ::Val{K}, ::Val{E}) where {K, E}
+    b, n = @index(Global, NTuple)
+    if b <= size(pins, 1) && n <= size(W, 1)
+        out_dim = size(W, 1)
+        w = ntuple(e -> @inbounds(W[n, e]), Val(E))
+        vs = ntuple(k -> @inbounds(pins[b, (k - 1) * out_dim + n]), Val(K))
+        _, _, dwc = _lut_fwbw_gen(w, vs, dy[b, n])
+        ntuple(e -> KernelAbstractions.@atomic(dW[n, e] += dwc[e]), Val(E))
+    end
+end
+
+@kernel function _lutk_dw_idx_kernel!(dW, @Const(x), @Const(W), @Const(idx), @Const(dy), ::Val{K}, ::Val{E}) where {K, E}
+    b, n = @index(Global, NTuple)
+    if b <= size(x, 1) && n <= size(W, 1)
+        out_dim = size(W, 1)
+        w = ntuple(e -> @inbounds(W[n, e]), Val(E))
+        vs = ntuple(k -> @inbounds(x[b, idx[(k - 1) * out_dim + n]]), Val(K))
+        _, _, dwc = _lut_fwbw_gen(w, vs, dy[b, n])
+        ntuple(e -> KernelAbstractions.@atomic(dW[n, e] += dwc[e]), Val(E))
+    end
+end
+
+function execute_op!(out, op::LutKOp, pins, W)
+    length(out) == 0 && return out
+    _lutk_fwd_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(pins),
+        _dense(W), Val(op.K), Val(2^op.K); ndrange=size(out))
+    return out
+end
+
+function execute_op!(out, op::LutKOp, x, W, idx)
+    length(out) == 0 && return out
+    _lutk_fwd_idx_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x),
+        _dense(W), _dense(idx), Val(op.K), Val(2^op.K); ndrange=size(out))
+    return out
+end
+
+function execute_op!(out, op::LutKBwdPinsOp, pins, W, dy)
+    length(out) == 0 && return out
+    _lutk_bwd_pins_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(pins),
+        _dense(W), _dense(dy), Val(op.K), Val(2^op.K); ndrange=size(out))
+    return out
+end
+
+function execute_op!(out, op::LutKBwdPinsOp, x, W, idx, dy)
+    length(out) == 0 && return out
+    _lutk_bwd_pins_idx_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x),
+        _dense(W), _dense(idx), _dense(dy), Val(op.K), Val(2^op.K); ndrange=size(out))
+    return out
+end
+
+function execute_op!(out, op::LutKDWOp, pins, W, dy)
+    fill!(out, zero(eltype(out)))
+    size(out) == (0,) || size(out, 2) == 0 && return out
+    _lutk_dw_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(pins),
+        _dense(W), _dense(dy), Val(op.K), Val(2^op.K); ndrange=(size(pins, 1), size(W, 1)))
+    return out
+end
+
+function execute_op!(out, op::LutKDWOp, x, W, idx, dy)
+    fill!(out, zero(eltype(out)))
+    size(out) == (0,) || size(out, 2) == 0 && return out
+    _lutk_dw_idx_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x),
+        _dense(W), _dense(idx), _dense(dy), Val(op.K), Val(2^op.K); ndrange=(size(x, 1), size(W, 1)))
+    return out
+end
+
+# --- SparseMapGather: compact top-K router ---------------------------------
+
+@kernel function _spmap_fwd_kernel!(out, @Const(x), @Const(S), @Const(cand), ::Val{K}) where {K}
+    b, c = @index(Global, NTuple)
+    if b <= size(x, 1) && c <= size(S, 1)
+        bestv = S[c, 1]
+        bestk = 1
+        for kk in 2:K
+            v = S[c, kk]
+            if v > bestv
+                bestv = v
+                bestk = kk
+            end
+        end
+        @inbounds out[b, c] = x[b, cand[c, bestk]]
+    end
+end
+
+@kernel function _spmap_bwd_s_kernel!(dS, @Const(x), @Const(cand), @Const(dy), ::Val{K}) where {K}
+    c, k = @index(Global, NTuple)
+    if c <= size(cand, 1)
+        ci = cand[c, k]
+        acc = 0.0f0
+        for b in 1:size(dy, 1)
+            @inbounds acc += (2 * x[b, ci] - 1) * dy[b, c]
+        end
+        @inbounds dS[k, c] = acc
+    end
+end
+
+@kernel function _spmap_bwd_x_kernel!(dx, @Const(P), @Const(cand), @Const(dy))
+    b, c = @index(Global, NTuple)
+    if b <= size(dy, 1) && c <= size(cand, 1)
+        g = dy[b, c]
+        for kk in 1:size(cand, 2)
+            @inbounds KernelAbstractions.@atomic dx[b, cand[c, kk]] += g * P[c, kk]
+        end
+    end
+end
+
+function execute_op!(out, op::SparseMapGather, x, S, cand)
+    length(out) == 0 && return out
+    _spmap_fwd_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x),
+        _dense(S), _dense(cand), Val(op.K); ndrange=size(out))
+    return out
+end
+
+function execute_op!(out, op::SparseMapBwdS, x, cand, dy)
+    length(out) == 0 && return out
+    _spmap_bwd_s_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x),
+        _dense(cand), _dense(dy), Val(op.K); ndrange=size(out))
+    return out
+end
+
+function execute_op!(out, op::SparseMapBwdX, P, cand, dy)
+    fill!(out, zero(eltype(out)))
+    _spmap_bwd_x_kernel!(KernelAbstractions.get_backend(out), 256)(out,
+        _dense(P), _dense(cand), _dense(dy); ndrange=(size(dy, 1), size(cand, 1)))
+    return out
+end
+
+# Copy init's contents into the output buffer with a kernel launch, not
+# `copyto!`: device-to-device memcpys run on the null stream and abort HIP
+# graph capture (hipErrorStreamCaptureUnsupported), while KA kernels capture.
+@kernel function _copy_kernel!(dst, @Const(src))
+    i = @index(Global, Linear)
+    @inbounds dst[i] = src[i]
+end
+
 function execute_op!(out, op::ScatterND, init, src, coords...)
-    out === init || copyto!(out, _dense_like(init, out))
+    out === init ||
+        _copy_kernel!(KernelAbstractions.get_backend(out), 256)(out,
+                                                                _dense_like(init, out);
+                                                                ndrange=length(out))
     s = _dense(src)
     cs = map(c -> _dense_like(c, s), coords)
     length(s) == 0 && return out

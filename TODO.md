@@ -1,0 +1,261 @@
+# TODO
+
+## Kernel fusion for DiffLUT-Net training: crossing fusion barriers
+
+Status: **profiled 2026-10-02 — closed for the LutKOp design** (see the
+measured checkbox below: host 2%, graph 74%, mapping-Adam 21%; the tree is
+already fused and the remaining cost is the learnable-mapping complex, which
+barrier-crossing fusion cannot touch). Kept as background for the general
+compiler mechanisms. Scope: this is a **DiffLUT-Net training** item —
+LLM decode is already covered by hand ops (plus the RMSNorm fusion item in
+"AMD GPU performance" below), and prefill is GEMM-bound, so a general fuser is
+not expected to move LLM workloads. Motivated by the DiffLUT-Net step
+(~/devel/AI/DiffLUT-Network/julia): GPU utilization < 50%, the graph runs
+~32-53 ms of a ~96 ms step, and the LUT tree crosses a kernel boundary at
+every non-elementwise op.
+
+What the compiler does today: `compile(fuse=true)` merges chains of elementwise
+ops into generated `FusedElementwiseOp` kernels (whitelist-based; anything else
+errors out of the group). Every other op is a fusion barrier — `SumReduce` /
+`MaxReduce`, `GatherND`, `MatMul`, `SoftmaxOp`, custom ops — and each barrier
+materializes its output to memory: a full write of the intermediate by the
+producer kernel and a full read by the consumer. Movement ops (`Slice`,
+`Permute`, `Expand`) are ShapeTracker views in the naive interpreter, but in the
+compiled path they still bound fusion groups, and `reshape` inserts
+`Contiguous()` copies when a view cannot be represented. The e-graph layer
+(`EGraphRewrite.jl`, `search=:static` / `:measured`) can already rewrite and
+time candidate graphs, and several hot composites are hand-fused as single ops
+(`SoftmaxOp`, `RMSNormOp`, `RotaryEmbed`, `DecodeAttention`, `FlashAttentionOp`,
+`CausalConv`, `DeltaRule`) — proof that crossing these barriers pays. The
+strongest data point is `LutKOp` below: a hand-written composite took the
+DiffLUT step from 90 s to 33 s. That argues for hand ops where a pattern is
+hot; the open question is whether the *general* mechanisms below earn their
+cost.
+
+- [x] **Profile first — including the host side. MEASURED 2026-10-02, and the
+  result closes this item for the LutKOp design.** Phase-timed the LutKOp
+  training step on the 8060S (`bench_step.jl` in the DiffLUT-Network julia
+  tree, 50 steps, HIP graph capture on). Before/after the two quick wins:
+  - graph replay: 38.2 → **26.6 ms** — the mapping-backward softmax over the
+    6272×8000 score matrix now uses the fused `SoftmaxOp` (`softmax1`) instead
+    of the ~6-pass composite (safe: the node is created inside a vjp pass, so
+    no gradient is taken through it).
+  - mapping Adam: 11.1 → 11.3 ms — the fused single-kernel version is
+    bandwidth-bound (1.2 GB of state traffic through shared DDR5); kept for
+    launch hygiene and because it stays Float32 end-to-end (the broadcast
+    version promoted to Float64 via the Float64 eps/bias constants).
+  - host side: ~1.2 ms/step (2.3%) — capture already removed launch cost.
+  The remaining cost is the learnable-mapping complex: the two large GEMMs
+  and the softmax over the 6272×8000 score matrix. bf16-casting the score in
+  the graph is a wash (the cast pass cancels the halved GEMM read; a real win
+  would need a bf16-output Softmax kernel in Luminal — possible future op).
+  Further DiffLUT speed would come from mapping-side changes: top-K sparse
+  mapping (shrinks the 50 M-entry score matrix), bf16 mapping state, or fewer
+  candidate inputs per pin.
+- [ ] **Step 1 (cheap, do first): let elementwise fusion absorb movement ops
+  as views.** When the fusion walker hits a `Slice`/`Permute`/`Expand`,
+  propagate the output coordinates through the view into the producer's access
+  expressions instead of stopping (ShapeTracker's `indexes` machinery already
+  encodes this mapping; `reshape`'s inserted `Contiguous()` copies are the
+  case to handle). No in-kernel reductions — this alone removes most barriers
+  in the DiffLUT LUT tree, where every level is slice+mul+add. Much cheaper
+  than the full mechanism below because the kernel generator keeps emitting
+  straight-line elementwise code; only its read expressions gain view
+  indexing. Estimate: days to a couple of weeks, dominated by correctness
+  testing of the view-index propagation (strided views, views over views,
+  `Contiguous()` interactions).
+- [ ] **Step 2 (Mechanism B): composite-pattern rewrites / FusedReduceOp.**
+  Add e-graph rewrite rules that map recurring multi-op composites onto fused
+  op nodes: elementwise-chain → `SumReduce` pairs onto a generated
+  `FusedReduceOp` (workgroup per output, reduced axis evaluated in registers,
+  no materialized intermediate); known composites onto the existing hand ops
+  where they are not already constructed directly. The e-graph machinery
+  (rules, static cost model, `:measured` timing, numeric candidate
+  verification within tolerance) already exists — new rules are additive.
+  - [ ] Generic generated fused-reduction kernel: correct across ranks, dtypes,
+    non-contiguous views, size-1 dims and symbolic dims; workgroup/tile policy
+    per reduction shape (can start from `_reduce_dim_kernel!`'s shape logic).
+  - [ ] Cost-model entries for the new forms so `:static` search can choose
+    them; `:measured` verifies the win on-device.
+  - Estimate: realistically 2-4+ weeks — the kernel generator is the smaller
+    half; verification across ranks/dtypes/views/symbolic dims is most of the
+    cost (see Verification below — it applies to B too, not just to the
+    big mechanism).
+- [ ] **Step 3 (stretch, conditional — not a planned deliverable): full
+  index-transparent barriers with in-kernel reductions.** Treat reductions as
+  coordinate algebra too: workgroup-per-output loop kernels that evaluate the
+  whole producer chain inline; runtime-coordinate gathers stay barriers,
+  constant/affine-coordinate gathers become address arithmetic.
+  **Condition:** only if the profile shows the barrier pattern still dominates
+  after Steps 1-2 AND another workload exhibits the same pattern — no such
+  workload is identified yet (LLM decode is covered by hand ops; prefill is
+  GEMM-bound). The `LutKOp` result argues for hand ops where a pattern is
+  hot, which Step 1 + this section's hand ops already deliver.
+  - [ ] Coordinate-propagation through views in the kernel generator
+    (reuse/adapt ShapeTracker rather than inventing a second algebra).
+  - [ ] In-kernel loop nest emission for reductions, with boundary/tile
+    handling; workgroup sizing policy.
+  - [ ] Interaction audit: CSE keys for fused nodes, `fold`, HIP graph capture
+    (captured replays bake shapes/addresses — fused kernels must be
+    capture-safe), `free_intermediates` buffer sizing (fewer intermediates).
+  - Estimate: 1-2 months if pursued. A mini tensor-compiler kernel-authoring
+    layer; the naive interpreter must keep producing identical results.
+- [ ] **Verification (all steps — this is most of the cost of each).**
+  - Always-on numeric verification of fused vs unfused subgraphs in the test
+    suite (reuse the `search_tolerance` checking machinery), CPU + AMD GPU,
+    Float32/Float16/BFloat16, edge shapes (rank-1, size-1 dims, views over
+    views).
+  - Golden-output regression for the model zoo tests (Qwen35/TinyLlama/
+    Whisper components) with `fuse=true` vs `fuse=false` compiled runs.
+  - `free_intermediates=true` vs `false` equivalence, and HIP graph capture
+    replay equivalence.
+  - Perf gates: `rocprofv3` launch counts + step times on the profiled
+    workloads; no regression outside noise on paths that don't match the new
+    patterns (the hand ops must keep winning wherever they exist — new rules
+    should not fire on subgraphs already covered by them).
+- [ ] **Risks.**
+  - Miscompilation of generated kernels (view-index propagation errors, tile
+    boundaries, symbolic dims) — mitigated by the verification harness plus
+    randomized shape/property tests.
+  - Performance regressions where a generic fused kernel replaces a tuned hand
+    op — cost-model-gate or suppress rules where hand ops exist.
+  - Compile-time blowup from e-graph saturation on llama-scale graphs —
+    iteration caps; search stays on-demand only.
+  - Two sources of truth for fusion (hand ops vs discovered fusions) — write
+    down the policy: hand ops stay preferred; rewrites target composites with
+    no hand op.
+  - Payoff is bounded by the host/graph split: fusion only shrinks the graph
+    portion of the step, and payoff is concentrated in the DiffLUT training
+    workload; GEMM-bound prefill gains little. Measure per workload before
+    and after (see "Measurement practice" below).
+
+## DiffLUT LutKOp: fused K-input LUT layer kernel (hand-written composite)
+
+Status: DONE (implemented, tested, upstreamed here). `LutKOp` /
+`LutKBwdPinsOp` / `LutKDWOp` in `src/Ops.jl` with Val-unrolled register
+kernels in `src/Execution.jl`, vjp rules in `src/Autograd.jl`, and the
+`lut_layer` constructor in `src/HighLevelOps.jl`; tests in
+`tests/test_lutk.jl` (forward vs brute-force basis, gradients vs independent
+basis-derivative references, both gathered and indexed input forms, CPU +
+GPU + compiled). Measured on the DiffLUT-Net MNIST step (2000/1000, K=4,
+batch 100): 500 iterations + eval in 33 s (was 90 s composite, 58 s through
+Zygote), verified bit-exact against PyTorch. GroupSum remains separate
+(Reshape + SumReduce).
+
+- [x] **`LutKOp` forward** (`Ops.jl` + `execute_op!`): one work-item per
+  (batch, neuron); the neuron's `2^K` truth-table entries in registers
+  (16 for K=4, 64 for K=6); input pins read directly via the per-neuron index
+  constants (fixed connections: the gather disappears into the kernel; learnable
+  mapping stays a separate op feeding it). Interpolation tree in registers —
+  the DiffLUT-Network julia port is the reference implementation.
+- [x] **`LutKOp` backward**: `dW` kernel (per (batch, neuron), all `2^K` entry
+  contributions — the tree path products, same cost shape as forward) and
+  pin-gradient kernel with atomic scatter (mirror difflogic_kernel.cu's
+  CSR `backward_x`/`backward_w` scheme). `vjp_rules` entry; the mapping
+  surrogate gradient (softmax + two rocBLAS GEMMs) stays as it is.
+- [x] **Verify** against the DiffLUT-Network julia port (it has a PyTorch
+  bit-exact parity harness to reuse) on CPU + AMD GPU; then upstream like
+  `MappingGather`.
+- Expected: kernel count per training step from hundreds to ~a dozen; per-layer
+  traffic from "every tree level round-trips a (B, out, m) intermediate" to
+  "read x once, write out once"; 2-4x on the ~32-53 ms graph execution.
+  Estimate: 300-400 lines including tests.
+
+## DiffLUT compact top-K mapping router (SparseMapGather)
+
+Status: DONE (implemented, tested, measured 2026-10-05). `SparseMapGather` /
+`SparseMapBwdS` / `SparseMapBwdX` in `src/Ops.jl` with kernels in
+`src/Execution.jl`, vjp rules in `src/Autograd.jl`, and the
+`sparse_map_gather` constructor in `src/HighLevelOps.jl`; tests in
+`tests/test_sparsemap.jl` (forward vs host gather, gradients vs host
+references, interpreter + compiled CPU/GPU + HIP-graph capture). This is the
+"top-K sparse mapping" the profile above pointed at: after a dense warmup the
+(DiffLUT-side) switch keeps the top-k candidate inputs per pin as a frozen
+(C, k) id table plus a (C, k) trainable score matrix, replacing the
+(in, C) ≈ 50 M-entry score matrix — forward argmax is unchanged by
+construction (the kept set contains it), backward trains the kept scores
+straight-through and scatters softmax-weighted gradients to x.
+
+- [x] Measured on the DiffLUT-Net MNIST step (6272→2000→1000, K=4, batch 100,
+  k=16, HIP capture on): **35.5 → 10.2 ms/step (3.5×)** — graph replay
+  26.1 → 9.3 ms, on-device mapping Adam 8.1 → 0.15 ms (state 55 M → 192 K
+  entries), host prep 0.63 → 0.22 ms (per-step `column_argmax` gone).
+- [x] End-to-end accuracy (same seed/tau as the dense+prune baseline):
+  20000-step MNIST run, dense warmup 3000 steps then compact k=16 —
+  **97.26 % best test-eval vs 95.85 %** for the dense baseline; the compact
+  run also converges faster (96.7 % by step 5000).
+- [x] Capture-safety: `ScatterND`'s init copy became a KA kernel
+  (`_copy_kernel!`) — `copyto!`'s null-stream D2D memcpy aborts HIP graph
+  capture with `hipErrorStreamCaptureUnsupported`.
+- Note: the dense→compact switch lives on the DiffLUT side
+  (`luminal_compactify!` in the julia tree); the accuracy run vs the
+  masked-dense baseline is recorded there.
+
+## Qwen3.6-27B
+
+Status: runs end to end from `Qwen3.6-27B-Q8_0.gguf` (int8 load in ~140 s, coherent
+output; `examples/qwen35_gguf.jl`). The README still labels it "in progress".
+
+- [ ] **Validate against a reference.** Only a tiny random model is checked against
+  transformers (`tests/test_qwen35_model.jl`). Compare 27B logits / perplexity with
+  transformers or llama.cpp to catch small errors in Gated DeltaNet and partial RoPE.
+  Do this first.
+- [ ] **Decode performance.** No numbers recorded for Q8_0 tokens/s, prefill speed or
+  memory. Bandwidth floor is ~125 ms/token (~27 GB int8 at ~215 GB/s); measure how
+  close the hybrid DeltaNet decode path gets (`rocprofv3`, see `debug_decode.jl`).
+- [ ] **Load / startup time.** Cut the 140 s load (parallelise the loader, or cache
+  converted int8 weights) and the compilation time inside `generate`.
+- [ ] **Int4 and long context.** Check `--int4` quality (`examples/quant_eval.jl`
+  perplexity). `--max-seq` defaults to 512; measure long-context behaviour and the
+  hybrid cache's memory use.
+- [ ] **Tests that don't need the 27B file.** Cover `qwen35_config(::GGUFFile)`, the
+  GGUF tokenizer path (`LlamaTokenizer(::GGUFFile)`) and the MTP-layer trimming
+  from commit 889c2a8.
+- [ ] **Chat template / thinking mode.** The example does raw completion. Check
+  chat-template formatting, stop tokens and `<think>` handling.
+- [ ] **Cleanup.** Update the README from "in progress", document the GGUF example,
+  and commit or delete the scratch files (`test_gpu_ops.jl`, root `run*.log`).
+
+## AMD GPU performance (ideas from ~/devel/AI/magnitude)
+
+Magnitude targets AMD only through Vulkan (no HIP/ROCm), so these are ideas to adapt,
+not code to reuse. Based on a skim of `inference-v4/.../vulkan/lib/projection/projection.glsl`
+and `info/inference-tile-sizing-autotuning.md`; none of it has been tested here.
+
+- [ ] **Matrix-core (WMMA) GEMM for prefill.** Biggest known gap: prefill GEMMs don't
+  use the matrix cores. Magnitude uses 16x16x16 cooperative-matrix multiplies on
+  RDNA3/4 with f16 operands, F32 accumulation, and weights decoded to f16 once per
+  tile. gfx1151 has the same WMMA hardware.
+  - [x] Step 1: AMDGPU.jl emits `llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16` on
+    gfx1151 (wave32); a 16x16x16 product matches the CPU (err ~1e-6). Build operand
+    vectors with `ntuple(f, Val(16))`; wrapping in `NTuple{16,VecElement}(...)` makes
+    the kernel fail to compile (dynamic calls). Lane `l` holds row/column `l%16` of A/B
+    and `D[2i + l÷16, l%16]` for i in 0..7. Note `@roc gridsize` counts workgroups.
+  - [x] Step 2: tiled GEMM (f16 in, f32 out), correct (rel. err ~1e-5) at 256^3, 2048^3,
+    512x4096x4096, 4096^3. Throughput: 16x16 tile per wave 1.3 TFLOPS; 2x2 tiles per
+    wave 4.2; 64x64 block tile with LDS staging (128 threads, BK=32) 5.3-5.5 TFLOPS at
+    2048^3 and 4096^3 (4.2 at 512x4096x4096; slower than the 2x2 kernel at 256^3).
+    Baselines at 2048^3: rocBLAS Float32 `mul!` 2.85 TFLOPS, rocBLAS Float16 `mul!`
+    0.47 (does not use the matrix cores). Still far below peak; likely limited by
+    scalar 2-byte global loads, LDS stores and fragment reads (not profiled).
+    Scripts were scratch files (not in the repo).
+  - [ ] Step 3: wide loads (16-byte global, vector LDS reads), double-buffered K loop,
+    `rocprofv3` to confirm the bottleneck; stop when gains aren't worth the complexity.
+  - [ ] Step 4: check which GEMM Luminal's prefill calls today (Float32 rocBLAS or
+    Float16) and what fraction of prefill time is GEMM, then wire the kernel in and
+    verify with `debug_prefill.jl` and generated text. Test on TinyLlama first (small).
+- [ ] **Fuse RMSNorm into the following projection for decode.** Magnitude applies the
+  norm while staging activations, so norm + projection is one launch. RMSNorm
+  currently costs 3-4 kernels x 45 layers, and launch gaps (~5.5 us) are the
+  remaining decode cost. Also fuse SiLU-mul and residual-add into the output stage.
+- [ ] **Per-device autotuning with a cache.** Small sweep over threads per workgroup,
+  columns per pass and split-K for small-N outputs; check correctness, time on the
+  device, store winners per device. Would replace hand-tuning such as `_q8_threads`.
+- [ ] **Cross-check the GEMV/GEMM split.** Magnitude switches kernel class at M <= 8
+  (decode weight packet decoded once, applied to every activation row). Compare with
+  Luminal's multi-column int8 GEMV, which is limited to 4 columns per pass; see
+  whether B > 4 improves.
+- [ ] **Split-K for small-N projections** (relevant to the smaller 27B projections).
+- [ ] **Measurement practice.** Measure each component, then re-measure the whole
+  workload; a layer-0 saving does not extrapolate (keep using `rocprofv3` and
+  `debug_decode.jl`).

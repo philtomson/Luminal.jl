@@ -68,6 +68,7 @@ output_dtype(op::Div, ins) = _require(op, _same_dtype(op, ins), _isfloat, "float
 output_dtype(op::LessThan, ins) = (_require(op, _same_dtype(op, ins), _isnum, "numeric"); Bool)
 output_dtype(op::Union{SumReduce, MaxReduce}, ins) = _require(op, ins[1], _isnum, "numeric")
 output_dtype(op::Union{MatMul, MatMulT}, ins) = _require(op, _same_dtype(op, ins), _isfloat, "floating-point")
+output_dtype(op::Union{MappingGather, LutKOp, LutKBwdPinsOp, LutKDWOp, SparseMapGather, SparseMapBwdS, SparseMapBwdX}, ins) = (_require(op, ins[1], _isfloat, "floating-point"); ins[1])
 
 function output_dtype(op::Select, ins)
     ins[1] in (Bool, Float32) || throw(ArgumentError("Select: the condition must be Bool (or a Float32 0/1 mask), got $(ins[1])"))

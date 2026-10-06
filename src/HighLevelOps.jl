@@ -248,6 +248,65 @@ repeated coordinates accumulate). One coordinate tensor per axis of `init`,
 each of `src`'s shape; out-of-range writes are dropped. With `:replace`, which of
 several writes to one element survives is unspecified on the GPU.
 """
+
+"""
+    mapping_gather(x, scores, indices; tau=1f-3)
+
+Discrete column selection with a straight-through surrogate gradient:
+`out[b, c] = x[b, indices[c]]` (1-based Int32/Int64 indices) forward; backward
+`dx = dy @ softmax(scores ./ tau, dim 1)'` and `dscores = (2x - 1)' dy`, as if
+the output had been `x` routed through a softmax over the score columns. See
+`MappingGather`.
+"""
+function mapping_gather(x::GraphTensor, scores::GraphTensor, indices::GraphTensor; tau=1.0f-3)
+    B = realized_dims(x.shape)[1]
+    C = realized_dims(indices.shape)[1]
+    inputs = [(x.id, 0, x.shape), (scores.id, 0, scores.shape), (indices.id, 0, indices.shape)]
+    return add_op!(x.graph_ref, MappingGather(Float32(tau)), inputs, ShapeTracker([B, C]))
+end
+
+"""
+    lut_layer(pins, W; K)
+    lut_layer(x, W, indices; K)
+
+Fused K-input LUT layer (see `LutKOp`): the multilinear extension of the
+per-neuron truth table `W` (out, 2^K) over the K inputs of each neuron.
+Gathered form: `pins` is (B, K*out), pin-major (`MappingGather` output).
+Indexed form: `x` is (B, In) and `indices` (K*out,) holds 1-based Int
+column numbers of x, pin-major. Gradients flow to `pins`/`x` and `W`.
+"""
+function lut_layer(pins::GraphTensor, W::GraphTensor; K::Int)
+    B = realized_dims(pins.shape)[1]
+    out = realized_dims(W.shape)[1]
+    return add_op!(pins.graph_ref, LutKOp(K),
+                   [(pins.id, 0, pins.shape), (W.id, 0, W.shape)],
+                   ShapeTracker([B, out]))
+end
+
+function lut_layer(x::GraphTensor, W::GraphTensor, indices::GraphTensor; K::Int)
+    B = realized_dims(x.shape)[1]
+    out = realized_dims(W.shape)[1]
+    return add_op!(x.graph_ref, LutKOp(K),
+                   [(x.id, 0, x.shape), (W.id, 0, W.shape), (indices.id, 0, indices.shape)],
+                   ShapeTracker([B, out]))
+end
+
+"""
+    sparse_map_gather(x, S, cand; K, tau=1f-3)
+
+Compact top-K sparse router (see `SparseMapGather`): `S` is (C, K) candidate
+scores per pin, `cand` (C, K) 1-based Int64 candidate input ids; forward is a
+discrete gather of each pin's current best candidate, backward trains the kept
+scores straight-through and scatters softmax-weighted gradients to `x`.
+"""
+function sparse_map_gather(x::GraphTensor, S::GraphTensor, cand::GraphTensor; K::Int, tau=1.0f-3)
+    B = realized_dims(x.shape)[1]
+    C = realized_dims(S.shape)[1]
+    return add_op!(x.graph_ref, SparseMapGather(Int(K), Float32(tau)),
+                   [(x.id, 0, x.shape), (S.id, 0, S.shape), (cand.id, 0, cand.shape)],
+                   ShapeTracker([B, C]))
+end
+
 function scatter(init::GraphTensor, src::GraphTensor, coords::AbstractVector{GraphTensor}; mode::Symbol=:replace)
     mode in (:replace, :add) || throw(ArgumentError("scatter mode must be :replace or :add, got :$mode"))
     d = _coords_dims(init, coords)
