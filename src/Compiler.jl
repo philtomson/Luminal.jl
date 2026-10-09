@@ -75,6 +75,10 @@ function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Sy
     live_counts = copy(cg.consumer_count)
     
     function run_graph()
+        if get(ENV, "LUMINAL_TRACE_MEM", "") != "" && device isa Luminal.AMDDevice
+            _run_traced(cg, device, sym_vals, live_counts)
+            return
+        end
         for step in cg.steps
             step(cg.results, device, sym_vals, live_counts)
         end
@@ -90,13 +94,55 @@ function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Sy
     return cg.results
 end
 
+# LUMINAL_TRACE_MEM=1 (AMD only): run the steps one at a time, synchronizing, and report the HIP
+# pool's live bytes before and after each, so the steps that allocate (and never free) show up:
+# per op type the allocated total and the net growth, then the 12 largest single-step jumps.
+function _run_traced(cg, device, sym_vals, live_counts)
+    pool = AMDGPU.HIP.memory_pool(AMDGPU.device())
+    nodes = get(cg.cache, :step_nodes, Int[])
+    rows = Tuple{Int, Float64, Float64}[]            # (node, bytes before, bytes after)
+    for (i, step) in enumerate(cg.steps)
+        AMDGPU.synchronize(); b = AMDGPU.HIP.used_memory(pool)
+        step(cg.results, device, sym_vals, live_counts)
+        AMDGPU.synchronize(); a = AMDGPU.HIP.used_memory(pool)
+        push!(rows, (get(nodes, i, 0), b, a))
+    end
+    by = Dict{String, Vector{Float64}}()
+    for (n, b, a) in rows
+        k = n == 0 ? "?" : string(typeof(cg.graph.nodes[n].op).name.name)
+        v = get!(by, k, zeros(3)); v[1] += max(a - b, 0); v[2] += a - b; v[3] += 1
+    end
+    println("[trace] _release! calls ", _RELEASE_STATS[1], ", owned GPU buffers freed ", _RELEASE_STATS[2], " (",
+            round(_RELEASE_STATS[3] / 2^30, digits = 2), " GB), not owned ", _RELEASE_STATS[4])
+    left = [(id, cg.results[id]) for id in eachindex(cg.results) if isassigned(cg.results, id) && cg.results[id] isa AnyGPUArray]
+    println("[trace] results still assigned: ", length(left), " GPU arrays, ",
+            round(sum(length(x) * sizeof(eltype(x)) for (_, x) in left; init = 0) / 2^30, digits = 2), " GB logical;  nodes with live count > 0: ",
+            count(>(0), live_counts))
+    println("[trace] start ", round(rows[1][2] / 2^30, digits = 2), " GB live, end ", round(rows[end][3] / 2^30, digits = 2),
+            " GB live (", length(rows), " steps)")
+    for (k, v) in sort(collect(by); by = x -> -x[2][2])[1:min(10, end)]
+        println("[trace]   ", rpad(k, 18), lpad(Int(v[3]), 5), " steps  allocated ", lpad(round(v[1] / 2^30, digits = 2), 6),
+                " GB  net ", lpad(round(v[2] / 2^30, digits = 2), 6), " GB")
+    end
+    for (n, b, a) in sort(rows; by = r -> -(r[3] - r[2]))[1:min(12, end)]
+        n == 0 && continue
+        println("[trace]   jump ", lpad(round((a - b) / 2^20, digits = 0), 7), " MB  node ", n, "  ", typeof(cg.graph.nodes[n].op).name.name)
+    end
+    return
+end
+
 # Drop a dead intermediate. Buffers the graph allocated itself (`owned`) are
 # returned to the GPU pool right away instead of waiting for a GC finalizer.
+const _RELEASE_STATS = zeros(Int, 4)    # calls, owned GPU buffers freed, bytes freed, not owned (left to the GC)
 function _release!(res, id, owned)
     buf = res[id]
     res[id] = nothing
+    _RELEASE_STATS[1] += 1
     if owned[id] && buf isa AnyGPUArray
+        _RELEASE_STATS[2] += 1; _RELEASE_STATS[3] += length(buf) * sizeof(eltype(buf))
         GPUArrays.unsafe_free!(buf)
+    else
+        _RELEASE_STATS[4] += 1
     end
 end
 
@@ -666,6 +712,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     end
 
     steps = Base.Function[]
+    step_nodes = Int[]          # the node each step computes (for LUMINAL_TRACE_MEM)
     processed = folded .| processed_pads .| fused_matmuls   # these nodes need no step of their own
     owned = fill(false, length(graph.nodes))  # buffers allocated by this graph's own steps
     dynamic = false  # true if any shape depends on symbolic dims (sym_vals)
@@ -681,6 +728,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             src_sts = [evaluate_shapes(sst, Dict{Symbol,Int}()) for (_, sst, _) in parts]
             owned[node_id] = true
             backing = Ref{Any}(nothing)
+            push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
                 out = res[node_id]
@@ -707,6 +755,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             sts = [evaluate_shapes(st, Dict{Symbol,Int}()) for st in (xst, rst)]
             owned[node_id] = true
             backing = Ref{Any}(nothing)
+            push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
                 x = realize_view(res[xid], sts[1])
@@ -725,12 +774,14 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
 
         if op isa Luminal.Constant
             val = to_device(op.value, compile_device)
+            push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 res[node_id] = val
             end)
             processed[node_id] = true
             continue
         elseif op isa Luminal.Function && op.name == "ARange"
+            push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 node_shape = graph.shapes[node_id]
                 dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(node_shape))
@@ -745,6 +796,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             continue
         elseif op isa Luminal.Iota
             # evaluated on the host, uploaded again only when its (symbolic) size changes
+            push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 dims_int = map(d -> eval_dim(d, sym_vals), realized_dims(graph.shapes[node_id]))
                 if !isassigned(res, node_id) || res[node_id] === nothing || size(res[node_id]) != Tuple(dims_int)
@@ -806,6 +858,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             end
             static === nothing && (dynamic = true)
 
+            push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, _, st) in input_specs] : static.in_sts
                 run_op = static === nothing ? evaluate_op_shapes(op, sym_vals) : static.op
@@ -872,6 +925,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 end
                 static === nothing && (dynamic = true)
 
+                push!(step_nodes, node_id)
                 push!(steps, (res, dev, sym_vals, live) -> begin
                     in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
                     args = [align_rank(realize_view(res[id], in_sts[k]), target_rank) for (k, (id, _, _)) in enumerate(group_inputs)]
@@ -894,6 +948,6 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
 
     return CompiledGraph(graph, steps, results,
                          Dict{Symbol, Any}(:capture => capture, :dynamic => dynamic, :lowering_sites => sites,
-                                           :freeable => findall(owned .| folded)),
+                                           :freeable => findall(owned .| folded), :step_nodes => step_nodes),
                          consumer_count)
 end

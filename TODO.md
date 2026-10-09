@@ -350,3 +350,49 @@ Memory at full context: int8 weights ~28 GB + K/V cache of the 16 full-attention
   GEMV kernels reach on TinyLlama; floor for ~13.5 GB of int4 weights is ~63 ms). Decode is the
   thing to look at: profile with `rocprofv3` (DeltaRule / CausalConv / small kernels x 64 layers?).
   Not yet: longer prompts (2k, 4k, 8k), int8, WMMA on/off comparison, output sanity check.
+
+## Qwen3.6-27B int4: speed plan (what gufo shows)
+
+Reference: `~/devel/AI/gufo`, a Strix Halo (gfx1151) inference engine. Same chip, same model class
+(its numbers are Qwen3.8-27B, UD-Q4_K_XL = 16.35 GiB of weights; ours is Qwen3.6-27B requantized
+to int4 g32, ~14 GB; not identical, but close enough to compare). Its published AR numbers
+(`docs/models/qwen3.8-27b/BENCHMARKS.md`): Q4 prefill 656 tok/s, decode **12.4 tok/s**
+(llama.cpp 12.1); Q8 485 / 7.2. Ours (int4, 512-token prompt): prefill 170 tok/s, decode 6.1.
+
+- **Decode target.** 12.4 tok/s on 16.35 GiB is ~215 GB/s, the memory ceiling, so *autoregressive* 15 tok/s
+  is at the wall even for our smaller weights (14 GB / 215 GB/s = 65 ms = 15 tok/s only at 100%).
+  Realistic AR goal: match gufo, ~11-12 tok/s (2x today). Above that needs **speculative decoding**:
+  gufo reaches 26 tok/s (ordinary text) and 63 (repetitive) with a DFlash2 draft model, and has an
+  MTP path (`src/models/qwen/hip/mtp`, `dflash`). Our GGUF-MTP dir has the MTP head we currently drop.
+- **Decode: get from 6.1 to ~12 tok/s.** First profile where 165 ms goes (kernel trace of decode only;
+  the unprofiled run is safe, rocprofv3 inflated memory, see above). gufo's rejected-experiments list
+  (`docs/models/qwen3.8-27b/EXPERIMENTS.md`) says what not to chase once at the wall: residual/RMSNorm
+  fusion, graph replay (97.5% GPU-busy already), gate/up sharing, prefetch variants did not survive
+  end-to-end. Ours is at ~82 GB/s, so the loss is elsewhere (GEMV efficiency, DeltaRule/CausalConv, small
+  kernels x 64 layers). Cheap things they found: mapped/huge-page weights were +2% and *copied* weights
+  3-8% lower cold-weight throughput than mapped (test our hipMalloc'd weights vs mapped host memory in a
+  bandwidth microbenchmark: `tests/diagnostics/bandwidth_test.cpp`).
+- **Prefill: 170 -> ~650 tok/s.** gufo's prefill GEMM is W8A8: activations quantized to int8 blocks (Q8_1
+  style), weights expanded to int8, `wmma_i32_16x16x16_iu8`; it measures a 55 TOPS int8 WMMA ceiling and
+  reaches 58% of it (~32 TOPS) with a 128x128 block tile, 8 waves (256 threads), BK=32 LDS stages, and
+  fused epilogues (SwiGLU + quantize the next activation; residual + RMSNorm + quantize)
+  (`src/models/qwen/hip/kernels/prefill_quant_gemm.hip`). Ours: f16 WMMA at 12-18 TFLOPS (~9 TFLOPS
+  effective over the whole model). Experiments, in order: (1) measure the f16 vs int8 WMMA peaks on this
+  chip with a microbenchmark (`tools/bench/gfx1151_peak.hip` is the model); (2) an int8 (iu8) variant of
+  our kernel for the int8/int4 weights with quantized activations, checking quality (W8A8 changes the
+  numerics: perplexity); (3) 128x128 blocks with 8 waves.
+- **Prefill memory: chunked prefill into a preallocated arena (the answer to "why 15 GB").** Measured on
+  the 27B: during a 512-token prefill every intermediate stays live until the call ends (live bytes rise
+  by the sum of all allocations: +16 GB, linear in the prompt), `_release!` frees buffers but the
+  reshapes/views made by `realize_view` share the buffer (refcounted) and keep it alive; after the call
+  the HIP pool still holds ~12.5 GB reserved and `hipMemPoolTrimTo` returns only a little of it
+  (reserved 34.6 GB vs live 22.1 GB). gufo allocates all model/KV/recurrent/graph/scratch before
+  serving (`arena.cpp`) and prefills in fixed chunks (`prefill_chunk.cpp`), so memory is constant in
+  the prompt length. For Luminal: compile the prefill graph for a fixed chunk (e.g. 512 tokens), run it
+  per chunk with the K/V cache and recurrent states carried (needs attention over the cache for chunks
+  after the first), and keep the scratch resident. That also unlocks long prompts (8k now, 262k later).
+- **Quality of the weights.** gufo reads the native GGUF K-quants (Q4_K / Q5_K / Q6_K mixes) directly;
+  we requantize Q8_0 to int4 g32 symmetric, which costs perplexity (+7% on TinyLlama). A K-quant loader
+  would give better quality per byte (17.5 GB vs our ~14 GB, so decode would be ~20% slower at the wall).
+- **Not worth it (per gufo's experiments):** more attention-kernel tuning for decode at short context,
+  two-layer fusion of norm into projection, graph capture variants.
