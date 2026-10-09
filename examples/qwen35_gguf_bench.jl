@@ -12,7 +12,7 @@
 # GB (default 10), so the rest of the machine is not squeezed. --stop-after stops cleanly
 # after a stage, to walk through the stages one at a time.
 #
-# For each prompt length: the time to the first token (prefill + one greedy pick, median
+# For each prompt length (after one untimed call of each kind, which compile and capture): the time to the first token (prefill + one greedy pick, median
 # of `reps` after a warm-up that also compiles the graph), and the time per generated
 # token over `--new` tokens decoded at that depth. Prompts are fixed pseudo-random token
 # ids. Decode attention caps the context at 8191 positions (DECODE_ATTN_MAX_CTX).
@@ -128,6 +128,8 @@ function main()
         n + n_new < max_seq || (status("skip $n (needs max_seq > $(n + n_new))"); continue)
         p = ids(n)
         t_cold = timed("prompt $n: cold (1 token)", 1, p)
+        # the first decode call captures the HIP graph (seconds); keep it out of the timed runs
+        n_new > 1 && timed("prompt $n: decode warm-up", n_new, p)
         get(ENV, "LUMINAL_TRACE_MEM", "") != "" && (ENV["LUMINAL_TRACE_MEM"] = "")   # trace the cold call only
         "--buffers" in ARGS && dump_buffers(n)
         "--cold-only" in ARGS && (status("stopping after the first call"); return)

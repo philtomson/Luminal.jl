@@ -346,9 +346,8 @@ Memory at full context: int8 weights ~28 GB + K/V cache of the 16 full-attention
 - [~] `examples/qwen35_gguf_bench.jl` (stage-by-stage memory log, in-process watchdog,
   `--stop-after`, `--reclaim`): first numbers, Qwen3.6-27B int4 (g32), Float16 K/V, 512-token
   prompt, WMMA prefill: time to first token 3.02 s = 170 tok/s prefill (~9 TFLOPS effective);
-  decode 165 ms/token = 6.1 tok/s (~82 GB/s of weight traffic, about 40% of the ~215 GB/s the
-  GEMV kernels reach on TinyLlama; floor for ~13.5 GB of int4 weights is ~63 ms). Decode is the
-  thing to look at: profile with `rocprofv3` (DeltaRule / CausalConv / small kernels x 64 layers?).
+  (CORRECTED, see the decode profile below: the 165 ms/token reported here included the one-time HIP graph
+  capture of the first decode call; steady-state decode is 79-84 ms/token = 11.9-12.6 tok/s.)
   Not yet: longer prompts (2k, 4k, 8k), int8, WMMA on/off comparison, output sanity check.
 
 ## Qwen3.6-27B int4: speed plan (what gufo shows)
@@ -357,21 +356,17 @@ Reference: `~/devel/AI/gufo`, a Strix Halo (gfx1151) inference engine. Same chip
 (its numbers are Qwen3.8-27B, UD-Q4_K_XL = 16.35 GiB of weights; ours is Qwen3.6-27B requantized
 to int4 g32, ~14 GB; not identical, but close enough to compare). Its published AR numbers
 (`docs/models/qwen3.8-27b/BENCHMARKS.md`): Q4 prefill 656 tok/s, decode **12.4 tok/s**
-(llama.cpp 12.1); Q8 485 / 7.2. Ours (int4, 512-token prompt): prefill 170 tok/s, decode 6.1.
+(llama.cpp 12.1); Q8 485 / 7.2. Ours (int4, 512-token prompt, measured with a decode warm-up): prefill 170 tok/s, decode 12.0 tok/s.
 
 - **Decode target.** 12.4 tok/s on 16.35 GiB is ~215 GB/s, the memory ceiling, so *autoregressive* 15 tok/s
   is at the wall even for our smaller weights (14 GB / 215 GB/s = 65 ms = 15 tok/s only at 100%).
   Realistic AR goal: match gufo, ~11-12 tok/s (2x today). Above that needs **speculative decoding**:
   gufo reaches 26 tok/s (ordinary text) and 63 (repetitive) with a DFlash2 draft model, and has an
   MTP path (`src/models/qwen/hip/mtp`, `dflash`). Our GGUF-MTP dir has the MTP head we currently drop.
-- **Decode: get from 6.1 to ~12 tok/s.** First profile where 165 ms goes (kernel trace of decode only;
-  the unprofiled run is safe, rocprofv3 inflated memory, see above). gufo's rejected-experiments list
-  (`docs/models/qwen3.8-27b/EXPERIMENTS.md`) says what not to chase once at the wall: residual/RMSNorm
-  fusion, graph replay (97.5% GPU-busy already), gate/up sharing, prefetch variants did not survive
-  end-to-end. Ours is at ~82 GB/s, so the loss is elsewhere (GEMV efficiency, DeltaRule/CausalConv, small
-  kernels x 64 layers). Cheap things they found: mapped/huge-page weights were +2% and *copied* weights
-  3-8% lower cold-weight throughput than mapped (test our hipMalloc'd weights vs mapped host memory in a
-  bandwidth microbenchmark: `tests/diagnostics/bandwidth_test.cpp`).
+- **Decode: already ~12 tok/s (see the profile below); beyond that: fewer bytes, fewer launches, speculative decoding.**
+  gufo's rejected-experiments list (`docs/models/qwen3.8-27b/EXPERIMENTS.md`) warns that norm/residual
+  fusion, graph replay and prefetch variants did not survive end to end at the wall. Cheap thing they found:
+  mapped/huge-page weights +2% (copied weights 3-8% lower cold-weight throughput than mapped).
 - **Prefill: 170 -> ~650 tok/s.** gufo's prefill GEMM is W8A8: activations quantized to int8 blocks (Q8_1
   style), weights expanded to int8, `wmma_i32_16x16x16_iu8`; it measures a 55 TOPS int8 WMMA ceiling and
   reaches 58% of it (~32 TOPS) with a 128x128 block tile, 8 waves (256 threads), BK=32 LDS stages, and
@@ -396,3 +391,26 @@ to int4 g32, ~14 GB; not identical, but close enough to compare). Its published 
   would give better quality per byte (17.5 GB vs our ~14 GB, so decode would be ~20% slower at the wall).
 - **Not worth it (per gufo's experiments):** more attention-kernel tuning for decode at short context,
   two-layer fusion of norm into projection, graph capture variants.
+
+### Decode profile of the 27B (int4, measured 2026-10-09, `rocprofv3 --kernel-trace`, 16-token prompt, 22 decode steps)
+
+Steady-state decode is **79-84 ms/token = 11.9-12.6 tok/s** (matches gufo's AR 12.4); the earlier 6.1 tok/s
+came from timing the first decode call, which captures the HIP graph (seconds). Per step: ~1,750 kernel
+launches, GPU busy 91% of the step window (~77 ms), kernel time ~70 ms:
+
+| kernel | per step | share |
+|---|---|---|
+| `_q4_matmul_kernel_` (int4 GEMV, ~475 launches) | 62.0 ms | 88.7% |
+| `_delta_rule_kernel_` (48 linear-attention layers) | 3.2 ms | 4.6% |
+| `broadcast_kernel_cartesian` (unfused elementwise, ~550 launches) | 1.6 ms | 2.3% |
+| `_rmsnorm_kernel_` (~200 launches) | 1.5 ms | 2.2% |
+| decode attention, linear broadcasts, causal conv, reduce, copy, rotary | 1.6 ms | 2.3% |
+
+The GEMV streams ~14 GB in 62 ms = ~226 GB/s, at the memory wall (gufo: ~215 GB/s). So 15 tok/s (67 ms)
+AR needs the ~15 ms outside the GEMV (8 ms small kernels + ~8 ms launch gaps between ~1,750 launches)
+cut to ~5 ms AND the GEMV unchanged, which is a stretch; the alternatives are fewer bytes (int4 g64:
+-5.5% of the GEMV = -3.4 ms; fewer weights read per token) or speculative decoding (gufo 26-63 tok/s).
+Cheap next steps: fuse the ~550 elementwise broadcasts + 200 RMSNorm launches per step (~3 ms of kernel
+time plus their launch gaps); DeltaRule (3.2 ms, 48 launches/step = 66 us each) looks slow for its work.
+Also: prefill of <= 16 tokens (`QUANT_GEMM_COLS = 16`) takes the multi-pass GEMV path (16-token prompt:
+520 ms to the first token vs ~65 ms to read the weights once); the WMMA path is not used below 17 columns.
