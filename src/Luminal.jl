@@ -41,6 +41,7 @@ using .Device
 export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice, AMDDevice, VulkanDevice
 
 # Execution Engine
+include("WMMA.jl")
 include("Execution.jl")
 export execute
 

@@ -4,7 +4,10 @@
 # exactly `output` generated tokens (end-of-sequence ignored), greedy, one full
 # warm-up request, then the median of `reps` requests.
 #
-#   julia --project=. examples/chat_benchmark.jl <model_dir> [f32|f16|int8|int4|int4_mixed|int4_mixed_plus] [input] [output] [reps]
+#   julia --project=. examples/chat_benchmark.jl <model_dir> [f32|f16|int8|int4|int4_mixed|int4_mixed_plus] [input] [output] [reps] [stored]
+#
+# With `stored`, the weights are also loaded in that precision (weight_storage), so prefill
+# runs on them too; otherwise prefill uses Float32 weights and only decode is reduced.
 #
 # TTFT = time to the first generated token (prefill + one greedy pick; upstream's
 # also includes one decode step). TPOT = (time for `output` tokens - TTFT) /
@@ -19,7 +22,7 @@ wd = let a = get(ARGS, 2, "f32")
 end
 n_in = parse(Int, get(ARGS, 3, "128"))
 n_out = parse(Int, get(ARGS, 4, "128"))
-reps = parse(Int, get(ARGS, 5, "3"))
+reps = parse(Int, get(ARGS, 5, "3"))   # (a trailing "stored" is read below)
 
 tok = LlamaTokenizer(dir)
 empty!(tok.eos_ids)                      # generate exactly n_out tokens, as upstream does
@@ -36,7 +39,8 @@ function padded_prompt()
 end
 prompt = padded_prompt()
 
-t_load = @elapsed s = LlamaSession(model, tok, dir; max_seq=n_in + n_out + 8, decode_weights=wd)
+t_load = @elapsed s = LlamaSession(model, tok, dir; max_seq=n_in + n_out + 8, decode_weights=wd,
+                                   weight_storage="stored" in ARGS ? wd : nothing)
 t_cold = @elapsed generate(s, prompt; max_new_tokens=n_out)
 ttft = [@elapsed(generate(s, prompt; max_new_tokens=1)) for _ in 1:reps]
 full = [@elapsed(generate(s, prompt; max_new_tokens=n_out)) for _ in 1:reps]

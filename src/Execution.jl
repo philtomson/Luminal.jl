@@ -945,10 +945,36 @@ end
     end
 end
 
+# Activations rounded to Float16 and zero-padded to a multiple of 64 columns, for the
+# WMMA GEMM; reused per (array type, K, padded N) like _GEMM_EX_WORKSPACE. The padding
+# columns are never written, so they stay zero.
+const _WMMA_WORKSPACE = Dict{Any, Any}()
+
+# C (Out, N) = W * B on the matrix cores (src/WMMA.jl), with the optional residual
+# added afterwards. Returns false when the shapes or the device do not fit, and the
+# caller falls back to the dequantize-and-rocBLAS path.
+function _wmma_half_gemm!(C, W::HalfWeight, B, residual)
+    (C isa ROCArray{Float32} && W.t isa ROCArray{Float16} && wmma_enabled()) || return false
+    K, M = size(W.t)
+    (M % 64 == 0 && K % 32 == 0) || return false
+    N = length(B) ÷ K
+    Npad = cld(N, 64) * 64
+    Bc = B isa DenseArray ? B : copy(B)
+    x16 = get!(() -> (x = similar(Bc, Float16, K, Npad); fill!(x, Float16(0)); x),
+               _WMMA_WORKSPACE, (typeof(Bc), K, Npad))
+    copyto!(view(x16, :, 1:N), Base.reshape(Bc, K, N))
+    C2 = Base.reshape(C, M, N)
+    wmma_gemm!(C2, W.t, x16, N)
+    residual === nothing || (C2 .+= Base.reshape(residual isa DenseArray ? residual : copy(residual), M, N))
+    Bc === B || _free_now!(Bc)
+    return true
+end
+
 # C (Out, N) = W (Out, In) * B (In, N), with any trailing dims of B/C flattened into N.
 function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP, residual = nothing)
     K, M = size(W.t)
     N = length(B) ÷ K
+    N > QUANT_GEMM_COLS && _wmma_half_gemm!(C, W, B, residual) && return C
     (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)

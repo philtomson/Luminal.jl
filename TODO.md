@@ -239,11 +239,45 @@ and `info/inference-tile-sizing-autotuning.md`; none of it has been tested here.
     0.47 (does not use the matrix cores). Still far below peak; likely limited by
     scalar 2-byte global loads, LDS stores and fragment reads (not profiled).
     Scripts were scratch files (not in the repo).
-  - [ ] Step 3: wide loads (16-byte global, vector LDS reads), double-buffered K loop,
-    `rocprofv3` to confirm the bottleneck; stop when gains aren't worth the complexity.
-  - [ ] Step 4: check which GEMM Luminal's prefill calls today (Float32 rocBLAS or
-    Float16) and what fraction of prefill time is GEMM, then wire the kernel in and
-    verify with `debug_prefill.jl` and generated text. Test on TinyLlama first (small).
+  - [~] Step 3 (partly done, ROCm 10.1.0): K-contiguous operands (activations [M,K] and
+    weights [N,K] row-major, so each WMMA fragment is 32 contiguous bytes), 16-byte
+    global loads, 16-byte LDS reads (LDS rows padded to 5 chunks = 80 B), and global
+    loads of the next K tile issued into registers before the current tile's WMMAs.
+    64x64 block, 4 waves of 32x32, BK=32 ("v4"): 12.4-13.4 TFLOPS at 2048^3, 11.3 at
+    4096^3, 5.9 at 512x4096x4096, 6.4 at 4096x11008x4096 (2.2x the scalar-load kernel,
+    ~4x Float32 rocBLAS; correct, rel. err ~1e-5). A 128x128 block with 64x64 per wave
+    ("v5") was correct but slower (8.2 / 5.2 TFLOPS at 2048^3 / 4096^3), probably
+    register pressure or low occupancy (not checked). The big-weight shape drops to
+    ~6 TFLOPS when B (90 MB) exceeds the 32 MB on-chip cache.
+    Not tried yet: block swizzle for cache locality, BK=64, split-K for small M,
+    `rocprofv3` / VGPR counts to see what limits v5, 128x64 blocks, edge handling for
+    M, N not a multiple of the tile and K not a multiple of 32 (currently required).
+  - [x] Step 4 (Float16 weights): saved as `benchmarks/wmma_gemm.jl` (v4 kernel plus a
+    comparison with rocBLAS) and wired in as `src/WMMA.jl`, called from
+    `_half_matmul!` (HalfWeight, prefill N > 16) in `src/Execution.jl`. Activations are
+    rounded to Float16 into a zero-padded workspace; N may be any size, M must be a
+    multiple of 64 and K of 32 (otherwise it falls back); gfx11 only; set
+    `LUMINAL_WMMA=0` to disable. Benchmark (ROCm 10.1.0), WMMA vs rocBLAS `gemm_ex`
+    f16 vs sgemm, TFLOPS: 2048x2048x512 13.1 / 5.2 / 2.7; 5632x2048x512 12.4 / 5.8 / 3.0;
+    32000x2048x512 14.6 / 6.5 / 3.2; 11008x4096x512 12.8 / 6.6 / 3.1; 4096x4096x4096
+    11.1 / 6.8 / 3.2 (at 128 tokens 8.6-21 / 5.4-7.1 / 2.5-3.1). TinyLlama, 512-token
+    prompt, weights stored as Float16: time to first token 298 ms, vs 1890 ms on the
+    previous dequantize-then-sgemm path for stored-Float16 weights (and 505 ms for the
+    default Float32-prefill session). Quality: TinyLlama Float16 perplexity 12.1226
+    (Float32 12.1229), top-1 agreement 153/153, logit relerr 5.4e-4. Tests:
+    `tests/test_wmma_gemm.jl`; `test_quantized_loading.jl` relaxes its Float16 GPU
+    prefill tolerance to 1e-3 (activation rounding, ~2e-4); full suite 2150/2150.
+  - [ ] Default sessions are not sped up yet: `LlamaSession` keeps Float32 weights for
+    prefill (plain sgemm) and only converts decode weights. Options: prefill on
+    HalfWeight (changes prefill numerics to f16 activations/weights, extra weight
+    memory unless shared with decode) or `weight_storage=Float16`
+    (`examples/chat_benchmark.jl ... stored` measures that).
+  - [ ] Int8 / Int4 prefill (`_dequant_gemm!` on QuantWeight / Q4Weight, e.g. the
+    Qwen3.6-27B Q8_0 GGUF): dequantize straight to a Float16 K-contiguous tile and feed
+    WMMA, instead of a Float32 temporary + sgemm. Probably the biggest remaining win
+    for the 27B.
+  - [ ] Fused residual in the kernel epilogue (now a separate `C .+= residual`), M and K
+    tails, gfx12 (different WMMA intrinsic), CUDA/other devices untouched.
 - [ ] **Fuse RMSNorm into the following projection for decode.** Magnitude applies the
   norm while staging activations, so norm + projection is one launch. RMSNorm
   currently costs 3-4 kernels x 45 layers, and launch gaps (~5.5 us) are the
