@@ -38,9 +38,10 @@ prompts = [[3, 14, 15, 9, 2, 6, 30], [11, 40, 7, 1, 25]]
     end
     gq, lq, sq = run(W)
     g32, l32, s32 = run(W32)
-    # prefill: dequantize + GEMM. On a GPU with Float16 weights the GEMM runs on the matrix
-    # cores (src/WMMA.jl), which round the activations to Float16 (~2e-4 on these logits).
-    ptol = (T === Float16 && dev isa Luminal.AbstractGPUDevice) ? 1e-3 : 1e-4
+    # prefill: dequantize + GEMM. On a GPU with Float16 or int8 weights the GEMM runs on the
+    # matrix cores (src/WMMA.jl), which round the activations (and the dequantized int8
+    # weights) to Float16: ~2e-4 on these logits.
+    ptol = (T in (Float16, Int8) && dev isa Luminal.AbstractGPUDevice) ? 1e-3 : 1e-4
     @test all(relerr(lq[b], l32[b]) < ptol for b in 1:2)
     @test all(relerr(sq[k], s32[k]) < 1e-4 for k in eachindex(s32))      # decode: GEMV kernels
     @test gq == g32

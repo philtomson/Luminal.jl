@@ -272,10 +272,18 @@ and `info/inference-tile-sizing-autotuning.md`; none of it has been tested here.
     HalfWeight (changes prefill numerics to f16 activations/weights, extra weight
     memory unless shared with decode) or `weight_storage=Float16`
     (`examples/chat_benchmark.jl ... stored` measures that).
-  - [ ] Int8 / Int4 prefill (`_dequant_gemm!` on QuantWeight / Q4Weight, e.g. the
-    Qwen3.6-27B Q8_0 GGUF): dequantize straight to a Float16 K-contiguous tile and feed
-    WMMA, instead of a Float32 temporary + sgemm. Probably the biggest remaining win
-    for the 27B.
+  - [x] Int8 prefill (`QuantWeight`, `_q8_matmul!` with N > 16): `_wmma_q8_kernel!`
+    dequantizes each 16-int8 chunk x its group scale to Float16 while staging the A tile
+    (no Float32 copy of the weight; any group that is a multiple of 16). 8-17 TFLOPS vs
+    0.2-1.7 for dequantize + sgemm (10-100x). TinyLlama int8 stored, time to first token:
+    74-87 ms for 128 tokens (was ~1070 ms), 251 ms for 512 tokens (was 1436 ms); decode
+    unchanged (TPOT noise 5.8-6.8 ms with other jobs on the machine). Perplexity 12.1552
+    (was 12.1526; Float32 12.1229), top-1 agreement 149/153 as before.
+    `benchmarks/wmma_gemm.jl` now calls the kernels in `src/WMMA.jl` and covers int8.
+    Not yet tried on the Qwen3.6-27B Q8_0 GGUF (group 32; needs ~27 GB free, so check
+    memory with the other jobs first).
+  - [ ] Int4 prefill (`Q4Weight`, still `_dequant_gemm!`): same idea with 4-bit codes,
+    scale and min.
   - [ ] Fused residual in the kernel epilogue (now a separate `C .+= residual`), M and K
     tails, gfx12 (different WMMA intrinsic), CUDA/other devices untouched.
 - [ ] **Fuse RMSNorm into the following projection for decode.** Magnitude applies the

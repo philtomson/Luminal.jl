@@ -23,7 +23,42 @@ const WMMA_V8F  = NTuple{8,VecElement{Float32}}
 
 const WMMA_PADC = 5   # LDS row = 4 chunks of 16 B + 1 pad chunk, to spread banks
 
-# Av, Bv: A (K, M) and B (K, Npad) viewed as 16-byte chunks (8 halves along K).
+# One BK=32 tile of WMMAs for a wave's 32x32 output: As/Bs hold 4 chunks (32 halves)
+# per row of the 64-row A and B tiles; (wm, wn) is the wave's offset in the block.
+@inline function _wmma_tile(acc, As, Bs, wm, wn, r)
+    a00, a01, a10, a11 = acc
+    for s in 0:1
+        A0 = _wmma_cat(As[2s + 1, wm + r + 1],      As[2s + 2, wm + r + 1])
+        A1 = _wmma_cat(As[2s + 1, wm + 16 + r + 1], As[2s + 2, wm + 16 + r + 1])
+        B0 = _wmma_cat(Bs[2s + 1, wn + r + 1],      Bs[2s + 2, wn + r + 1])
+        B1 = _wmma_cat(Bs[2s + 1, wn + 16 + r + 1], Bs[2s + 2, wn + 16 + r + 1])
+        a00 = _wmma16(A0, B0, a00); a01 = _wmma16(A0, B1, a01)
+        a10 = _wmma16(A1, B0, a10); a11 = _wmma16(A1, B1, a11)
+    end
+    return (a00, a01, a10, a11)
+end
+
+# Write the wave's 32x32 result; columns >= N (padding) are skipped.
+@inline function _wmma_store!(C, acc, m0, n0, r, h, N)
+    a00, a01, a10, a11 = acc
+    ok0 = n0 + r < N; ok1 = n0 + 16 + r < N
+    for i in 0:7   # lane l holds D[2i + l÷16, l%16] of each 16x16 tile
+        if ok0
+            C[m0+2i+h+1,    n0+r+1]    = a00[i+1].value
+            C[m0+16+2i+h+1, n0+r+1]    = a10[i+1].value
+        end
+        if ok1
+            C[m0+2i+h+1,    n0+16+r+1] = a01[i+1].value
+            C[m0+16+2i+h+1, n0+16+r+1] = a11[i+1].value
+        end
+    end
+    return
+end
+
+@inline _wmma_zeros() = (_wmma_zero(), _wmma_zero(), _wmma_zero(), _wmma_zero())
+
+# Float16 weights. Av, Bv: A (K, M) and B (K, Npad) viewed as 16-byte chunks (8 halves
+# along K). Each thread stages 2 chunks of A and 2 of B per K tile.
 function _wmma_gemm_kernel!(C, Av, Bv, K, N)
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; h = l ÷ 16; w = tid ÷ 32
@@ -31,7 +66,7 @@ function _wmma_gemm_kernel!(C, Av, Bv, K, N)
     bm = (workgroupIdx().y - 1) * 64; bn = (workgroupIdx().x - 1) * 64
     As = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
     Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
-    a00 = _wmma_zero(); a01 = _wmma_zero(); a10 = _wmma_zero(); a11 = _wmma_zero()
+    acc = _wmma_zeros()
     c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 32   # this thread's chunks of each K tile
     nk = K ÷ 32
     ra0 = Av[c0 + 1, bm + row0 + 1]; ra1 = Av[c0 + 1, bm + row1 + 1]
@@ -45,28 +80,50 @@ function _wmma_gemm_kernel!(C, Av, Bv, K, N)
             ra0 = Av[kc, bm + row0 + 1]; ra1 = Av[kc, bm + row1 + 1]
             rb0 = Bv[kc, bn + row0 + 1]; rb1 = Bv[kc, bn + row1 + 1]
         end
-        for s in 0:1
-            A0 = _wmma_cat(As[2s + 1, wm + r + 1],      As[2s + 2, wm + r + 1])
-            A1 = _wmma_cat(As[2s + 1, wm + 16 + r + 1], As[2s + 2, wm + 16 + r + 1])
-            B0 = _wmma_cat(Bs[2s + 1, wn + r + 1],      Bs[2s + 2, wn + r + 1])
-            B1 = _wmma_cat(Bs[2s + 1, wn + 16 + r + 1], Bs[2s + 2, wn + 16 + r + 1])
-            a00 = _wmma16(A0, B0, a00); a01 = _wmma16(A0, B1, a01)
-            a10 = _wmma16(A1, B0, a10); a11 = _wmma16(A1, B1, a11)
-        end
+        acc = _wmma_tile(acc, As, Bs, wm, wn, r)
         sync_workgroup()
     end
-    m0 = bm + wm; n0 = bn + wn
-    ok0 = n0 + r < N; ok1 = n0 + 16 + r < N
-    for i in 0:7   # lane l holds D[2i + l÷16, l%16] of each 16x16 tile
-        if ok0
-            C[m0+2i+h+1,    n0+r+1]    = a00[i+1].value
-            C[m0+16+2i+h+1, n0+r+1]    = a10[i+1].value
+    _wmma_store!(C, acc, bm + wm, bn + wn, r, h, N)
+    return
+end
+
+# 16 int8 of one weight row times the Float32 scale of their group, as two chunks of 8
+# halves. (The rounding to Float16 is far below the int8 quantization error.)
+@inline _wmma_dq8(q::NTuple{16,Int8}, s::Float32) =
+    (ntuple(i -> VecElement(Float16(Float32(q[i]) * s)), Val(8)),
+     ntuple(i -> VecElement(Float16(Float32(q[i + 8]) * s)), Val(8)))
+
+# int8 weights (QuantWeight): Qv (K/16, M) of 16 int8 along K, Sc (K/group, M) Float32
+# scales (group a multiple of 16). Each thread stages one 16-int8 chunk of A per K tile,
+# dequantized to Float16 on the way into LDS, and 2 chunks of B.
+function _wmma_q8_kernel!(C, Qv, Sc, Bv, K, N, group)
+    tid = workitemIdx().x - 1
+    l = tid % 32; r = l % 16; h = l ÷ 16; w = tid ÷ 32
+    wm = (w % 2) * 32; wn = (w ÷ 2) * 32
+    bm = (workgroupIdx().y - 1) * 64; bn = (workgroupIdx().x - 1) * 64
+    As = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
+    Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
+    acc = _wmma_zeros()
+    arow = tid ÷ 2; ah = tid % 2                       # A: 64 rows x 2 chunks per K tile
+    c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 32     # B as in the Float16 kernel
+    nk = K ÷ 32
+    qa = Qv[ah + 1, bm + arow + 1]; sa = Sc[(16ah) ÷ group + 1, bm + arow + 1]
+    rb0 = Bv[c0 + 1, bn + row0 + 1]; rb1 = Bv[c0 + 1, bn + row1 + 1]
+    for t in 0:nk-1
+        lo, hi = _wmma_dq8(qa, sa)
+        As[2ah + 1, arow + 1] = lo; As[2ah + 2, arow + 1] = hi
+        Bs[c0 + 1, row0 + 1] = rb0; Bs[c0 + 1, row1 + 1] = rb1
+        sync_workgroup()
+        if t + 1 < nk
+            kq = 2 * (t + 1) + ah                      # next 16-wide chunk along K (0-based)
+            qa = Qv[kq + 1, bm + arow + 1]; sa = Sc[(16kq) ÷ group + 1, bm + arow + 1]
+            kc = (t + 1) * 4 + c0 + 1
+            rb0 = Bv[kc, bn + row0 + 1]; rb1 = Bv[kc, bn + row1 + 1]
         end
-        if ok1
-            C[m0+2i+h+1,    n0+16+r+1] = a01[i+1].value
-            C[m0+16+2i+h+1, n0+16+r+1] = a11[i+1].value
-        end
+        acc = _wmma_tile(acc, As, Bs, wm, wn, r)
+        sync_workgroup()
     end
+    _wmma_store!(C, acc, bm + wm, bn + wn, r, h, N)
     return
 end
 
@@ -93,5 +150,18 @@ function wmma_gemm!(C::ROCArray{Float32,2}, At::ROCArray{Float16,2}, B::ROCArray
         throw(ArgumentError("wmma_gemm!: need M % 64 == 0, K % 32 == 0, padded N % 64 == 0"))
     Av = reinterpret(WMMA_V8H, At); Bv = reinterpret(WMMA_V8H, B)
     @roc groupsize=128 gridsize=(Npad ÷ 64, M ÷ 64) _wmma_gemm_kernel!(C, Av, Bv, K, N)
+    return C
+end
+
+# C (M, N) = dequantize(Q, scale)' * B for Q (K, M) Int8, scale (K/group, M) Float32,
+# B (K, Npad) Float16 (see `wmma_gemm!`); K % 32 == 0, group % 16 == 0.
+function wmma_q8_gemm!(C::ROCArray{Float32,2}, Q::ROCArray{Int8,2}, scale::ROCArray{Float32,2},
+                       group::Int, B::ROCArray{Float16,2}, N::Int)
+    K, M = size(Q); Npad = size(B, 2)
+    (M % 64 == 0 && Npad % 64 == 0 && K % 32 == 0 && group % 16 == 0 && size(B, 1) == K &&
+     size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
+        throw(ArgumentError("wmma_q8_gemm!: need M % 64 == 0, K % 32 == 0, padded N % 64 == 0"))
+    Qv = reinterpret(NTuple{16,Int8}, Q); Bv = reinterpret(WMMA_V8H, B)
+    @roc groupsize=128 gridsize=(Npad ÷ 64, M ÷ 64) _wmma_q8_kernel!(C, Qv, scale, Bv, K, N, group)
     return C
 end

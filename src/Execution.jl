@@ -653,6 +653,7 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, cols
                      residual = nothing)
     K, M = size(W.q)
     N = length(B) ÷ K
+    N > QUANT_GEMM_COLS && _wmma_q8_gemm!(C, W, B, residual) && return C
     (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
@@ -950,6 +951,20 @@ end
 # columns are never written, so they stay zero.
 const _WMMA_WORKSPACE = Dict{Any, Any}()
 
+# B (K, N) rounded to Float16 in the zero-padded workspace; returns (x16, Bc), Bc being
+# the dense copy to free afterwards when B had to be copied.
+function _wmma_activations(B, K, N)
+    Npad = cld(N, 64) * 64
+    Bc = B isa DenseArray ? B : copy(B)
+    x16 = get!(() -> (x = similar(Bc, Float16, K, Npad); fill!(x, Float16(0)); x),
+               _WMMA_WORKSPACE, (typeof(Bc), K, Npad))
+    copyto!(view(x16, :, 1:N), Base.reshape(Bc, K, N))
+    return x16, Bc
+end
+
+_wmma_add_residual!(C2, residual, M, N) =
+    residual === nothing || (C2 .+= Base.reshape(residual isa DenseArray ? residual : copy(residual), M, N))
+
 # C (Out, N) = W * B on the matrix cores (src/WMMA.jl), with the optional residual
 # added afterwards. Returns false when the shapes or the device do not fit, and the
 # caller falls back to the dequantize-and-rocBLAS path.
@@ -958,14 +973,25 @@ function _wmma_half_gemm!(C, W::HalfWeight, B, residual)
     K, M = size(W.t)
     (M % 64 == 0 && K % 32 == 0) || return false
     N = length(B) ÷ K
-    Npad = cld(N, 64) * 64
-    Bc = B isa DenseArray ? B : copy(B)
-    x16 = get!(() -> (x = similar(Bc, Float16, K, Npad); fill!(x, Float16(0)); x),
-               _WMMA_WORKSPACE, (typeof(Bc), K, Npad))
-    copyto!(view(x16, :, 1:N), Base.reshape(Bc, K, N))
+    x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
     wmma_gemm!(C2, W.t, x16, N)
-    residual === nothing || (C2 .+= Base.reshape(residual isa DenseArray ? residual : copy(residual), M, N))
+    _wmma_add_residual!(C2, residual, M, N)
+    Bc === B || _free_now!(Bc)
+    return true
+end
+
+# The same for int8 weights: dequantized to Float16 as the tiles are staged, so no
+# Float32 copy of the weight is made.
+function _wmma_q8_gemm!(C, W::QuantWeight, B, residual)
+    (C isa ROCArray{Float32} && W.q isa ROCArray{Int8} && W.scale isa ROCArray{Float32} && wmma_enabled()) || return false
+    K, M = size(W.q)
+    (M % 64 == 0 && K % 32 == 0 && W.group % 16 == 0) || return false
+    N = length(B) ÷ K
+    x16, Bc = _wmma_activations(B, K, N)
+    C2 = Base.reshape(C, M, N)
+    wmma_q8_gemm!(C2, W.q, W.scale, W.group, x16, N)
+    _wmma_add_residual!(C2, residual, M, N)
     Bc === B || _free_now!(Bc)
     return true
 end
