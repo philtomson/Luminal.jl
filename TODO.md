@@ -414,3 +414,35 @@ Cheap next steps: fuse the ~550 elementwise broadcasts + 200 RMSNorm launches pe
 time plus their launch gaps); DeltaRule (3.2 ms, 48 launches/step = 66 us each) looks slow for its work.
 Also: prefill of <= 16 tokens (`QUANT_GEMM_COLS = 16`) takes the multi-pass GEMV path (16-token prompt:
 520 ms to the first token vs ~65 ms to read the weights once); the WMMA path is not used below 17 columns.
+
+### Prefill profile of the 27B (int4, 512-token prompt, measured 2026-10-09, `rocprofv3 --kernel-trace`)
+
+Kernel time per prefill call is ~2.9 s (TTFT 2.97 s):
+
+| kernel | per prefill | share |
+|---|---|---|
+| `_wmma_q4_kernel_` (int4 GEMM, 401 launches; ~20 TFLOPS in the model, 40% of the 51 TFLOPS f16 peak) | 1,333 ms | 46% |
+| `_delta_rule_kernel_` (48 linear-attention layers, ~23 ms each) | **1,102 ms** | **38%** |
+| broadcast (unfused elementwise, 1,200 launches) | ~137 ms | 5% |
+| rocBLAS f32 GEMM `Cijk_...MT32x32x8` (129 launches) | ~104 ms | 4% |
+| `fill_kernel` (zero_tensor, ~2,000 launches), `linear_copy` (640), `permutedims` (190) | ~160 ms | 5% |
+| reduce, rmsnorm, causal conv, rotary | ~45 ms | 2% |
+
+WMMA peaks measured on this chip (20 CUs, register-only loops, `llvm.amdgcn.wmma.*`): **f16 51-52 TFLOPS,
+int8 (iu8) 55-57 TOPS**, i.e. int8 is only ~8-10% faster than f16 (gufo measures 55 TOPS int8 too). So int8
+prefill's value is lower operand traffic (half the LDS/register bytes, per-block scales applied after the
+integer MMA), not a 2x MMA rate; the GEMM gap is blocking: ours reaches 25-40% of peak, gufo's W8A8 kernel
+58% (128x128 block, 8 waves).
+
+**The DeltaRule kernel is the biggest single item and is cheap to fix.** `_delta_rule_kernel!` launches one
+workgroup per (value head, batch), 48 workgroups on a 20-CU GPU, and every token step reads and writes the
+head's 128x128 Float32 state (64 KB) in global memory (`st[j, i, h, b]`, ~45 us per step). Thread j owns one
+column of the state, so those 128 floats can stay in registers for the whole sequence (state loaded once,
+written back at the end); per-step work is ~400 FMAs per thread from registers plus the shared q/k vectors.
+Expected: ~23 ms -> well under 2 ms per layer, i.e. ~1 s off a 3 s prefill (and the same state-traffic
+saving, ~1 ms, on each decode step). For long prompts a chunked (WY / matrix) form would parallelize over
+the sequence as well; gufo's `prefill_ssm.hip` and `batched_ssm.hip` are the references.
+
+Order of work for prefill (largest first): (1) DeltaRule register-resident state (~1.0 s); (2) GEMM blocking
+toward ~58% of peak, optionally W8A8 (~0.5 s); (3) the ~0.3 s of small kernels: stop zero-filling outputs
+that are fully overwritten (`fill_kernel`), fuse the broadcasts, avoid the copies/permutes.
