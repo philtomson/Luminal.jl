@@ -763,26 +763,32 @@ end
 Base.propertynames(::LlamaKVCacheState) = (fieldnames(LlamaKVCacheState)..., :step_pos)
 
 """
-    LlamaKVCacheState(n_layers, n_kv_heads, head_dim; batch=1, max_seq=2048, device=CPUDevice())
+    LlamaKVCacheState(n_layers, n_kv_heads, head_dim; batch=1, max_seq=2048, device=CPUDevice(), kv_dtype=Float32)
+
+`kv_dtype=Float16` halves the cache; the attention kernels read and write it in Float32.
 """
 function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
                             batch::Int=1, max_seq::Int=2048,
-                            device::Luminal.AbstractDevice=Luminal.CPUDevice())
-    self = [(Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch),
-             Luminal.zero_tensor(device, Float32, head_dim, max_seq, n_kv_heads, batch))
+                            device::Luminal.AbstractDevice=Luminal.CPUDevice(),
+                            kv_dtype::Type=Float32)
+    self = [(Luminal.zero_tensor(device, kv_dtype, head_dim, max_seq, n_kv_heads, batch),
+             Luminal.zero_tensor(device, kv_dtype, head_dim, max_seq, n_kv_heads, batch))
             for _ in 1:n_layers]
     return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
 end
 
 """
-    LlamaKVCacheState(model; batch=1, max_seq=2048, device=CPUDevice())
+    LlamaKVCacheState(model; batch=1, max_seq=2048, device=CPUDevice(), kv_dtype=Float32)
 
-The decode-step state buffers of `model`: a K/V cache per attention layer, and
-the convolution and recurrent states of a recurrent (Gated DeltaNet) layer.
+The decode-step state buffers of `model`: a K/V cache per attention layer (stored as
+`kv_dtype`), and the convolution and recurrent states of a recurrent (Gated DeltaNet)
+layer, which stay Float32.
 """
 function LlamaKVCacheState(model; batch::Int=1, max_seq::Int=2048,
-                           device::Luminal.AbstractDevice=Luminal.CPUDevice())
-    self = [Tuple(Luminal.zero_tensor(device, Float32, s...) for s in _state_shapes(l, max_seq, batch))
+                           device::Luminal.AbstractDevice=Luminal.CPUDevice(),
+                           kv_dtype::Type=Float32)
+    self = [Tuple(Luminal.zero_tensor(device, _is_state_layer(l) ? Float32 : kv_dtype, s...)
+                  for s in _state_shapes(l, max_seq, batch))
             for l in model.layers]
     return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
 end
@@ -873,7 +879,8 @@ function build_llama_decode_step!(model,
                                    step_pos::Luminal.DimType;
                                    max_seq::Int=2048,
                                    batch::Int=1,
-                                   rope_base::Float32=500000f0)
+                                   rope_base::Float32=500000f0,
+                                   kv_dtype::Type=Float32)
     # ── Inputs ────────────────────────────────────────────────────────────────
     token_in = Luminal.tensor(graph, [1, batch])
     pos_tensor = Luminal.tensor(graph, [batch])   # each sequence's position
@@ -881,8 +888,11 @@ function build_llama_decode_step!(model,
 
     # per layer: the K/V cache, or a recurrent layer's two state buffers
     shapes = [_state_shapes(l, max_seq, batch) for l in model.layers]
-    self_k_tensors = [Luminal.tensor(graph, s[1]) for s in shapes]
-    self_v_tensors = [Luminal.tensor(graph, s[2]) for s in shapes]
+    # (declared with the cache's element type: the executor converts an input of any other type
+    # to the declared one, which would hand the attention kernel a copy instead of the cache)
+    cdt(l) = _is_state_layer(l) ? Float32 : kv_dtype
+    self_k_tensors = [Luminal.tensor(graph, s[1]; dtype=cdt(l)) for (s, l) in zip(shapes, model.layers)]
+    self_v_tensors = [Luminal.tensor(graph, s[2]; dtype=cdt(l)) for (s, l) in zip(shapes, model.layers)]
 
     # ── Embedding ─────────────────────────────────────────────────────────────
     x = _embed(model, token_in)  # (hidden, 1, batch)

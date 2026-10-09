@@ -45,3 +45,24 @@ Luminal.get_device() isa CPUDevice || push!(devices, Luminal.get_device())
     single = [only(generate_ids(s, [p]; max_new_tokens=6)) for p in ps]
     @test batched == single
 end
+
+# A Float16 K/V cache (kv_dtype=Float16; the recurrent states stay Float32) gives the same
+# tokens and logits to within Float16 rounding. The compiled decode graph must declare the
+# cache inputs as Float16, or the executor feeds the kernel a Float32 copy and the new K/V
+# never reach the cache (the logits then drift away after the first decode step).
+@testset "Float16 KV cache ($(nameof(typeof(dev))))" for dev in devices
+    model = model_template(REF)
+    ids = Int.(refarr("ids")); prompts = [ids[:, b] for b in 1:size(ids, 2)]
+    function run(kv)
+        s = LlamaSession(model, nothing, REF; max_seq=32, decode_weights=Float32, device=dev, kv_dtype=kv)
+        steps = Matrix{Float32}[]
+        gen = generate_ids(s, prompts; max_new_tokens=8, step_logits=steps)
+        gen, steps, s
+    end
+    g32, st32, _ = run(Float32)
+    g16, st16, s16 = run(Float16)
+    cache = only(values(s16.decode)).cache.self_cache
+    @test [eltype(c[1]) for c in cache] == [Float32, Float32, Float32, Float16]   # states stay Float32
+    @test g16 == g32
+    @test all(relerr(st16[k], st32[k]) < 1e-3 for k in eachindex(st32))
+end

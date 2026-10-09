@@ -35,7 +35,7 @@ end
 
 """
     LlamaSession(model, tokenizer, model_dir; max_seq=2048, rope_base=model.rope_base,
-                 device=nothing, search=:none, decode_weights=nothing)
+                 device=nothing, search=:none, decode_weights=nothing, kv_dtype=Float32)
 
 A loaded Llama-style model for repeated generation. The weights are read once;
 compiled graphs are built on first use and kept:
@@ -52,6 +52,7 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
 - `tokenizer`     : a `LlamaTokenizer` loaded from the model directory
 - `model_dir`     : directory containing the `.safetensors` weights
 - `max_seq`       : KV cache capacity per sequence (default 2048)
+- `kv_dtype`      : element type of the K/V caches (default Float32; Float16 halves them)
 - `rope_base`     : RoPE base frequency; defaults to the model's (see `llama_config`)
 - `device`        : device to run on; defaults to `get_device()`
 - `search`        : `:none`, `:static` or `:measured`: compile the graphs through the
@@ -85,12 +86,13 @@ mutable struct LlamaSession{M, D}
     decode_weights::Any              # a Type, or name -> Type (per tensor)
     prefill::Dict{Tuple{Int,Int}, Any}   # (padded length, batch) => compiled prefill
     decode::Dict{Int, Any}               # batch => compiled decode step and its cache
+    kv_dtype::DataType                   # element type of the K/V caches
 end
 
 function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_dir::String;
                       max_seq::Int=2048, rope_base::Real=model.rope_base, device=nothing,
                       search::Symbol=:none, decode_weights=nothing, awq=nothing,
-                      weight_storage=nothing, weights=nothing)
+                      weight_storage=nothing, weights=nothing, kv_dtype::Type=Float32)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
     # weight_storage: load straight into reduced precision (prefill and decode both
@@ -107,7 +109,7 @@ function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_di
     end
     awq === nothing || awq_apply!(weights, awq, model)
     return LlamaSession(model, tokenizer, weights, dev, max_seq, Float32(rope_base), search, wdtype,
-                        Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}())
+                        Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}(), kv_dtype)
 end
 
 Base.show(io::IO, s::LlamaSession) =
@@ -150,7 +152,7 @@ function _decode_graph(s::LlamaSession, B::Int)
     get!(s.decode, B) do
         g = Base.invokelatest(Graph); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
-        idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base)
+        idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
                       idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
@@ -177,7 +179,7 @@ function _decode_graph(s::LlamaSession, B::Int)
                     capture=capture, search=s.search,
                     precision=wd === Luminal.Int4 ? :int4 : wd === Int8 ? :int8 : wd === Float16 ? :weights : false)
         end
-        cache = LlamaKVCacheState(s.model; batch=B, max_seq=s.max_seq, device=s.device)
+        cache = LlamaKVCacheState(s.model; batch=B, max_seq=s.max_seq, device=s.device, kv_dtype=s.kv_dtype)
         (exec=exec, idg=idg, cache=cache)
     end
 end

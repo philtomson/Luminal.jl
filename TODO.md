@@ -308,3 +308,33 @@ and `info/inference-tile-sizing-autotuning.md`; none of it has been tested here.
 - [ ] **Measurement practice.** Measure each component, then re-measure the whole
   workload; a layer-0 saving does not extrapolate (keep using `rocprofv3` and
   `debug_decode.jl`).
+
+## Long context for Qwen3.6-27B (262,141 tokens)
+
+Goal: load Qwen3.6-27B at its full 262,141-token context and measure prefill and decode.
+Memory at full context: int8 weights ~28 GB + K/V cache of the 16 full-attention layers
+(2 x 4 kv heads x 256 x 262,144 positions) = 34 GB in Float32, 17 GB in Float16.
+
+- [x] **Float16 K/V cache** (`LlamaSession(...; kv_dtype=Float16)`,
+  `LlamaKVCacheState(...; kv_dtype=)`, `build_llama_decode_step!(...; kv_dtype=)`): the
+  recurrent states stay Float32; the decode kernel reads/writes it as Float32. The decode
+  graph must declare the cache inputs with the cache's dtype: the executor converts any
+  input to its declared dtype, so a Float16 cache under a Float32 declaration was silently
+  replaced by a Float32 copy and the new K/V never reached it (logits drifted after the
+  first decode step). TinyLlama: identical text, logit relerr ~1e-4; test in
+  `tests/test_qwen35_model.jl`.
+- [ ] **Decode attention is capped at 8,191 positions** (`DECODE_ATTN_MAX_CTX = 8192`: the
+  per-head score buffer is workgroup-local memory). Longer caches raise an error, so full
+  context needs a chunked (flash-decoding) kernel: per-chunk partial max/sum/output, then a
+  combine pass; keep `write_cache`, `window` and batch semantics; test against the current
+  kernel.
+- [ ] **Long prompts in prefill**: check that Qwen3.5 prefill attention does not build
+  slen x slen scores per head (FlashAttentionOp?), and the other prefill intermediates.
+- [ ] **Memory peak while loading/compiling the 27B**: with 73 GB available at the start,
+  available memory fell to 5 GB (run killed by the watchdog) in the first benchmark run at
+  max_seq=8191, between the end of the load (~170 s) and the first prefill; the earlier run
+  at max_seq=1024 survived (>= 8 GB). Find which allocation (GGUF read buffers? graph
+  intermediates with `free_intermediates=false`? the decode graph at max_seq 8191?) before
+  running again; log memory per stage (`AMDGPU.memory_status`, `free`).
+- [ ] `examples/qwen35_gguf_bench.jl`: prefill TTFT and decode TPOT at several prompt
+  lengths (Float16 K/V by default); first real numbers still to come.
