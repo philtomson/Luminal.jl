@@ -1,7 +1,8 @@
 # WMMA (matrix-core) GEMM for prefill on gfx11 (RDNA3 / 3.5; kernels in src/WMMA.jl),
 # versus the GEMMs Luminal used before: rocBLAS gemm_ex (Float16 weights, Float32
 # accumulation and output) and sgemm (Float32 weights); for int8 weights, versus
-# dequantizing to a Float32 matrix and sgemm (`_dequant_gemm!`).
+# int8 and 4-bit weights, versus dequantizing to a Float32 matrix and sgemm
+# (`_dequant_gemm!`).
 #
 # Usage: julia --project=. benchmarks/wmma_gemm.jl
 #
@@ -64,6 +65,19 @@ function main()
         ref = Array(C0)
         err = maximum(abs.(Array(C1) .- ref)) / maximum(abs.(ref))
         tw = bench(() -> Luminal._wmma_q8_gemm!(C1, qw, X, nothing))
+        td = bench(() -> Luminal._dequant_gemm!(C0, qw, X, nothing); n = 5)
+        fl = 2.0 * M * N * K
+        println("Out=$M In=$K N=$N  err vs sgemm=$(round(err, sigdigits=2)) | $(ms(tw)) ms $(tf(fl, tw)) TF | $(ms(td)) ms $(tf(fl, td)) TF")
+    end
+    println("--- 4-bit weights (group 32, symmetric): WMMA | dequantize + sgemm")
+    for (M, K, N) in shapes
+        K > 8192 && continue
+        qw = Luminal.Q4Weight(ROCArray(randn(Float32, M, K)); group = 32)
+        X = ROCArray(randn(Float32, K, N)); C1 = AMDGPU.zeros(Float32, M, N); C0 = similar(C1)
+        Luminal._wmma_q4_gemm!(C1, qw, X, nothing); Luminal._dequant_gemm!(C0, qw, X, nothing); AMDGPU.synchronize()
+        ref = Array(C0)
+        err = maximum(abs.(Array(C1) .- ref)) / maximum(abs.(ref))
+        tw = bench(() -> Luminal._wmma_q4_gemm!(C1, qw, X, nothing))
         td = bench(() -> Luminal._dequant_gemm!(C0, qw, X, nothing); n = 5)
         fl = 2.0 * M * N * K
         println("Out=$M In=$K N=$N  err vs sgemm=$(round(err, sigdigits=2)) | $(ms(tw)) ms $(tf(fl, tw)) TF | $(ms(td)) ms $(tf(fl, td)) TF")

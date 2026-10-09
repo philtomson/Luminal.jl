@@ -127,6 +127,56 @@ function _wmma_q8_kernel!(C, Qv, Sc, Bv, K, N, group)
     return
 end
 
+# 16 4-bit codes (8 bytes: even k in the low nibble) of one weight row, dequantized as
+# q * scale + min, as two chunks of 8 halves.
+@inline function _wmma_nib(b::NTuple{8,UInt8}, i::Int)::Float32
+    x = @inbounds b[(i + 1) >> 1]
+    return Float32(isodd(i) ? (x & 0x0f) : (x >> 0x04))
+end
+@inline _wmma_dq4(b::NTuple{8,UInt8}, s::Float32, m::Float32) =
+    (ntuple(i -> VecElement(Float16(_wmma_nib(b, i) * s + m)), Val(8)),
+     ntuple(i -> VecElement(Float16(_wmma_nib(b, i + 8) * s + m)), Val(8)))
+
+# 4-bit weights (Q4Weight): Pv (K/32, M) of 32 codes along K (16 bytes) = one K tile per
+# chunk, Sc / Mn (K/group, M) Float16 scales and minimums (Mn = Sc and ignored when
+# symmetric: min = -8 * scale). Two threads share each row's chunk and dequantize 16
+# codes each into LDS.
+function _wmma_q4_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}) where {SYM}
+    tid = workitemIdx().x - 1
+    l = tid % 32; r = l % 16; h = l ÷ 16; w = tid ÷ 32
+    wm = (w % 2) * 32; wn = (w ÷ 2) * 32
+    bm = (workgroupIdx().y - 1) * 64; bn = (workgroupIdx().x - 1) * 64
+    As = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
+    Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
+    acc = _wmma_zeros()
+    arow = tid ÷ 2; ah = tid % 2
+    c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 32
+    nk = K ÷ 32
+    qa = Pv[1, bm + arow + 1]; sa = Float32(Sc[1, bm + arow + 1])
+    ma = SYM ? -8f0 * sa : Float32(Mn[1, bm + arow + 1])
+    rb0 = Bv[c0 + 1, bn + row0 + 1]; rb1 = Bv[c0 + 1, bn + row1 + 1]
+    for t in 0:nk-1
+        bytes = let q = qa   # (a closure must not capture the reassigned qa)
+            ah == 0 ? ntuple(i -> q[i], Val(8)) : ntuple(i -> q[i + 8], Val(8))
+        end
+        lo, hi = _wmma_dq4(bytes, sa, ma)
+        As[2ah + 1, arow + 1] = lo; As[2ah + 2, arow + 1] = hi
+        Bs[c0 + 1, row0 + 1] = rb0; Bs[c0 + 1, row1 + 1] = rb1
+        sync_workgroup()
+        if t + 1 < nk
+            gi = (32 * (t + 1)) ÷ group + 1
+            qa = Pv[t + 2, bm + arow + 1]; sa = Float32(Sc[gi, bm + arow + 1])
+            ma = SYM ? -8f0 * sa : Float32(Mn[gi, bm + arow + 1])
+            kc = (t + 1) * 4 + c0 + 1
+            rb0 = Bv[kc, bn + row0 + 1]; rb1 = Bv[kc, bn + row1 + 1]
+        end
+        acc = _wmma_tile(acc, As, Bs, wm, wn, r)
+        sync_workgroup()
+    end
+    _wmma_store!(C, acc, bm + wm, bn + wn, r, h, N)
+    return
+end
+
 # gfx11 has the 16x16x16 f16 WMMA instruction used above (gfx12's differs).
 const _WMMA_ARCH = Ref{Union{Nothing,Bool}}(nothing)
 function wmma_supported()
@@ -163,5 +213,19 @@ function wmma_q8_gemm!(C::ROCArray{Float32,2}, Q::ROCArray{Int8,2}, scale::ROCAr
         throw(ArgumentError("wmma_q8_gemm!: need M % 64 == 0, K % 32 == 0, padded N % 64 == 0"))
     Qv = reinterpret(NTuple{16,Int8}, Q); Bv = reinterpret(WMMA_V8H, B)
     @roc groupsize=128 gridsize=(Npad ÷ 64, M ÷ 64) _wmma_q8_kernel!(C, Qv, scale, Bv, K, N, group)
+    return C
+end
+
+# C (M, N) = dequantize(P, scale, mn)' * B for the 4-bit layout of `Q4Weight`: Pv (K/32, M)
+# of NTuple{16,UInt8}, scale / mn (K/group, M) Float16 (`mn` = nothing when symmetric).
+function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
+                       group::Int, B::ROCArray{Float16,2}, N::Int)
+    K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
+    (M % 64 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
+     size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
+        throw(ArgumentError("wmma_q4_gemm!: need M % 64 == 0, group % 32 == 0, padded N % 64 == 0"))
+    Bv = reinterpret(WMMA_V8H, B)
+    @roc groupsize=128 gridsize=(Npad ÷ 64, M ÷ 64) _wmma_q4_kernel!(
+        C, Pv, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing))
     return C
 end

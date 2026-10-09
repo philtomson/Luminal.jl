@@ -62,4 +62,23 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
         Luminal._q8_matmul!(out, qw, Luminal.to_device(x, dev); residual = Luminal.to_device(r, dev))
         @test relerr(Array(out), Array(Luminal.dequantize(qw)) * Float32.(Float16.(x)) .+ r) < 2e-3
     end
+
+    @testset "4-bit Q4Weight prefill matmul takes the WMMA path" begin
+        for (Out, In, N, group, sym) in ((128, 64, 20, 32, true), (128, 128, 100, 32, false),
+                                         (192, 256, 70, 64, true), (64, 96, 17, 96, false),
+                                         (256, 512, 130, 128, false), (128, 64, 3, 32, true))
+            W = randn(Float32, Out, In); x = randn(Float32, In, N)
+            qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = group, symmetric = sym)
+            out = Luminal.zero_tensor(dev, Float32, Out, N)
+            Luminal.batch_matmul!(out, qw, Luminal.to_device(x, dev))
+            xr = N > Luminal.QUANT_GEMM_COLS ? Float32.(Float16.(x)) : x
+            @test relerr(Array(out), Array(Luminal.dequantize(qw)) * xr) < 2e-3
+        end
+        Out, In, N = 128, 128, 40
+        W = randn(Float32, Out, In); x = randn(Float32, In, N); r = randn(Float32, Out, N)
+        qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = 32)
+        out = Luminal.zero_tensor(dev, Float32, Out, N)
+        Luminal._q4_matmul!(out, qw, Luminal.to_device(x, dev); residual = Luminal.to_device(r, dev))
+        @test relerr(Array(out), Array(Luminal.dequantize(qw)) * Float32.(Float16.(x)) .+ r) < 2e-3
+    end
 end

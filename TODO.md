@@ -282,8 +282,15 @@ and `info/inference-tile-sizing-autotuning.md`; none of it has been tested here.
     `benchmarks/wmma_gemm.jl` now calls the kernels in `src/WMMA.jl` and covers int8.
     Not yet tried on the Qwen3.6-27B Q8_0 GGUF (group 32; needs ~27 GB free, so check
     memory with the other jobs first).
-  - [ ] Int4 prefill (`Q4Weight`, still `_dequant_gemm!`): same idea with 4-bit codes,
-    scale and min.
+  - [x] Int4 prefill (`Q4Weight`, `_q4_matmul!` with N > 16): `_wmma_q4_kernel!`; a K tile
+    is one 16-byte chunk per row (two threads share it, each dequantizing 16 codes as
+    q*scale+min, symmetric or not). 10-19 TFLOPS vs 0.2-1.9 for dequantize + sgemm.
+    TinyLlama int4 stored, time to first token for 512 tokens: 241 ms (was 1440 ms);
+    decode unchanged. Perplexity 13.5665 vs 13.5656 on the old path (Float32 12.1229),
+    top-1 agreement 126/153 either way (`examples/quant_eval.jl` now has an int4 row;
+    note `quant_formats.jl` fake-quantizes to Float32 and does not exercise the kernels).
+    Full suite 2164/2164.
+  - [ ] Try the Qwen3.6-27B Q8_0 GGUF (group 32): memory (~27 GB) with other jobs running.
   - [ ] Fused residual in the kernel epilogue (now a separate `C .+= residual`), M and K
     tails, gfx12 (different WMMA intrinsic), CUDA/other devices untouched.
 - [ ] **Fuse RMSNorm into the following projection for decode.** Magnitude applies the

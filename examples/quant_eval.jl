@@ -1,7 +1,7 @@
 # quant_eval.jl — accuracy of reduced-precision weights on TinyLlama.
 #
 # Runs the full model over a text passage (one prefill pass) with Float32,
-# Float16 and int8 weights, and reports perplexity on the passage's next-token
+# Float16, int8 and int4 weights, and reports perplexity on the passage's next-token
 # predictions, top-1 agreement with Float32 at every position, and the relative
 # logit error.
 #
@@ -56,7 +56,7 @@ end
 
 ref = logits_with(Float32)
 @printf("%-10s perplexity %.4f\n", "Float32", perplexity(ref))
-for (label, dt) in (("Float16", Float16), ("int8", Int8))
+for (label, dt) in (("Float16", Float16), ("int8", Int8), ("int4", Luminal.Int4))
     l = logits_with(dt)
     top1 = count(i -> argmax(l[:, i, 1]) == argmax(ref[:, i, 1]), 1:n)
     relerr = maximum(abs.(l .- ref)) / maximum(abs.(ref))
