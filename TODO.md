@@ -330,11 +330,23 @@ Memory at full context: int8 weights ~28 GB + K/V cache of the 16 full-attention
   kernel.
 - [ ] **Long prompts in prefill**: check that Qwen3.5 prefill attention does not build
   slen x slen scores per head (FlashAttentionOp?), and the other prefill intermediates.
-- [ ] **Memory peak while loading/compiling the 27B**: with 73 GB available at the start,
-  available memory fell to 5 GB (run killed by the watchdog) in the first benchmark run at
-  max_seq=8191, between the end of the load (~170 s) and the first prefill; the earlier run
-  at max_seq=1024 survived (>= 8 GB). Find which allocation (GGUF read buffers? graph
-  intermediates with `free_intermediates=false`? the decode graph at max_seq 8191?) before
-  running again; log memory per stage (`AMDGPU.memory_status`, `free`).
-- [ ] `examples/qwen35_gguf_bench.jl`: prefill TTFT and decode TPOT at several prompt
-  lengths (Float16 K/V by default); first real numbers still to come.
+- [x] **Memory while loading / compiling / running the 27B** (MemAvailable, 125 GB machine,
+  `examples/qwen35_gguf_bench.jl`, Q8_0 GGUF converted on load, Float16 K/V, max_seq 8191).
+  Int4 weights: start 76 GB available -> after load 55 GB (the model takes ~21 GB, with a
+  transient low of 42 GB during the load, ~12 GB above the steady state) -> compiling the
+  prefill and decode graphs costs ~0.1 GB (nothing is allocated until a graph first runs) ->
+  the FIRST 512-token prefill takes another ~15 GB (55 -> 40 GB) -> later calls add ~1.6 GB
+  once, then ~0.1-0.2 GB each (38 GB, flat): no unbounded growth at int4. Everything is
+  returned when the process exits. Int8 earlier: 71 GB -> 36.5 GB after load (~35 GB) -> 20 GB
+  after the first prefill, then the kernel OOM killer ended the run during the repeat calls,
+  although growth per call at int4 is tiny, so that kill is not explained (other jobs on the
+  machine also draw on the same RAM). Use int4 and a watchdog for experiments; int8 needs
+  ~15 GB more headroom. Open: why does the first prefill need ~15 GB at 512 tokens (graph
+  intermediates are kept: `free_intermediates` is off), and does it scale with prompt length?
+- [~] `examples/qwen35_gguf_bench.jl` (stage-by-stage memory log, in-process watchdog,
+  `--stop-after`, `--reclaim`): first numbers, Qwen3.6-27B int4 (g32), Float16 K/V, 512-token
+  prompt, WMMA prefill: time to first token 3.02 s = 170 tok/s prefill (~9 TFLOPS effective);
+  decode 165 ms/token = 6.1 tok/s (~82 GB/s of weight traffic, about 40% of the ~215 GB/s the
+  GEMV kernels reach on TinyLlama; floor for ~13.5 GB of int4 weights is ~63 ms). Decode is the
+  thing to look at: profile with `rocprofv3` (DeltaRule / CausalConv / small kernels x 64 layers?).
+  Not yet: longer prompts (2k, 4k, 8k), int8, WMMA on/off comparison, output sanity check.
