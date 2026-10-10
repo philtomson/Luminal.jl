@@ -448,6 +448,20 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
     new_keys = keys
     new_values = values
 
+    # Prefill on matrix cores: one fused op (online softmax, GQA inside) instead of the
+    # score matrix below. LUMINAL_FLASH=0 selects the composite form.
+    if return_kv && seq >= 16 && sa.window == 0 && sa.head_dim % 32 == 0 &&
+       sa.n_heads % sa.n_kv_heads == 0 && Luminal.wmma_enabled() && get(ENV, "LUMINAL_FLASH", "1") != "0"
+        g = x.graph_ref
+        o = Luminal.add_op!(g, Luminal.CausalAttention(Float32(sa.scale)),
+                            [(t.id, 0, t.shape) for t in (queries, keys, values)],
+                            Luminal.ShapeTracker([sa.head_dim, seq, sa.n_heads, batch]))
+        o = Luminal.permute(o, [1, 3, 2, 4])                       # (D, H, S, B)
+        o = Luminal.reshape(o, [sa.n_heads * sa.head_dim, seq, batch])
+        o = sa.o_proj(_gate_output(sa, o, gate, seq, batch))
+        return o, new_keys, new_values
+    end
+
     # Attention: (Q^T @ K) / sqrt(D)
     # GQA: Repeat KV heads to match Q heads
     if sa.n_kv_heads < sa.n_heads

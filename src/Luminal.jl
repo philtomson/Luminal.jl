@@ -18,7 +18,7 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, Floor, Ceil, Round, Trunc, Select, Div, Exp, GatherND, ScatterND, MappingGather, LutKOp, LutKBwdPinsOp, LutKDWOp, SparseMapGather, SparseMapBwdS, SparseMapBwdX, Iota, Cast, TruncCast, TruncDiv, TruncRem, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulQ4, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, SoftmaxOp, CausalConv, DeltaRule, LastToken, Function, Slice, Pad, FlashAttentionOp, Unfold
+export Op, Add, Mul, LessThan, Floor, Ceil, Round, Trunc, Select, Div, Exp, GatherND, ScatterND, MappingGather, LutKOp, LutKBwdPinsOp, LutKDWOp, SparseMapGather, SparseMapBwdS, SparseMapBwdX, Iota, Cast, TruncCast, TruncDiv, TruncRem, SumReduce, MaxReduce, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulQ4, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, SoftmaxOp, CausalConv, DeltaRule, LastToken, CausalAttention, Function, Slice, Pad, FlashAttentionOp, Unfold
 
 
 include("DTypes.jl")
@@ -42,6 +42,7 @@ export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice
 
 # Execution Engine
 include("WMMA.jl")
+include("FlashAttn.jl")
 include("Execution.jl")
 export execute
 

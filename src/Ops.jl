@@ -293,6 +293,14 @@ end
 #   language-model head run on B columns instead of S * B.
 struct LastToken <: Op end
 
+# CausalAttention: prefill self-attention, fused. Inputs q (D, S, H, B), k and v (D, S, KVH, B)
+#   (RoPE and norms applied; query head h uses KV head (h - 1) ÷ (H ÷ KVH) + 1); output
+#   (D, S, H, B) = softmax(scale * q'k + causal mask) v'. Padding positions past a prompt's end
+#   only affect themselves (causal), as in the composite form.
+struct CausalAttention <: Op
+    scale::Float32
+end
+
 # Single-token (decode) attention over a KV cache, in one kernel. Inputs:
 #   q (D, 1, H, B), past_k and past_v (D, max_seq, KVH, B), k_new and v_new
 #   (D, 1, KVH, B), pos (1,) -- the number of valid cache slots (slots >= pos are

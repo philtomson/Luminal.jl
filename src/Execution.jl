@@ -366,6 +366,16 @@ function execute_op!(out, op::LastToken, x, lens)
     return out
 end
 
+function execute_op!(out, op::CausalAttention, q, k, v)
+    D = size(q, 1)
+    if out isa AMDGPU.ROCArray && wmma_supported() && D % 32 == 0
+        flash_prefill!(out, q, k, v, op.scale)
+    else
+        copyto!(out, causal_attention_ref(q, k, v, op.scale))
+    end
+    return out
+end
+
 function execute_op!(out, op::CausalConv, x, state, w, lens)
     C, S, B = size(x, 1), size(x, 2), size(x, 3)
     K = size(w, 3)
