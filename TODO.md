@@ -612,3 +612,13 @@ The draft step was 5.4 ms, 3 ms of it the 248k-row lm_head read. `MTPDrafter(s; 
 scores only token ids 0..N-1 (the BPE's most frequent) with a row-sliced copy of the head ("mtp.draft_head"), 165 MB at
 32768. On the 27B with N=32768: MTP steps 395 -> 178 ms over 73 cycles (5.4 -> 2.4 ms), acceptance unchanged (74%),
 output identical; ~18.9 tok/s (from 18.05, derived from the phase times). Default is still the full vocabulary (0).
+
+### Verify-step overhead, profiled (rocprofv3, full 27B, 40 steps each)
+Plain step 82.5 ms wall / 76.9 GPU-busy; verify step 91.5 / 85.1. The extra ~8 ms of GPU time:
+- int4 GEMV at 2 columns: +6.5 ms (75.2 vs 68.6). Standalone the 4-row kernel is only 3-6% over 1 column at the 27B's
+  shapes (gate/up 236 vs 224 us), in-graph 8-9% (248 vs 230); the WMMA skinny kernel is slower at N=2 (333 us), so the
+  GEMV is near its floor for 2 columns.
+- DeltaRule +0.85 ms: the 150 MB snapshot write (3 MB per layer) at memory speed; avoiding it would need an inverse update.
+- gpu_linear_copy / permutedims +0.4 ms: reshape(slice(qkv)) of q, k, v is a view at S=1 but a copy at S=2 (3 per layer).
+- ArgMax +0.34 ms: one workgroup per column over 248k. Fixed: 64 workgroups per column plus a merge kernel, 182 -> 17 us.
+The wall-minus-GPU gap (~5.6 ms) is launch gaps between ~1000 kernels, the same in both steps.

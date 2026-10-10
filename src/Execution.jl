@@ -417,6 +417,74 @@ end
     lid == 1 && (@inbounds out[s, b] = Float32(ri[1] - 1))
 end
 
+# Wide vocabularies: P workgroups per column each scan a strided slice (one workgroup per column leaves
+# the GPU idle: 0.34 ms for 2 columns of 248k), then a second kernel merges the P partial results.
+const ARGMAX_PARTS = 64
+const _ARGMAX_WORKSPACE = Dict{Any, Any}()
+@kernel function _argmax_part_kernel!(pv, pidx, @Const(x), ::Val{P}) where {P}
+    grp = @index(Group, Linear); lid = @index(Local, Linear)
+    T = @uniform @groupsize()[1]
+    V = @uniform size(x, 1)
+    g = grp - 1
+    col = g ÷ P
+    part = g % P
+    s = col % size(x, 2) + 1
+    b = col ÷ size(x, 2) + 1
+    rv = @localmem Float32 (256,)
+    ri = @localmem Int32 (256,)
+    bv = -Inf32; bi = Int32(typemax(Int32))
+    i = part * T + lid
+    while i <= V
+        @inbounds v = x[i, s, b]
+        if v > bv || (v == bv && Int32(i) < bi)
+            bv = v; bi = Int32(i)
+        end
+        i += P * T
+    end
+    @inbounds rv[lid] = bv; @inbounds ri[lid] = bi
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        if lid <= stride
+            @inbounds ov = rv[lid + stride]; @inbounds oi = ri[lid + stride]
+            @inbounds cv = rv[lid]; @inbounds ci = ri[lid]
+            if ov > cv || (ov == cv && oi < ci)
+                @inbounds rv[lid] = ov; @inbounds ri[lid] = oi
+            end
+        end
+        @synchronize
+        stride ÷= 2
+    end
+    if lid == 1
+        @inbounds pv[part + 1, col + 1] = rv[1]; @inbounds pidx[part + 1, col + 1] = ri[1]
+    end
+end
+
+@kernel function _argmax_final_kernel!(out, @Const(pv), @Const(pidx), ::Val{P}) where {P}
+    col = @index(Group, Linear); lid = @index(Local, Linear)
+    bv = -Inf32; bi = Int32(typemax(Int32))
+    if lid <= P
+        @inbounds bv = pv[lid, col]; @inbounds bi = pidx[lid, col]
+    end
+    rv = @localmem Float32 (P,)
+    ri = @localmem Int32 (P,)
+    lid <= P && (@inbounds rv[lid] = bv; @inbounds ri[lid] = bi)
+    @synchronize
+    stride = P ÷ 2
+    while stride > 0
+        if lid <= stride
+            @inbounds ov = rv[lid + stride]; @inbounds oi = ri[lid + stride]
+            @inbounds cv = rv[lid]; @inbounds ci = ri[lid]
+            if ov > cv || (ov == cv && oi < ci)
+                @inbounds rv[lid] = ov; @inbounds ri[lid] = oi
+            end
+        end
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds out[col] = Float32(ri[1] - 1))
+end
+
 function execute_op!(out, op::ArgMax, x)
     V, S, B = size(x, 1), size(x, 2), size(x, 3)
     if !(out isa AnyGPUArray)
@@ -425,7 +493,18 @@ function execute_op!(out, op::ArgMax, x)
         end
         return out
     end
-    _argmax_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x); ndrange = S * B * 256)
+    backend = KernelAbstractions.get_backend(out)
+    if V >= 32 * 256 * ARGMAX_PARTS ÷ 8 && ispow2(ARGMAX_PARTS) && get(ENV, "LUMINAL_ARGMAX_PARTS", "1") != "0"
+        P = ARGMAX_PARTS; ncol = S * B
+        # (reused across calls: a captured graph bakes in the pointers)
+        pv, pidx = get!(_ARGMAX_WORKSPACE, (typeof(out), ncol)) do
+            (similar(out, Float32, P, ncol), similar(out, Int32, P, ncol))
+        end
+        _argmax_part_kernel!(backend, 256)(pv, pidx, _dense(x), Val(P); ndrange = ncol * P * 256)
+        _argmax_final_kernel!(backend, P)(Base.reshape(out, :), pv, pidx, Val(P); ndrange = ncol * P)
+        return out
+    end
+    _argmax_kernel!(backend, 256)(out, _dense(x); ndrange = S * B * 256)
     return out
 end
 

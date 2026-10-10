@@ -73,7 +73,7 @@ end
 end
 
 @testset "ArgMax op ($(nameof(typeof(dev))))" for dev in devs
-    for (V, S, B) in ((1000, 2, 1), (257, 3, 2), (248320, 2, 1), (5, 1, 1))
+    for (V, S, B) in ((1000, 2, 1), (257, 3, 2), (248320, 2, 1), (100003, 3, 2), (5, 1, 1))
         x = randn(Float32, V, S, B)
         x[V ÷ 2, 1, 1] = 100f0; x[V, 1, 1] = 100f0           # a tie: the first one wins
         out = Luminal.zero_tensor(dev, Float32, S, B)
