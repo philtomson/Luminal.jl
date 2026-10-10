@@ -524,3 +524,23 @@ activations: 4 per DeltaNet layer, 2 per MLP), remaining fills ~1.7, assorted 3-
 causal conv 0.7, rmsnorm 1.1, embedding gather 1.5 (once per prefill). The GEMM is now the whole story: ~27 of 51 TFLOPS.
 Ideas left, by size: GEMM efficiency (W8A8 / better tiling); one Float16 conversion shared by the GEMMs of a block
 (needs a graph-level cast node); gate+up as one GEMM with a SwiGLU epilogue; fuse the DeltaNet gates.
+
+### int4 GEMM tiling, round 2 (2026-10-10)
+
+27B (int4, 512 tokens): 1.21 s -> **1.18 s** (433 tok/s; other jobs load the machine, run-to-run noise is ~3%); on the
+4-layer slice 89-90 ms -> 80.8 ms (-10%); standalone GEMM 23-26 -> 28-29 TFLOPS (+12-20% in the same run).
+- `_wmma_q4_wide_kernel!`: 128 x 256 block, 16 waves (512 threads, each wave 32 x 64), used when M % 128 == 0 and the
+  padded N % 256 == 0 (the executor pads N >= 384 to 256, N >= 192 to 128). The dequantized weight tile now feeds 256
+  columns and all 512 threads share the dequantization (one 32-bit word = 8 codes each); LDS is double-buffered (60 KB),
+  one barrier per K tile; a K-tile register prefetch queue (`WMMA_Q4_PD`, depth 1 is best; 4+ spills).
+  `LUMINAL_WMMA_WIDE=0` selects the 128x128 kernel. `@inbounds` in all the WMMA kernels (cuts exec-mask code; no speed change).
+- How the bottleneck was found (probe kernels, scratchpad): removing the loop's global loads gives 26 -> 40 TFLOPS but
+  that also lets LLVM hoist the (then loop-invariant) dequantization, so it is mostly the dequantization ALU work
+  (~28% of the 128x128 kernel; ~5% now). LDS fragment reads, barriers and B loads cost ~5% each; contiguous (repacked)
+  weight loads gave nothing. All-overheads-removed ceiling of this structure is ~43 TFLOPS (51 peak).
+- Not done: **W8A8 int8**. gufo's blocked W8A8 kernel reaches 58% of the int8 peak (~32 TOPS) and ours is at 57% of the f16
+  peak; the int8 WMMA is only 8-10% faster than f16 and each K32 block's int32 accumulators need scale conversion
+  (cvt + 2 fma per accumulator element, ~75% as many VALU cycles as the WMMAs themselves), so it should not beat the
+  f16 path, and activation quantization costs accuracy. Skipped unless a probe shows otherwise.
+- Remaining headroom (29 vs ~43): LDS traffic (24 `ds_load_b128` per wave per 16 WMMAs) and the 2 waits per tile.
+  Larger wave tiles (64x64) need > 192 VGPRs (AMDGPU.jl cannot raise the limit).
