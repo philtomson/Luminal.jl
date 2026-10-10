@@ -353,6 +353,19 @@ _silu(x) = x / (1 + exp(-x))
     end
 end
 
+@kernel function _last_token_kernel!(out, @Const(x), @Const(lens))
+    I = @index(Global, Cartesian)
+    h = I[1]; b = I[3]
+    t = clamp(Int(lens[b]), 1, size(x, 2))
+    @inbounds out[h, 1, b] = x[h, t, b]
+end
+
+function execute_op!(out, op::LastToken, x, lens)
+    length(out) == 0 && return out
+    _last_token_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x), _dense(lens); ndrange=size(out))
+    return out
+end
+
 function execute_op!(out, op::CausalConv, x, state, w, lens)
     C, S, B = size(x, 1), size(x, 2), size(x, 3)
     K = size(w, 3)

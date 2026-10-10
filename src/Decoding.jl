@@ -127,7 +127,9 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
         input = Luminal.tensor(g, [slen, B])
         # recurrent layers (Qwen3.5) consume each prompt only up to its length
         lens = NN._needs_lens(m) ? Luminal.tensor(g, [B]) : nothing
-        out, kvs = lens === nothing ? m(input, 0; return_kv=true) : m(input, 0; return_kv=true, lens=lens)
+        last_only = NN._prefill_last_only(m)
+        out, kvs = lens === nothing ? m(input, 0; return_kv=true) :
+                   last_only ? m(input, 0; return_kv=true, lens=lens, last_only=true) : m(input, 0; return_kv=true, lens=lens)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(out.id, [t.id for kv in kvs for t in kv])
         on_gpu = s.device isa Luminal.AbstractGPUDevice
@@ -143,7 +145,7 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
                     precision=on_gpu, search_inputs=Dict{Int,Any}(input.id => ids))
         end
         (exec=exec, input_id=input.id, out_id=out.id, kv_ids=[(k.id, v.id) for (k, v) in kvs],
-         lens_id=lens === nothing ? 0 : lens.id)
+         lens_id=lens === nothing ? 0 : lens.id, last_only=last_only)
     end
 end
 
@@ -242,10 +244,11 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
         pins[a], pins[b] = cache.self_cache[i]
     end
     res = pf.exec(pins; device=s.device)
-    logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B)
+    logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B), or (vocab, 1, B)
+    lastpos(b) = pf.last_only ? 1 : plens[b]
     eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
-    generated = [[argmax(view(logits, :, plens[b], b)) - 1] for b in 1:B]   # 0-indexed
-    last_logits === nothing || append!(last_logits, [logits[:, plens[b], b] for b in 1:B])
+    generated = [[argmax(view(logits, :, lastpos(b), b)) - 1] for b in 1:B]   # 0-indexed
+    last_logits === nothing || append!(last_logits, [logits[:, lastpos(b), b] for b in 1:B])
     done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
     # KV cache: sequence b's next token goes to position plens[b]. Slots past a

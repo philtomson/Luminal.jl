@@ -178,7 +178,8 @@ it are padding). With `return_kv`, `states[i]` is layer i's (K, V) outputs for
 a full layer, or its (conv, rec) state *inputs* for a linear layer: bind those
 to the state buffers, which the prefill leaves at the prompts' end.
 """
-function (m::Qwen35)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false, lens::Luminal.GraphTensor)
+function (m::Qwen35)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false, lens::Luminal.GraphTensor,
+                     last_only::Bool=false)
     prev_seq == 0 || error("Qwen35 prefill starts from empty states (prev_seq = 0)")
     g = input.graph_ref
     B = Luminal.realized_dims(input.shape)[2]
@@ -198,12 +199,18 @@ function (m::Qwen35)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=
         x = x + a
         x = x + layer.feed_forward(layer.post_attention_norm(x))
     end
+    if last_only   # logits at each sequence's position lens[b] only: (vocab, 1, B)
+        H, S, _ = Luminal.realized_dims(x.shape)
+        x = Luminal.add_op!(g, Luminal.LastToken(), [(x.id, 0, x.shape), (lens.id, 0, lens.shape)],
+                            Luminal.ShapeTracker([H, 1, B]))
+    end
     logits = m.head(m.norm(x))
     return return_kv ? (logits, states) : logits
 end
 
 # decode-step hooks (see build_llama_decode_step!)
 _needs_lens(::Qwen35) = true
+_prefill_last_only(::Qwen35) = true
 _state_shapes(l::Qwen35Block, max_seq, batch) =
     l.kind === :linear ? deltanet_state_shapes(l.mixer, batch) :
     ([l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch], [l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch])

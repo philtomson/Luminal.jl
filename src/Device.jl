@@ -8,7 +8,7 @@ using GPUArrays
  
 export AbstractDevice, CPUDevice, AbstractGPUDevice, CUDADevice, AMDDevice, 
        get_device, to_device, from_device, execute_with_capture,
-       reclaim!, available_memory, zero_tensor, synchronize_device
+       reclaim!, available_memory, zero_tensor, uninit_tensor, synchronize_device
  
 abstract type AbstractDevice end
  
@@ -170,6 +170,15 @@ zero_tensor(::CPUDevice, dtype, dims...) = zeros(dtype, dims...)
 zero_tensor(::CUDADevice, dtype, dims...) = CUDA.fill(dtype(0), dims...)
 zero_tensor(::AMDDevice, dtype, dims...) = AMDGPU.fill(dtype(0), dims...)
 # zero_tensor(::VulkanDevice, dtype, dims...) = zeros(dtype, dims...)
+
+"""
+    uninit_tensor(device, dtype, dims...)
+
+Allocate a tensor whose contents are unspecified, for outputs an op overwrites completely
+(on the GPU this skips the fill kernel `zero_tensor` launches).
+"""
+uninit_tensor(device, dtype, dims...) = zero_tensor(device, dtype, dims...)
+uninit_tensor(::AMDDevice, dtype, dims...) = AMDGPU.ROCArray{dtype}(undef, dims...)
  
 """
     execute_with_capture(device, f, cache)

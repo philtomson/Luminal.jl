@@ -287,6 +287,12 @@ struct DeltaRule <: Op
     fresh::Bool
 end
 
+# LastToken: out (H, 1, B) holds each sequence's hidden state at its last real position,
+#   out[:, 1, b] = x[:, lens[b], b] (clamped to 1:S), for x (H, S, B) and lens (B,).
+#   A prefill needs the logits of those positions only, so the final norm and the
+#   language-model head run on B columns instead of S * B.
+struct LastToken <: Op end
+
 # Single-token (decode) attention over a KV cache, in one kernel. Inputs:
 #   q (D, 1, H, B), past_k and past_v (D, max_seq, KVH, B), k_new and v_new
 #   (D, 1, KVH, B), pos (1,) -- the number of valid cache slots (slots >= pos are

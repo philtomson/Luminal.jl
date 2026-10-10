@@ -930,6 +930,8 @@ end
 # `lens` input, and one decoder layer.
 _embed(model, tokens) = model.embedding(tokens)
 _needs_lens(model) = false
+# true if the model's prefill (called with `last_only=true`) returns only each prompt's last position's logits
+_prefill_last_only(model) = false
 _is_state_layer(layer) = false
 _state_shapes(layer, max_seq, batch) =
     (a = layer.attention; ([a.head_dim, max_seq, a.n_kv_heads, batch], [a.head_dim, max_seq, a.n_kv_heads, batch]))

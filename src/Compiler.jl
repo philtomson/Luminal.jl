@@ -150,11 +150,11 @@ end
 # sized by a dynamic dim (e.g. decode context length) change size every run and
 # GPU allocation is slow, so they are served as a reshaped prefix of a backing
 # buffer that only regrows (with 50% headroom).
-function _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, T=Float32)
+function _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, T=Float32; zero=true)
     isassigned(res, node_id) && res[node_id] !== nothing && size(res[node_id]) == sz && return
     if free_intermediates || !(dev isa Luminal.AbstractGPUDevice)
         isassigned(res, node_id) && res[node_id] !== nothing && _release!(res, node_id, owned)
-        res[node_id] = Luminal.zero_tensor(dev, T, sz...)
+        res[node_id] = zero ? Luminal.zero_tensor(dev, T, sz...) : Luminal.uninit_tensor(dev, T, sz...)
     else
         n = prod(sz)
         if backing[] === nothing || length(backing[]) < n
@@ -166,6 +166,11 @@ function _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermedia
         res[node_id] = Base.reshape(view(backing[], 1:n), sz)
     end
 end
+
+# Ops whose `execute_op!` writes every element of the output, so it needs no zero fill.
+_writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa Luminal.Reshape ||
+    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp ||
+    op isa Luminal.RotaryEmbed || op isa Luminal.SoftmaxOp || op isa Luminal.LastToken
 
 # True if a consumer reads node `id` through `st` exactly as produced (no
 # permute, slice, pad or broadcast), so `id` can be fused into that consumer.
@@ -886,7 +891,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         res[node_id] = nothing
                         aliased[] = false
                     end
-                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
+                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, graph.dtypes[node_id]; zero=!_writes_all(op))
                 end
 
                 # 3. Execute
@@ -930,7 +935,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
                     args = [align_rank(realize_view(res[id], in_sts[k]), target_rank) for (k, (id, _, _)) in enumerate(group_inputs)]
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
-                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates, graph.dtypes[node_id])
+                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates, graph.dtypes[node_id]; zero=false)
 
                     Base.invokelatest(execute_op!, res[node_id], fused_op, args...)
 

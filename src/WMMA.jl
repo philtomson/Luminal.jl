@@ -203,16 +203,20 @@ end
 # A tile is shared by twice as many columns as in the 64x64 kernel, and a wave does 8
 # WMMAs per 6 LDS fragment loads (4 per 4 before).
 @inline function _wmma_tile_big(acc::NTuple{8,WMMA_V8F}, As, Bs, wm, wn, r)
+    c0, c1, c2, c3, c4, c5, c6, c7 = acc   # (A tile i, B tile j) is acc[4i + j + 1]
     for s in 0:1
-        A = ntuple(i -> _wmma_cat(As[2s + 1, wm + 16 * (i - 1) + r + 1],
-                                  As[2s + 2, wm + 16 * (i - 1) + r + 1]), Val(2))
-        B = ntuple(j -> _wmma_cat(Bs[2s + 1, wn + 16 * (j - 1) + r + 1],
-                                  Bs[2s + 2, wn + 16 * (j - 1) + r + 1]), Val(4))
-        acc = let a = acc
-            ntuple(k -> _wmma16(A[(k - 1) >> 2 + 1], B[(k - 1) & 3 + 1], a[k]), Val(8))
-        end
+        A0 = _wmma_cat(As[2s + 1, wm + r + 1],      As[2s + 2, wm + r + 1])
+        A1 = _wmma_cat(As[2s + 1, wm + 16 + r + 1], As[2s + 2, wm + 16 + r + 1])
+        B = _wmma_cat(Bs[2s + 1, wn + r + 1], Bs[2s + 2, wn + r + 1])
+        c0 = _wmma16(A0, B, c0); c4 = _wmma16(A1, B, c4)
+        B = _wmma_cat(Bs[2s + 1, wn + 16 + r + 1], Bs[2s + 2, wn + 16 + r + 1])
+        c1 = _wmma16(A0, B, c1); c5 = _wmma16(A1, B, c5)
+        B = _wmma_cat(Bs[2s + 1, wn + 32 + r + 1], Bs[2s + 2, wn + 32 + r + 1])
+        c2 = _wmma16(A0, B, c2); c6 = _wmma16(A1, B, c6)
+        B = _wmma_cat(Bs[2s + 1, wn + 48 + r + 1], Bs[2s + 2, wn + 48 + r + 1])
+        c3 = _wmma16(A0, B, c3); c7 = _wmma16(A1, B, c7)
     end
-    return acc
+    return (c0, c1, c2, c3, c4, c5, c6, c7)
 end
 
 @inline function _wmma_store_big!(C, acc, m0, n0, r, h, N)

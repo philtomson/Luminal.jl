@@ -3,7 +3,7 @@
 # Usage:
 #   julia -t auto,1 --project=. examples/qwen35_gguf_bench.jl <file.gguf> [--int4|--int8|--f16]
 #       [--lengths=512,2048,4096] [--new=32] [--reps=3] [--max-seq=8191] [--kv=f16|f32]
-#       [--min-avail=10] [--stop-after=read|load|session|compile-prefill|compile-decode] [--reclaim] [--buffers] [--cold-only]
+#       [--layers=N] [--min-avail=10] [--stop-after=read|load|session|compile-prefill|compile-decode] [--reclaim] [--buffers] [--cold-only]
 #   LUMINAL_TRACE_MEM=1 traces the first (cold) call step by step: HIP pool bytes before/after each graph step.
 #
 # Memory: the GPU shares system RAM, so a stage log line ("[mem] ...") gives MemAvailable, the
@@ -78,6 +78,9 @@ function main()
     stopped(name) = (stage("after " * name); stop_after == name && (status("stopping after $name"); true))
     f   = read_gguf(path)
     cfg = qwen35_config(f)
+    # --layers=N: only the first N layers (a small model with the real layer shapes, e.g. to profile)
+    nl = parse(Int, flag("layers", string(cfg.n_layers)))
+    nl < cfg.n_layers && (cfg = merge(cfg, (n_layers = nl, layer_types = cfg.layer_types[1:nl])))
     stopped("read") && return
     status("$(f.metadata["general.name"]): weights $T, KV cache $kv, max_seq $max_seq, WMMA ",
             get(ENV, "LUMINAL_WMMA", "1") != "0")
