@@ -446,3 +446,18 @@ the sequence as well; gufo's `prefill_ssm.hip` and `batched_ssm.hip` are the ref
 Order of work for prefill (largest first): (1) DeltaRule register-resident state (~1.0 s); (2) GEMM blocking
 toward ~58% of peak, optionally W8A8 (~0.5 s); (3) the ~0.3 s of small kernels: stop zero-filling outputs
 that are fully overwritten (`fill_kernel`), fuse the broadcasts, avoid the copies/permutes.
+
+### DeltaRule prefill kernel (2026-10-09)
+
+`_delta_rule_reg_kernel!` (AMD GPUs; `LUMINAL_DELTA_REG=0` selects the old global-memory kernel): the state
+stays in registers for the whole sequence, two lanes per state column (64 key rows each, partial sums
+combined with one `shfl_xor`), q/k staged in LDS 16 steps at a time. At the 27B's head sizes
+(dk = dv = 128, 48 value heads, 512 tokens) one layer drops from 23 ms to 1.5-1.7 ms (12-15x); results agree
+with the old kernel to 4e-7 relative on L2-normalized q/k (unnormalized random keys make the recurrence
+unstable and amplify rounding, so don't test with them). Pitfalls hit on the way: a single thread holding
+all 128 state values plus temporaries needed more than the 192 VGPRs a kernel gets by default (AMDGPU.jl
+cannot set the flat-work-group-size attribute) and spilled ~4 KB/thread to scratch, which kept it at 1.8x;
+a KernelAbstractions kernel lost the types of its Val parameters, so it is a plain `@roc` kernel; `foldl`
+over a 128-tuple is not unrolled (`_seq_dot` is a generated function). Test: `tests/test_delta_rule_gpu.jl`.
+Not yet measured end to end on the 27B (the first attempt was an OOM, see `qwen27b-memory-limits` in the
+agent memory): expected prefill at 512 tokens ~2.9 s -> ~1.8 s.

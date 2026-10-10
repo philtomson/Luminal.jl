@@ -31,12 +31,19 @@ meminfo_kb() = (d = Dict{String,Int}();
                 end; d)
 const MIN_AVAIL_KB = Ref(typemax(Int))     # lowest MemAvailable since the last stage line
 const T0 = time()
-function start_watchdog(limit_gb)
+# MemAvailable counts reclaimable file cache (the page-cached model file) as free, so on its own it
+# misses the machine swapping other programs out to make room for GPU buffers: the OOM kill of
+# 2026-10-09 happened with MemAvailable still high and swap exhausted. So the watchdog also exits
+# when swap use grows by more than `swap_gb` over its level at start.
+function start_watchdog(limit_gb; swap_gb = 1)
+    m0 = meminfo_kb(); swap0 = m0["SwapTotal"] - m0["SwapFree"]
     Threads.@spawn :interactive while true
-        av = meminfo_kb()["MemAvailable"]
+        m = meminfo_kb(); av = m["MemAvailable"]
         MIN_AVAIL_KB[] = min(MIN_AVAIL_KB[], av)
-        if av < limit_gb * 1024 * 1024
-            status(@sprintf("[mem] WATCHDOG: MemAvailable %.1f GB < %d GB, exiting", av / 1024^2, limit_gb))
+        swap_used = m["SwapTotal"] - m["SwapFree"] - swap0
+        if av < limit_gb * 1024 * 1024 || swap_used > swap_gb * 1024 * 1024
+            status(@sprintf("[mem] WATCHDOG: MemAvailable %.1f GB (limit %d), swap use +%.2f GB (limit %d GB), exiting",
+                            av / 1024^2, limit_gb, swap_used / 1024^2, swap_gb))
             ccall(:_exit, Cvoid, (Cint,), 3)
         end
         sleep(0.02)
@@ -86,6 +93,15 @@ function main()
     Luminal.Decoding._decode_graph(s, 1)
     stopped("compile-decode") && return
     ids(n) = [1000 + (i * 7919) % 20000 for i in 1:n]
+    # Prefill keeps every intermediate until the call ends, ~32 MB per prompt token on the 27B (measured:
+    # 16 GB at 512 tokens), so a long prompt is refused unless it fits with 25 GB to spare (--allow-large).
+    function fits(n)
+        need = 0.032 * n                                   # GB, prefill intermediates
+        avail = meminfo_kb()["MemAvailable"] / 1024^2      # GB, after the weights are loaded
+        ok = avail - need > 25 || "--allow-large" in ARGS
+        ok || status(@sprintf("skip %d: needs ~%.0f GB of scratch, only %.0f GB available (25 GB must stay free); pass --allow-large to override", n, need, avail))
+        ok
+    end
     # --buffers: after the first run of each prefill graph, what its result buffers hold
     function dump_buffers(n)
         cg = s.prefill[(Luminal.Decoding._prefill_bucket(n), 1)].exec
@@ -126,6 +142,7 @@ function main()
     status(@sprintf("%8s %12s %14s %12s %12s", "prompt", "TTFT (ms)", "prefill tok/s", "TPOT (ms)", "decode tok/s"))
     for n in lengths
         n + n_new < max_seq || (status("skip $n (needs max_seq > $(n + n_new))"); continue)
+        fits(n) || continue
         p = ids(n)
         t_cold = timed("prompt $n: cold (1 token)", 1, p)
         # the first decode call captures the HIP graph (seconds); keep it out of the timed runs

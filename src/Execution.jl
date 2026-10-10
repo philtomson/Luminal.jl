@@ -428,6 +428,89 @@ const DELTA_MAX_DK = 256
     end
 end
 
+# The same recurrence with the state held in registers for the whole sequence: the state (dv x dk
+# Float32, 64 KB per head at 128 x 128) is read once and written once, instead of read and written
+# in global memory at every token (~45 us per token step). Column j of S^T (one value dim) is shared
+# by two adjacent lanes, each holding half of the dk key rows (64 registers at dk = 128: one thread
+# holding all 128 plus its temporaries needed more than the 192 VGPRs a kernel may use by default
+# and spilled ~4 KB to scratch, which cost most of the gain). The two partial dot products S^T k and
+# S^T q are added across the lane pair with one shuffle each. q and k are staged in local memory
+# DELTA_REG_CHUNK steps at a time: one pair of barriers per chunk. The sums associate differently
+# from `_delta_rule_kernel!`, so results agree to rounding, not bitwise.
+const DELTA_REG_MAX_DK = 128
+const DELTA_REG_CHUNK = 16
+# ((0 + a[1] x[off+1]) + a[2] x[off+2]) + ...: a left-to-right sum as straight-line code (Base's
+# foldl does not unroll a tuple this long).
+@generated function _seq_dot(a::NTuple{N,Float32}, x, off) where {N}
+    ex = :(0f0)
+    for i in 1:N
+        ex = :($ex + a[$i] * Base.@inbounds(x[off + $i]))
+    end
+    return ex
+end
+# (A plain AMDGPU kernel, not a KernelAbstractions one: KA's lowering loses the types of the Val
+# parameter here. Grid: one workgroup per (value head, batch), 2 * dv threads.)
+function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh, ::Val{HD}) where {HD}
+    tid = workitemIdx().x
+    T = workgroupDim().x
+    j = (tid - 1) ÷ 2 + 1                  # value dim of this lane pair
+    hf = (tid - 1) % 2                     # which half of the key rows: hf * HD + 1 : (hf + 1) * HD
+    DK = 2 * HD
+    grp = workgroupIdx().x - 1
+    dv = size(v, 1); nv = size(v, 2); S = size(v, 3)
+    h = grp % nv + 1
+    b = grp ÷ nv + 1
+    hk = (h - 1) ÷ G + 1
+    L = min(S, unsafe_trunc(Int, @inbounds lens[b]))
+    qs = @ROCStaticLocalArray(Float32, (DELTA_REG_MAX_DK * DELTA_REG_CHUNK,), false)
+    ks = @ROCStaticLocalArray(Float32, (DELTA_REG_MAX_DK * DELTA_REG_CHUNK,), false)
+    active = j <= dv
+    s = ntuple(i -> (active && !fresh) ? (@inbounds st[j, hf * HD + i, h, b]) : 0f0, Val(HD))
+    t0 = 1
+    while t0 <= L
+        n = min(DELTA_REG_CHUNK, L - t0 + 1)
+        idx = tid
+        while idx <= n * DK                         # stage this chunk's q (scaled) and k
+            tt = (idx - 1) ÷ DK + 1
+            i = idx - (tt - 1) * DK
+            @inbounds qs[idx] = Float32(q[i, hk, t0 + tt - 1, b]) * scale
+            @inbounds ks[idx] = Float32(k[i, hk, t0 + tt - 1, b])
+            idx += T
+        end
+        sync_workgroup()
+        if active
+            for tt in 1:n
+                t = t0 + tt - 1
+                off = (tt - 1) * DK + hf * HD
+                @inbounds dec = exp(Float32(g[h, t, b]))
+                @inbounds vj = Float32(v[j, h, t, b])
+                @inbounds bet = Float32(beta[h, t, b])
+                s1 = let s0 = s; ntuple(i -> @inbounds(s0[i] * dec), Val(HD)); end            # decay (s is rebound below, so not captured)
+                kvp = _seq_dot(s1, ks, off)
+                kv = kvp + AMDGPU.Device.shfl_xor(kvp, Cint(1))                              # S^T k
+                delta = (vj - kv) * bet
+                s = ntuple(i -> @inbounds(s1[i] + ks[off + i] * delta), Val(HD))             # rank-1 update
+                op = _seq_dot(s, qs, off)
+                o = op + AMDGPU.Device.shfl_xor(op, Cint(1))                                 # S^T q
+                hf == 0 && (@inbounds out[j, h, t, b] = o)
+            end
+        end
+        sync_workgroup()
+        t0 += DELTA_REG_CHUNK
+    end
+    if active
+        for i in 1:HD
+            @inbounds st[j, hf * HD + i, h, b] = s[i]
+        end
+        if hf == 0
+            for t in L+1:S
+                @inbounds out[j, h, t, b] = 0f0
+            end
+        end
+    end
+    return
+end
+
 function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens)
     dk, nk = size(q, 1), size(q, 2)
     dv, nv, S, B = size(v, 1), size(v, 2), size(v, 3), size(v, 4)
@@ -450,6 +533,11 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens)
     end
     (dk <= DELTA_MAX_DK && dv <= 256) || error("DeltaRule: head dims must be <= 256 (key $dk, value $dv)")
     gs = min(256, max(32, nextpow(2, max(dv, dk))))
+    if out isa AMDGPU.ROCArray && dk <= DELTA_REG_MAX_DK && iseven(dk) && dv <= 128 && get(ENV, "LUMINAL_DELTA_REG", "1") != "0"
+        @roc groupsize=cld(2dv, 32) * 32 gridsize=nv * B _delta_rule_reg_kernel!(
+            out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), op.scale, G, op.fresh, Val(dk ÷ 2))
+        return out
+    end
     _delta_rule_kernel!(KernelAbstractions.get_backend(out), gs)(
         out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), op.scale, G, op.fresh;
         ndrange = nv * B * gs)
