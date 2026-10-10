@@ -490,3 +490,18 @@ Profile of the 4-layer slice after these (x16 for the 27B): GEMM ~70% of the ker
 ~40 small kernels per layer (4-D broadcasts, `linear_copy`, permutes, reduces) at 1-3% each.
 Next: a flash-style prefill attention (WMMA, GQA, causal) to replace the f32 sgemm pair; find which `linear_copy`
 and 4-D broadcast launches remain (45 copies per 4 layers); the 16-token path.
+
+### Fused causal prefill attention (2026-10-10)
+
+`CausalAttention` op + `flash_prefill!` (`src/FlashAttn.jl`; `SelfAttention` uses it for prefill (`return_kv`) when
+`seq >= 16`, no sliding window, head_dim % 32 == 0 and WMMA is available; `LUMINAL_FLASH=0` selects the composite
+form): online softmax over 64-key tiles on the matrix cores, GQA inside the kernel, no (S, S, heads) score matrix and
+no repeated K/V. Block = 4 waves = 32 query rows; both waves of a 16-row group compute the same scores and each
+accumulates half of the head dimension (no exchange between waves); Q/K/V operands are read from global memory
+(Float16 copies, V transposed), P goes through a per-wave LDS tile. Matches the host reference to 4e-4 (Float16
+operands); logits of the 4-layer 27B slice match the composite form to 5e-6, same greedy tokens.
+Speed: 0.87 ms per layer at 512 tokens (D = 256, 24 heads; the composite form was ~8 ms), 7.6 ms at 2048 (~7 TFLOPS of
+useful causal work, so there is room: K/V tiles via LDS shared by the row groups, 128-row blocks).
+27B (int4, 512 tokens): time to first token 1.38 s -> **1.30 s** (370 -> 394 tok/s); 16 tokens 460 ms; decode unchanged.
+Prefill memory is not reduced by this (the pool still holds ~22 GB used): the score matrices were a small part of it.
+Next: the ~40 small kernels per layer (copies, 4-D broadcasts, permutes), then GEMM (~70% of what is left).
