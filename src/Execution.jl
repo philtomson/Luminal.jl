@@ -1042,6 +1042,68 @@ end
     end
 end
 
+# The same GEMV with 4 rows per workgroup (each activation load is shared by 4 rows instead of 2): the
+# activations are read as 128 bytes per column per 16-byte weight chunk, and that L1 traffic is what limits
+# the multi-column kernel. Written out per row (a1..a4) like the 2-row kernel: nested closures over a
+# tuple of row accumulators did not compile for the GPU.
+@kernel function _q4_matmul_kernel_r4!(Y, @Const(Wv), @Const(sc), @Const(mn), @Const(Xv), K32, N,
+                                       shift, ::Val{C}, @Const(Res), ::Val{RES}, ::Val{SYM}) where {C, RES, SYM}
+    grp = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256, 4 * C)
+    row0 = (grp - 1) * 4
+    c0 = 0
+    while c0 < N
+        acc1 = ntuple(_ -> 0f0, Val(C)); acc2 = ntuple(_ -> 0f0, Val(C))
+        acc3 = ntuple(_ -> 0f0, Val(C)); acc4 = ntuple(_ -> 0f0, Val(C))
+        k = lid
+        while k <= K32
+            gi = ((k - 1) >> shift) + 1
+            @inbounds w1 = Wv[k, row0 + 1]; @inbounds w2 = Wv[k, row0 + 2]
+            @inbounds w3 = Wv[k, row0 + 3]; @inbounds w4 = Wv[k, row0 + 4]
+            @inbounds s1 = Float32(sc[gi, row0 + 1]); @inbounds s2 = Float32(sc[gi, row0 + 2])
+            @inbounds s3 = Float32(sc[gi, row0 + 3]); @inbounds s4 = Float32(sc[gi, row0 + 4])
+            m1 = SYM ? -8f0 * s1 : (@inbounds Float32(mn[gi, row0 + 1]))
+            m2 = SYM ? -8f0 * s2 : (@inbounds Float32(mn[gi, row0 + 2]))
+            m3 = SYM ? -8f0 * s3 : (@inbounds Float32(mn[gi, row0 + 3]))
+            m4 = SYM ? -8f0 * s4 : (@inbounds Float32(mn[gi, row0 + 4]))
+            kk = 4k; cb = c0   # fresh bindings: closures must not capture reassigned variables
+            acc1, acc2, acc3, acc4 = let a1 = acc1, a2 = acc2, a3 = acc3, a4 = acc4
+                xs = ntuple(j -> (c = min(cb + j, N);
+                                  @inbounds (Xv[kk - 3, c], Xv[kk - 2, c], Xv[kk - 1, c], Xv[kk, c])), Val(C))
+                sums = ntuple(j -> _sum32(xs[j]...), Val(C))
+                (ntuple(j -> a1[j] + s1 * _dot_q4(w1, xs[j]...) + m1 * sums[j], Val(C)),
+                 ntuple(j -> a2[j] + s2 * _dot_q4(w2, xs[j]...) + m2 * sums[j], Val(C)),
+                 ntuple(j -> a3[j] + s3 * _dot_q4(w3, xs[j]...) + m3 * sums[j], Val(C)),
+                 ntuple(j -> a4[j] + s4 * _dot_q4(w4, xs[j]...) + m4 * sums[j], Val(C)))
+            end
+            k += G
+        end
+        @unroll for j in 1:C
+            @inbounds s[lid, (j - 1) * 4 + 1] = acc1[j]; @inbounds s[lid, (j - 1) * 4 + 2] = acc2[j]
+            @inbounds s[lid, (j - 1) * 4 + 3] = acc3[j]; @inbounds s[lid, (j - 1) * 4 + 4] = acc4[j]
+        end
+        @synchronize
+        stride = G ÷ 2
+        while stride > 0
+            if lid <= stride
+                @unroll for i in 1:4*C
+                    @inbounds s[lid, i] += s[lid + stride, i]
+                end
+            end
+            @synchronize
+            stride ÷= 2
+        end
+        if lid <= 4 * C
+            r = (lid - 1) % 4 + 1; j = (lid - 1) ÷ 4 + 1
+            if c0 + j <= N
+                @inbounds Y[row0 + r, c0 + j] = RES ? s[1, lid] + Res[row0 + r, c0 + j] : s[1, lid]
+            end
+        end
+        @synchronize
+        c0 += C
+    end
+end
+
 # Columns per pass and threads, measured on Llama-3-8B shapes with weights read
 # from DRAM: batch 1 wants 256 threads only where K/32 >= 256 (every thread busy);
 # with several columns, 2 per pass and 128 threads are best (~2x 4 per pass at 4
@@ -1053,8 +1115,12 @@ end
 # ~60% of the GPU's scalar issue rate at 8 columns): the next step is packed Float16
 # math (two weights per instruction) with Float16 activations.
 const Q4_MAX_COLS = 2
+const Q4_ROWS_MIN_N = Ref(2)       # the 4-row kernel is used from this many columns
+const Q4_ROWS = Ref(4)           # rows per workgroup of the multi-column int4 GEMV (see `_q4_matmul_kernel_r!`)
 const DEFAULT_Q4_THREADS = 0     # 0: chosen per call (`_q4_threads`)
 _q4_threads(K32::Int, N::Int) = (N == 1 && K32 >= 256) ? 256 : 128
+# threads of the 4-row kernel: 64 for tall matrices with a short K (many workgroups), else 128 (measured at the 27B's shapes)
+_q4_threads_r4(M::Int, K32::Int) = (K32 <= 256 && M >= 8192) ? 64 : 128
 
 function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::Int = 0,
                      residual = nothing)
@@ -1070,6 +1136,14 @@ function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::I
     ispow2(lpg) || error("Q4Weight: group $(W.group) must be 32 times a power of two")
     group == 0 && (group = _q4_threads(K ÷ 32, N))
     group <= 256 || error("int4 GEMV: at most 256 threads per workgroup")
+    if Q4_ROWS[] == 4 && N >= Q4_ROWS_MIN_N[] && M % 4 == 0
+        group == _q4_threads(K ÷ 32, N) && (group = _q4_threads_r4(M, K ÷ 32))
+        _q4_matmul_kernel_r4!(KernelAbstractions.get_backend(C), group)(
+            Base.reshape(C, M, N), W.v, W.scale, W.mn === nothing ? W.scale : W.mn, Xv, K ÷ 32, N,
+            trailing_zeros(lpg), Val(min(N, cols == 0 ? Q4_MAX_COLS : cols)),
+            _residual_arg(residual, C, M, N)..., Val(W.mn === nothing); ndrange = (M ÷ 4) * group)
+        return C
+    end
     _q4_matmul_kernel!(KernelAbstractions.get_backend(C), group)(
         Base.reshape(C, M, N), W.v, W.scale, W.mn === nothing ? W.scale : W.mn, Xv, K ÷ 32, N,
         trailing_zeros(lpg), Val(R), Val(min(N, cols == 0 ? Q4_MAX_COLS : cols)),

@@ -68,7 +68,6 @@ function main()
     for _ in 1:reps
         t = @elapsed plain = only(generate_ids(s, [prompt_ids]; max_new_tokens = nnew))
         tp = min(tp, t)
-        st = Dict{Symbol,Int}()
         # --oracle=P: draft the true next token with probability P (a sliced model's MTP head is useless; this fixes the
         # acceptance rate to measure the cost of the cycle)
         hook = oracle < 0 ? nothing : (n, draft) -> (rand() < oracle && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, cfg.vocab_size))

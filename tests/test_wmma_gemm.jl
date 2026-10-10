@@ -77,7 +77,10 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
                                          # 7..16 columns: the skinny kernel (group 32, K % 256 == 0), else the GEMV
                                          (128, 256, 8, 32, true), (48, 256, 16, 32, false), (256, 512, 12, 32, false), (80, 768, 9, 32, true),
                                          (64, 96, 10, 32, true), (128, 128, 6, 32, false),
-                                         (128, 256, 20, 32, true), (48, 512, 32, 32, false), (256, 256, 33, 32, true))
+                                         (128, 256, 20, 32, true), (48, 512, 32, 32, false), (256, 256, 33, 32, true),
+                                         # 2..6 columns: the multi-column GEMV (4 rows per workgroup when M % 4 == 0)
+                                         (128, 128, 2, 32, true), (48, 256, 3, 32, false), (64, 96, 5, 32, true), (130, 128, 2, 32, false),
+                                         (256, 512, 4, 64, true))
             W = randn(Float32, Out, In); x = randn(Float32, In, N)
             qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = group, symmetric = sym)
             out = Luminal.zero_tensor(dev, Float32, Out, N)
@@ -86,13 +89,14 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
             xr = f16 ? Float32.(Float16.(x)) : x
             @test relerr(Array(out), Array(Luminal.dequantize(qw)) * xr) < 2e-3
         end
-        # with a residual, through the skinny kernel
-        let Out = 128, In = 256, N = 9   # (group 32, K % 256 == 0: the skinny kernel)
+        # with a residual, through the 4-row GEMV (2 columns) and the skinny kernel (9)
+        for N in (2, 9)
+            Out, In = 128, 256   # (group 32, K % 256 == 0: the skinny kernel)
             W = randn(Float32, Out, In); x = randn(Float32, In, N); r = randn(Float32, Out, N)
             qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = 32)
             out = Luminal.zero_tensor(dev, Float32, Out, N)
             Luminal._q4_matmul!(out, qw, Luminal.to_device(x, dev); residual = Luminal.to_device(r, dev))
-            xr = dev isa Luminal.AbstractGPUDevice ? Float32.(Float16.(x)) : x
+            xr = dev isa Luminal.AbstractGPUDevice && N >= Luminal.SKINNY_MIN_COLS ? Float32.(Float16.(x)) : x
             @test relerr(Array(out), Array(Luminal.dequantize(qw)) * xr .+ r) < 2e-3
         end
         Out, In, N = 128, 128, 40

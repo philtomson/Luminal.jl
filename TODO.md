@@ -593,3 +593,16 @@ The 15 tok/s goal is met. Cycle = verify ~97 ms (plain step 83) + MTP draft ~6 m
 - The GGUF reader now drops each tensor from the page cache right after reading it (`posix_fadvise(DONTNEED)`; set
   `LUMINAL_GGUF_KEEP_CACHE=1` to keep it): loading a 28 GB file was making the kernel swap other jobs' idle pages out.
   (Swap on this machine is full again, 8 of 8 GB, from the earlier full-model runs; `sudo swapoff -a && sudo swapon -a` brings it back.)
+
+### Faster multi-column int4 GEMV (2026-10-10)
+
+`_q4_matmul_kernel_r4!`: 4 weight rows per workgroup (the 2-row kernel's activation loads, 128 bytes per column per 16-byte
+weight chunk, were the L1 bottleneck with more than one column), used from 2 columns (`Q4_ROWS`, `Q4_ROWS_MIN_N`; 1 column keeps
+the 2-row kernel: 4 rows gave nothing there), 64 threads for tall matrices with K/32 <= 256 and M >= 8192, else 128
+(`_q4_threads_r4`). At the 27B's shapes a 2-column GEMV went from 140-160 to 175-190 GB/s of weights, i.e. the same speed as
+1 column (lm_head 3.9 -> 3.07 ms; 17408 x 5120: 0.30 -> 0.24 ms). Written out per row because nested closures over a tuple of row
+accumulators did not compile for the GPU (the closure also must not capture the loop variable `k`).
+Speculative decoding on the 27B (79-token prompt, 128 tokens): decode **16.8 -> 18.05 tok/s** (plain greedy 12.08), identical output,
+74% accepted; verify step 97 -> 90 ms (plain step 83), MTP draft 5.4 ms, rollback ~0.4 ms per cycle.
+What is left in the verify step over a plain step (~7 ms): the S = 2 attention, DeltaRule/conv writing the snapshots (~150 MB),
+2-column rmsnorm / elementwise kernels, and 2 columns in the lm_head argmax.
