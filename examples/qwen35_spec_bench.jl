@@ -39,6 +39,7 @@ function main()
     flag(name, default) = (i = findfirst(a -> startswith(a, "--$name="), ARGS); i === nothing ? default : split(ARGS[i], "=", limit = 2)[2])
     base, mtp = args[1], args[2]
     T = "--int8" in ARGS ? Int8 : Luminal.Int4
+    # (the GGUF reader drops each tensor from the page cache after reading it; see LUMINAL_GGUF_KEEP_CACHE)
     nnew = parse(Int, flag("new", "128")); reps = parse(Int, flag("reps", "2"))
     oracle = parse(Float64, flag("oracle", "-1"))
     start_watchdog(parse(Int, flag("min-avail", "20")); swap_gb = parse(Int, flag("swap-gb", "3")))

@@ -193,8 +193,15 @@ function gguf_tensor(f::GGUFFile, name::String)
     n = prod(t.dims)
     per, bytes = GGML_BLOCKS[ty]
     raw = open(f.path, "r") do io
-        seek(io, f.data_start + t.offset)
-        read(io, (n ÷ per) * bytes)
+        off = f.data_start + t.offset; len = (n ÷ per) * bytes
+        seek(io, off)
+        data = read(io, len)
+        # The model is read once: let the kernel drop these pages from the page cache at once. (A 28 GB file
+        # otherwise fills the cache and the kernel swaps out other processes' idle memory to make room.
+        # Only clean, unmapped pages are dropped. LUMINAL_GGUF_KEEP_CACHE=1 disables this.)
+        get(ENV, "LUMINAL_GGUF_KEEP_CACHE", "0") == "1" ||
+            ccall(:posix_fadvise, Cint, (Cint, Int64, Int64, Cint), Cint(reinterpret(Int32, fd(io))), off, len, 4)
+        data
     end
     out = Vector{Float32}(undef, n)
     if ty === :F32
