@@ -459,5 +459,7 @@ all 128 state values plus temporaries needed more than the 192 VGPRs a kernel ge
 cannot set the flat-work-group-size attribute) and spilled ~4 KB/thread to scratch, which kept it at 1.8x;
 a KernelAbstractions kernel lost the types of its Val parameters, so it is a plain `@roc` kernel; `foldl`
 over a 128-tuple is not unrolled (`_seq_dot` is a generated function). Test: `tests/test_delta_rule_gpu.jl`.
-Not yet measured end to end on the 27B (the first attempt was an OOM, see `qwen27b-memory-limits` in the
-agent memory): expected prefill at 512 tokens ~2.9 s -> ~1.8 s.
+Measured on the 27B (int4, 512 tokens, 2026-10-09): time to first token 2.97 s -> 2.07 s (172 -> 248 tok/s,
+1.44x); decode unchanged (11.4-12.3 tok/s). What is left of the 2.07 s: the int4 WMMA GEMM ~1.3 s (64%), the small
+kernels ~0.45 s, DeltaRule now ~0.1 s. Next: GEMM blocking, the small kernels, and prompts of <= 16 tokens
+(507 ms to the first token for a 16-token prompt: below `QUANT_GEMM_COLS` the weights are read several times).
