@@ -505,3 +505,22 @@ useful causal work, so there is room: K/V tiles via LDS shared by the row groups
 27B (int4, 512 tokens): time to first token 1.38 s -> **1.30 s** (370 -> 394 tok/s); 16 tokens 460 ms; decode unchanged.
 Prefill memory is not reduced by this (the pool still holds ~22 GB used): the score matrices were a small part of it.
 Next: the ~40 small kernels per layer (copies, 4-D broadcasts, permutes), then GEMM (~70% of what is left).
+
+### Small kernels, round 2 (2026-10-10)
+
+27B (int4, 512 tokens): time to first token 1.30 s -> **1.21 s** (394 -> 425 tok/s); 16 tokens 462 ms; decode unchanged.
+- The 48-row DeltaNet gates (`in_proj_a/b`) took the dequantize + sgemm path because M % 64 != 0 (~2 ms per layer in
+  the synchronized step trace). The int4 kernels now take any M % 16 == 0 (clamped weight-row loads, guarded stores).
+  Int8 / Float16 weights still need M % 64.
+- Quantized/half matmul outputs with more than `QUANT_GEMM_COLS` columns skip the zero fill (`_gemm_writes_all`).
+- `LUMINAL_TRACE_TIME=1` (AMD): times every graph step with a synchronize and lists the most expensive (op, shape)
+  groups. It overstates tiny ops (launch latency); use `rocprofv3` on `--layers=4` for kernel time.
+- `test_quantized_loading.jl`: GPU int4 tolerances loosened to 1e-2 (nearly every tiny-model matmul now rounds its
+  activations to Float16; the 4-layer 27B slice agrees with the exact path to 5.7e-5, same tokens).
+Profile of the 4-layer slice now (kernel time 80 ms): int4 GEMM 56 ms (69%), DeltaRule 4.9, ~15 ms in small kernels:
+SwiGLU multiply 2.0 (already at memory speed: only fusion into the GEMM removes it), 44 `linear_copy` launches 3.9
+(mostly the Float32 -> Float16 activation conversion in `_wmma_activations`, repeated for every GEMM that reads the same
+activations: 4 per DeltaNet layer, 2 per MLP), remaining fills ~1.7, assorted 3-D/4-D broadcasts ~3.5 (l2norm, gates),
+causal conv 0.7, rmsnorm 1.1, embedding gather 1.5 (once per prefill). The GEMM is now the whole story: ~27 of 51 TFLOPS.
+Ideas left, by size: GEMM efficiency (W8A8 / better tiling); one Float16 conversion shared by the GEMMs of a block
+(needs a graph-level cast node); gate+up as one GEMM with a SwiGLU epilogue; fuse the DeltaNet gates.
