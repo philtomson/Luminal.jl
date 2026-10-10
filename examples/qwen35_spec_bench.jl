@@ -72,8 +72,11 @@ function main()
         # --oracle=P: draft the true next token with probability P (a sliced model's MTP head is useless; this fixes the
         # acceptance rate to measure the cost of the cycle)
         hook = oracle < 0 ? nothing : (n, draft) -> (rand() < oracle && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, cfg.vocab_size))
-        t = @elapsed spec = generate_ids_speculative(s, d, prompt_ids; max_new_tokens = nnew, stats = st, draft_hook = hook)
-        ts = min(ts, t)
+        st1 = Dict{Symbol,Int}()
+        t = @elapsed spec1 = generate_ids_speculative(s, d, prompt_ids; max_new_tokens = nnew, stats = st1, draft_hook = hook)
+        if t < ts
+            ts = t; st = st1; spec = spec1          # the stats of the fastest run
+        end
     end
     # (both include the prefill and first token; subtract it by also timing a 1-token run)
     t1 = @elapsed generate_ids(s, [prompt_ids]; max_new_tokens = 1)

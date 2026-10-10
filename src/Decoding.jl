@@ -11,7 +11,7 @@ using ..Luminal.LlamaTokenization
 using AMDGPU
 using JSON3
 
-export greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative
+export greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative
 
 """
     weight_preset(name) -> (weight name -> Type)

@@ -567,3 +567,29 @@ Ideas left, by size: GEMM efficiency (W8A8 / better tiling); one Float16 convers
   verification (N = 4-8) can use it too (the GEMV is better below that).
 - Next for short prompts: 33-64 columns (two passes of the 2-tile kernel would only break even), the floor of ~95 ms for the
   weights, and the remaining non-GEMM work (DeltaRule, attention, ~40 small kernels per layer, ~10-15 ms at 16 tokens).
+
+### Decode: MTP speculative decoding (2026-10-10)
+
+27B int4, real prompt (79 tokens, 128 new tokens, greedy): decode **12.1 -> 16.8 tok/s (+39%)**, output identical to plain greedy
+over all 128 tokens; 74% of drafts accepted, 1.74 tokens per verify step (`examples/qwen35_spec_bench.jl base.gguf mtp.gguf --int4`).
+The 15 tok/s goal is met. Cycle = verify ~97 ms (plain step 83) + MTP draft ~6 ms + rollback ~0.5 ms (on rejects).
+- Mechanism (`src/Speculative.jl`): the model's own MTP head (`blk.64.nextn.*`, in the `-MTP` GGUFs; ours come from
+  `Qwen3.6-27B-UD-Q8_K_XL.gguf` of the MTP directory while the base weights stay the Q8_0 file) drafts one token; the base model
+  verifies `[y, draft]` in ONE 2-token step (weights read once for both), so an accepted draft is a second token for ~+17% cost.
+  Head: `x = eh_proj([enorm(embed(next token)); hnorm(hidden before it)])`, a full gated-attention layer + MLP with its own KV cache,
+  `shared_head_norm`, the base `lm_head` (`Qwen35MTP`, `load_qwen35_mtp`; `hnorm` input = the base's final residual stream
+  *before* its output norm, like gufo). Its prompt prefill is the pairs (x[i+1], H[i]).
+- Pieces: `DecodeAttention` over S new tokens (one workgroup per (head, token), token s sees the cache + new tokens 1..s);
+  `CausalConv` / `DeltaRule` write the recurrent state after token `snap_t` into a snapshot buffer (rollback of a rejected draft =
+  copy snapshots back; the KV cache needs none: positions just don't advance); `build_llama_decode_step!(...; seq, snapshots,
+  want_hidden, want_argmax)`; `ArgMax` op (greedy tokens picked on the device: no 2 MB logits readback / host argmax over 248k);
+  the MTP draft step takes two (token, hidden) pairs (both real after an accept, the 2nd a dummy after a reject) so one graph
+  and one weight read serve both cases. Verified: tests/test_speculative.jl (random MTP head: speculative == greedy; a forced-oracle
+  draft makes every cycle accept; mixed accept/reject), tests/test_spec_ops.jl, the verify-step test in test_qwen35_model.jl.
+- The 4-layer slice (`--layers=4 --oracle=P`) measures the cost of a cycle without a usable head; the numbers there are not the 27B's.
+- Where the rest goes: the 2-column GEMV is ~157 GB/s against ~185 for 1 column (+14 ms per verify step); the MTP step's lm_head
+  alone is ~3 ms. Ideas: a better 2-column int4 GEMV, drafting 2 tokens per cycle (3-column verify: the GEMV does 2 columns per
+  pass, the skinny kernel starts to pay at ~3), sampling instead of greedy, batching the draft with the next verify.
+- The GGUF reader now drops each tensor from the page cache right after reading it (`posix_fadvise(DONTNEED)`; set
+  `LUMINAL_GGUF_KEEP_CACHE=1` to keep it): loading a 28 GB file was making the kernel swap other jobs' idle pages out.
+  (Swap on this machine is full again, 8 of 8 GB, from the earlier full-model runs; `sudo swapoff -a && sudo swapon -a` brings it back.)

@@ -170,3 +170,13 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     return out
 end
 
+
+"""
+    generate_speculative(session, drafter, prompt::String; max_new_tokens=200) -> String
+
+Text in, text out: `generate` for one prompt with MTP speculative decoding (needs the session's tokenizer).
+"""
+function generate_speculative(s::LlamaSession, d::MTPDrafter, prompt::String; max_new_tokens::Int=200, kwargs...)
+    ids = LlamaTokenization.encode(s.tokenizer, prompt; bos=true)
+    return LlamaTokenization.decode(s.tokenizer, generate_ids_speculative(s, d, ids; max_new_tokens, kwargs...))
+end
