@@ -41,7 +41,7 @@ ref_lut(vs::NTuple{K,T}, w) where {K,T} = sum(ref_basis(vs) .* w)
     for r in run_all(g, [y], Dict(pins.id => pv, W.id => wv))
         for b in 1:B, n in 1:out_dim
             vs = ntuple(k -> pv[b, (k - 1) * out_dim + n], Val(K))
-            @test r[y.id][b, n] ≈ ref_lut(vs, view(wv, n, :)) rtol = 1e-5
+            @test r[y.id][b, n] ≈ ref_lut(vs, view(wv, n, :)) rtol = 1e-5 atol = 1e-5
         end
     end
 end

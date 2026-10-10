@@ -21,6 +21,7 @@ const WMMA_V8F  = NTuple{8,VecElement{Float32}}
 @inline _wmma_zero() = ntuple(_ -> VecElement(0f0), Val(8))
 @inline _wmma_cat(a::WMMA_V8H, b::WMMA_V8H)::WMMA_V16H = (a..., b...)
 
+const WMMA_SKINNY_WAVES = Ref(4)   # waves (= K splits) per workgroup of the skinny int4 kernel
 const WMMA_Q4_PD = Ref(1)   # prefetch depth of the 128x128 int4 kernel (K tiles in flight)
 const WMMA_PADC = 5   # LDS row = 4 chunks of 16 B + 1 pad chunk, to spread banks
 
@@ -327,6 +328,90 @@ function _wmma_q4_wide_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val
     _wmma_store_big!(C, acc, bm + wm, bn + wn, r, h, N)
     return
     end
+end
+
+# Skinny GEMM for N <= 16 columns (prefill of a short prompt, a few decode streams, speculative
+# verification): the weights are streamed once at memory speed. No LDS and no barriers: each
+# wave owns 16 weight rows, dequantizes its 16-byte chunk per K tile straight into the two WMMA
+# A fragments, and takes the B fragments (16 activation columns, K contiguous) from cache.
+# `PD` K tiles of loads are kept in flight in registers.
+# The weights are read with contiguous accesses: for 8 K tiles at a time (128 bytes = one cache
+# line of each row) the wave's 32 lanes load 4 rows x 8 chunks per instruction, park them in a
+# per-wave LDS tile, and read them back one tile at a time in the WMMA layout (lane = row). Loading
+# 16 bytes per lane straight from 16 different rows 2.5 KB apart ran at ~70 GB/s; this streams.
+# Requires group == 32 (one Float16 scale per K tile: 8 scales = one 16-byte load per row) and
+# K % 256 == 0.
+@inline function _wmma_q4s_raw(Pv, row0, M, l, g)
+    ntuple(j -> Pv[8g + l % 8 + 1, min(row0 + 4 * (j - 1) + l ÷ 8, M - 1) + 1], Val(4))
+end
+
+function _wmma_q4_skinny_kernel!(C, Pv, Sc8, Mn8, Bv, K, N, ::Val{SYM}, ::Val{NW}) where {SYM, NW}
+    # One workgroup = NW waves = the same 16 weight rows, each wave streaming every NW-th group of
+    # 8 K tiles (more independent streams per row block); the partial sums meet in LDS at the end.
+    @inbounds begin
+    tid = workitemIdx().x - 1
+    l = tid % 32; r = l % 16; h = l ÷ 16; w = tid ÷ 32
+    M = size(C, 1)
+    row0 = (workgroupIdx().x - 1) * 16
+    grow = min(row0 + r, M - 1)
+    Ls = @ROCStaticLocalArray(NTuple{16,UInt8}, (9, 16, NW), false)   # [chunk (+1 pad), row, wave]
+    Rs = @ROCStaticLocalArray(Float32, (8, 32, NW), false)
+    ng = K ÷ 256
+    acc0 = _wmma_zero(); acc1 = _wmma_zero()
+    g0 = min(w, ng - 1)
+    raw = _wmma_q4s_raw(Pv, row0, M, l, g0)
+    sc = Sc8[g0 + 1, grow + 1]; mn = SYM ? sc : Mn8[g0 + 1, grow + 1]
+    for g in w:NW:ng-1
+        for j in 1:4
+            Ls[l % 8 + 1, 4 * (j - 1) + l ÷ 8 + 1, w + 1] = raw[j]
+        end
+        gn = min(g + NW, ng - 1)
+        scn = Sc8[gn + 1, grow + 1]; mnn = SYM ? scn : Mn8[gn + 1, grow + 1]
+        nraw = _wmma_q4s_raw(Pv, row0, M, l, gn)
+        # (the tile is private to this wave: LDS accesses of a wave execute in order, so no barrier)
+        for u in 0:7
+            t = 8g + u
+            qa = Ls[u + 1, r + 1, w + 1]
+            sa = Float32(sc[u + 1]); ma = SYM ? -8f0 * sa : Float32(mn[u + 1])
+            b1 = Bv[4t + 1, r + 1]; b2 = Bv[4t + 2, r + 1]; b3 = Bv[4t + 3, r + 1]; b4 = Bv[4t + 4, r + 1]
+            lo0, hi0 = _wmma_dq4(ntuple(i -> qa[i], Val(8)), sa, ma)
+            lo1, hi1 = _wmma_dq4(ntuple(i -> qa[i + 8], Val(8)), sa, ma)
+            acc0 = _wmma16(_wmma_cat(lo0, hi0), _wmma_cat(b1, b2), acc0)
+            acc1 = _wmma16(_wmma_cat(lo1, hi1), _wmma_cat(b3, b4), acc1)
+        end
+        raw = nraw; sc = scn; mn = mnn
+    end
+    for i in 0:7
+        Rs[i + 1, l + 1, w + 1] = acc0[i + 1].value + acc1[i + 1].value
+    end
+    sync_workgroup()
+    if w == 0 && r < N
+        for i in 0:7   # lane l holds D[2i + l÷16, l%16]: weight row 2i + h, activation column r
+            row = row0 + 2i + h
+            v = 0f0
+            for k in 1:NW
+                v += Rs[i + 1, l + 1, k]
+            end
+            row < M && (C[row + 1, r + 1] = v)
+        end
+    end
+    return
+    end
+end
+
+# C (M, N <= 16) = dequantize(Pv, scale, mn)' * B for B (K, >= 16) Float16 (columns >= N ignored).
+function wmma_q4_skinny!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
+                         group::Int, B::ROCArray{Float16,2}, N::Int)
+    K32, M = size(Pv); K = 32 * K32
+    (M % 16 == 0 && K % 256 == 0 && group == 32 && size(B, 1) == K && size(B, 2) >= 16 && N <= 16 &&
+     size(scale) == (K ÷ group, M) && size(C) == (M, N)) ||
+        throw(ArgumentError("wmma_q4_skinny!: need M % 16 == 0, K % 256 == 0, group == 32, N <= 16"))
+    Bv = reinterpret(WMMA_V8H, B)
+    Sc8 = reinterpret(NTuple{8,Float16}, scale)
+    Mn8 = mn === nothing ? Sc8 : reinterpret(NTuple{8,Float16}, mn)
+    @roc groupsize=32 * WMMA_SKINNY_WAVES[] gridsize=cld(M, 16) _wmma_q4_skinny_kernel!(
+        C, Pv, Sc8, Mn8, Bv, K, N, Val(mn === nothing), Val(WMMA_SKINNY_WAVES[]))
+    return C
 end
 
 # gfx11 has the 16x16x16 f16 WMMA instruction used above (gfx12's differs).

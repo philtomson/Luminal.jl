@@ -972,6 +972,7 @@ function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::I
     M, K = size(W)
     N = length(B) ÷ K
     N > QUANT_GEMM_COLS && _wmma_q4_gemm!(C, W, B, residual) && return C
+    N >= SKINNY_MIN_COLS && N <= QUANT_GEMM_COLS && _wmma_q4_skinny_gemm!(C, W, B, residual) && return C
     (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
@@ -1103,6 +1104,23 @@ function _wmma_q4_gemm!(C, W::Q4Weight, B, residual)
     x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
     wmma_q4_gemm!(C2, W.v, W.scale, W.mn, W.group, x16, N)
+    _wmma_add_residual!(C2, residual, M, N)
+    Bc === B || _free_now!(Bc)
+    return true
+end
+
+# 7..16 columns: the weights are streamed once by the skinny matrix-core kernel (the GEMV would
+# read them N/2 times; measured crossover at the 27B's shapes is ~7 columns).
+const SKINNY_MIN_COLS = 7
+function _wmma_q4_skinny_gemm!(C, W::Q4Weight, B, residual)
+    (C isa ROCArray{Float32} && W.p isa ROCArray{UInt8} && W.scale isa ROCArray{Float16} && wmma_enabled() &&
+     get(ENV, "LUMINAL_WMMA_SKINNY", "1") != "0") || return false
+    M, K = size(W)
+    (M % 16 == 0 && K % 256 == 0 && W.group == 32) || return false
+    N = length(B) ÷ K
+    x16, Bc = _wmma_activations(B, K, N)
+    C2 = Base.reshape(C, M, N)
+    wmma_q4_skinny!(C2, W.v, W.scale, W.mn, W.group, x16, N)
     _wmma_add_residual!(C2, residual, M, N)
     Bc === B || _free_now!(Bc)
     return true
