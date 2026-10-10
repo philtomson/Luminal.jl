@@ -11,7 +11,7 @@ using ..Luminal.LlamaTokenization
 using AMDGPU
 using JSON3
 
-export greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset
+export greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative
 
 """
     weight_preset(name) -> (weight name -> Type)
@@ -129,10 +129,14 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
         # recurrent layers (Qwen3.5) consume each prompt only up to its length
         lens = NN._needs_lens(m) ? Luminal.tensor(g, [B]) : nothing
         last_only = NN._prefill_last_only(m)
+        href = Ref{Any}(nothing)     # the final residual stream, kept for the MTP head (models that offer it)
         out, kvs = lens === nothing ? m(input, 0; return_kv=true) :
-                   last_only ? m(input, 0; return_kv=true, lens=lens, last_only=true) : m(input, 0; return_kv=true, lens=lens)
+                   !last_only ? m(input, 0; return_kv=true, lens=lens) :
+                   NN._prefill_hidden(m) ? m(input, 0; return_kv=true, lens=lens, last_only=true, hidden_ref=href) :
+                   m(input, 0; return_kv=true, lens=lens, last_only=true)
+        hidden_id = href[] === nothing ? 0 : href[].id
         load_weights!(g, reg, s.weights; device=s.device)
-        retain = vcat(out.id, [t.id for kv in kvs for t in kv])
+        retain = vcat(out.id, [t.id for kv in kvs for t in kv], hidden_id == 0 ? Int[] : [hidden_id])
         on_gpu = s.device isa Luminal.AbstractGPUDevice
         # Prefill multiplies each weight by slen*B >= 16 columns, where rocBLAS's
         # Float32 GEMM beats the Float16 GEMV (which suits decode's single column).
@@ -146,7 +150,7 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
                     precision=on_gpu, search_inputs=Dict{Int,Any}(input.id => ids))
         end
         (exec=exec, input_id=input.id, out_id=out.id, kv_ids=[(k.id, v.id) for (k, v) in kvs],
-         lens_id=lens === nothing ? 0 : lens.id, last_only=last_only)
+         lens_id=lens === nothing ? 0 : lens.id, last_only=last_only, hidden_id=hidden_id)
     end
 end
 
@@ -285,10 +289,12 @@ generated ids, the end-of-sequence token included if one was produced. With a
 appended to it, and with `step_logits` each decode step's (vocab, B) logits
 (for validation).
 """
-function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
-                      last_logits=nothing, step_logits=nothing)
+# Prefill `prompt_ids` into the session's decode cache for batch size B = length(prompt_ids): the K/V of
+# the full layers are copied in, the recurrent states are left at each prompt's end, and the cache
+# positions set. Returns (pf, res, dc, plens, logits): the prefill graph and its results, the decode
+# graph (and cache), the prompt lengths and the host logits ((vocab, slen, B), or (vocab, 1, B)).
+function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}})
     B = length(prompt_ids)
-    B >= 1 || error("no prompts")
     plens = length.(prompt_ids)
     maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
 
@@ -310,11 +316,6 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
     end
     res = pf.exec(pins; device=s.device)
     logits = Array{Float32}(res[pf.out_id])                                  # (vocab, slen, B), or (vocab, 1, B)
-    lastpos(b) = pf.last_only ? 1 : plens[b]
-    eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
-    generated = [[argmax(view(logits, :, lastpos(b), b)) - 1] for b in 1:B]   # 0-indexed
-    last_logits === nothing || append!(last_logits, [logits[:, lastpos(b), b] for b in 1:B])
-    done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
     # KV cache: sequence b's next token goes to position plens[b]. Slots past a
     # sequence's position are never read, so the reused cache needs no clearing.
@@ -328,6 +329,20 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
             view(cache.self_cache[i][2], :, 1:plens[b], :, b) .= view(res[v], :, 1:plens[b], :, b)
         end
     end
+    return pf, res, dc, plens, logits
+end
+
+function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
+                      last_logits=nothing, step_logits=nothing)
+    B = length(prompt_ids)
+    B >= 1 || error("no prompts")
+    pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids)
+    cache = dc.cache
+    lastpos(b) = pf.last_only ? 1 : plens[b]
+    eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
+    generated = [[argmax(view(logits, :, lastpos(b), b)) - 1] for b in 1:B]   # 0-indexed
+    last_logits === nothing || append!(last_logits, [logits[:, lastpos(b), b] for b in 1:B])
+    done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
     # Decode. A finished sequence keeps being fed (its last token, at the same
     # position, so it never runs into max_seq) until every sequence is done.
@@ -578,5 +593,7 @@ end
 export transcribe, WhisperSession
 
 include("AWQ.jl")
+
+include("Speculative.jl")
 
 end # module Decoding

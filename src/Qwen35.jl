@@ -182,7 +182,7 @@ a full layer, or its (conv, rec) state *inputs* for a linear layer: bind those
 to the state buffers, which the prefill leaves at the prompts' end.
 """
 function (m::Qwen35)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=false, lens::Luminal.GraphTensor,
-                     last_only::Bool=false)
+                     last_only::Bool=false, hidden_ref=nothing)
     prev_seq == 0 || error("Qwen35 prefill starts from empty states (prev_seq = 0)")
     g = input.graph_ref
     B = Luminal.realized_dims(input.shape)[2]
@@ -202,6 +202,7 @@ function (m::Qwen35)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=
         x = x + a
         x = x + layer.feed_forward(layer.post_attention_norm(x))
     end
+    hidden_ref === nothing || (hidden_ref[] = x)    # the final residual stream, for the MTP head
     if last_only   # logits at each sequence's position lens[b] only: (vocab, 1, B)
         H, S, _ = Luminal.realized_dims(x.shape)
         x = Luminal.add_op!(g, Luminal.LastToken(), [(x.id, 0, x.shape), (lens.id, 0, lens.shape)],
@@ -214,6 +215,7 @@ end
 # decode-step hooks (see build_llama_decode_step!)
 _needs_lens(::Qwen35) = true
 _prefill_last_only(::Qwen35) = true
+_prefill_hidden(::Qwen35) = true
 _state_shapes(l::Qwen35Block, max_seq, batch) =
     l.kind === :linear ? deltanet_state_shapes(l.mixer, batch) :
     ([l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch], [l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch])
@@ -403,6 +405,124 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
             store!("$sa.k_norm.weight", vec_("$b.attn_k_norm.weight") .- 1f0)
         end
     end
+    Luminal.reclaim!(device)
+    return W
+end
+
+
+# ── The MTP (multi-token prediction) head ─────────────────────────────────────
+
+"""
+    Qwen35MTP(graph, reg; qwen35_config(...)...)
+
+The one-layer multi-token-prediction head some Qwen3.5 / Qwen3.6 GGUFs carry (`blk.N.nextn.*`, N = the
+number of base layers). Given the *next* token and the base model's final residual stream (before its
+output norm) at the position before it, it predicts the token after that one:
+
+    x = eh_proj([enorm(embed(token)); hnorm(hidden)])       # (2 hidden) -> hidden
+    x = x + attn(norm(x)); x = x + mlp(norm(x))              # a full gated-attention layer, own KV cache
+    logits = lm_head(shared_head_norm(x))                    # the base model's embedding and lm_head
+
+Used for speculative decoding (`generate_ids_speculative`): drafts one token that the base model then
+verifies two-at-a-time. Weights are registered under `mtp.*`; the embedding and head under the base names.
+"""
+struct Qwen35MTP
+    embedding::Embedding
+    enorm::LayerNorm
+    hnorm::LayerNorm
+    eh_proj::Linear
+    block::Qwen35Block
+    head_norm::LayerNorm
+    head::Linear
+    rope_base::Float32
+    config::NamedTuple
+end
+
+function Qwen35MTP(graph::Luminal.Graph, reg=nothing; vocab_size, hidden, n_heads, n_kv_heads, head_dim,
+                   intermediate, rope_base=1f7, rotary_dim, rms_eps=1f-6, prefix="model.language_model", kwargs...)
+    emb = Luminal.tensor(graph, [vocab_size, hidden])
+    reg !== nothing && register_weight!(reg, "$(prefix).embed_tokens.weight", emb)
+    head = _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
+    p = "mtp.block"
+    block = Qwen35Block(:full,
+                        qwen35_attention(hidden, graph, reg, "$(p).self_attn"; n_heads=n_heads, n_kv_heads=n_kv_heads,
+                                         head_dim=head_dim, rotary_dim=rotary_dim, rope_theta=rope_base, epsilon=rms_eps),
+                        _gemma_rmsnorm(hidden, graph, reg, "$(p).input_layernorm"; epsilon=rms_eps),
+                        _gemma_rmsnorm(hidden, graph, reg, "$(p).post_attention_layernorm"; epsilon=rms_eps),
+                        Mlp(hidden, intermediate, graph, reg, "$(p).mlp"))
+    config = (; vocab_size, hidden, n_heads, n_kv_heads, head_dim, intermediate, rotary_dim,
+              rope_base=Float32(rope_base), rms_eps=Float32(rms_eps), prefix)
+    return Qwen35MTP(Embedding(emb),
+                     _gemma_rmsnorm(hidden, graph, reg, "mtp.enorm"; epsilon=rms_eps),
+                     _gemma_rmsnorm(hidden, graph, reg, "mtp.hnorm"; epsilon=rms_eps),
+                     _linear(2hidden, hidden, graph, reg, "mtp.eh_proj"; bias=false),
+                     block,
+                     _gemma_rmsnorm(hidden, graph, reg, "mtp.shared_head_norm"; epsilon=rms_eps),
+                     head, Float32(rope_base), config)
+end
+
+# tokens (S, B) and the base hidden states (Hidden, S, B) -> the layer's input (Hidden, S, B)
+function _mtp_input(m::Qwen35MTP, tokens::Luminal.GraphTensor, hidden::Luminal.GraphTensor)
+    e = m.enorm(m.embedding(tokens))
+    h = m.hnorm(hidden)
+    return m.eh_proj(Luminal.concat_along(e, h, 1))
+end
+
+# Prefill over S (token, hidden) pairs: returns the layer's K and V, (D, S, KV_H, B) each, for the
+# MTP cache. (The pairs are (x[i+1], H[i]) for a prompt x with base hidden states H.)
+function mtp_prefill(m::Qwen35MTP, tokens::Luminal.GraphTensor, hidden::Luminal.GraphTensor)
+    x = _mtp_input(m, tokens, hidden)
+    b = m.block
+    a, k, v = b.mixer(b.input_norm(x), 0; rope_base=m.rope_base, return_kv=true)
+    return k, v
+end
+
+# One draft step: token (1, B), hidden (Hidden, 1, B), the MTP layer's cache tensors. Returns
+# (logits (Vocab, 1, B), new K, new V); the attention op writes K/V into the cache at `pos`.
+function mtp_decode_step(m::Qwen35MTP, tokens, hidden, step_pos, pos_tensor, pk, pv)
+    x = _mtp_input(m, tokens, hidden)
+    x, nk, nv = _decode_block(m.block, x, step_pos, pos_tensor, pk, pv, m.rope_base)
+    return m.head(m.head_norm(x)), nk, nv
+end
+
+"""
+    load_qwen35_mtp(path, cfg; device, quantize) -> Dict{String,Any}
+
+The MTP head's weights (`blk.<n_layers>.*` of a GGUF that has them), under the `mtp.*` names
+`Qwen35MTP` registers; merge the result into the base model's weight dict.
+"""
+function load_qwen35_mtp(path::String, cfg; device=Luminal.get_device(), quantize=nothing)
+    f = Luminal.read_gguf(path)
+    b = "blk.$(cfg.n_layers)"
+    haskey(f.tensors, "$b.nextn.eh_proj.weight") || error("$path has no MTP head ($b.nextn.eh_proj.weight)")
+    W = Dict{String, Any}()
+    function mat(name)
+        A = Luminal.to_device(Luminal.gguf_tensor(f, name), device)
+        B = permutedims(A, (2, 1))
+        Luminal._free_now!(A)
+        return B
+    end
+    vec_(name) = vec(Luminal.gguf_tensor(f, name))
+    function store!(key, A)
+        data = A isa Array ? Luminal.to_device(Array{Float32}(A), device) : A
+        data, _ = Luminal._quantize_loaded(key, data, quantize)
+        W[key] = data
+    end
+    store!("mtp.enorm.weight", vec_("$b.nextn.enorm.weight") .- 1f0)
+    store!("mtp.hnorm.weight", vec_("$b.nextn.hnorm.weight") .- 1f0)
+    store!("mtp.shared_head_norm.weight", vec_("$b.nextn.shared_head_norm.weight") .- 1f0)
+    store!("mtp.eh_proj.weight", mat("$b.nextn.eh_proj.weight"))
+    h = "mtp.block"
+    store!("$h.input_layernorm.weight", vec_("$b.attn_norm.weight") .- 1f0)
+    store!("$h.post_attention_layernorm.weight", vec_("$b.post_attention_norm.weight") .- 1f0)
+    for (g, hf) in (("ffn_gate", "gate_proj"), ("ffn_up", "up_proj"), ("ffn_down", "down_proj"))
+        store!("$h.mlp.$hf.weight", mat("$b.$g.weight"))
+    end
+    for (g, hf) in (("attn_q", "q_proj"), ("attn_k", "k_proj"), ("attn_v", "v_proj"), ("attn_output", "o_proj"))
+        store!("$h.self_attn.$hf.weight", mat("$b.$g.weight"))
+    end
+    store!("$h.self_attn.q_norm.weight", vec_("$b.attn_q_norm.weight") .- 1f0)
+    store!("$h.self_attn.k_norm.weight", vec_("$b.attn_k_norm.weight") .- 1f0)
     Luminal.reclaim!(device)
     return W
 end

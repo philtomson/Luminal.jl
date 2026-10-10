@@ -962,6 +962,8 @@ _embed(model, tokens) = model.embedding(tokens)
 _needs_lens(model) = false
 # true if the model's prefill (called with `last_only=true`) returns only each prompt's last position's logits
 _prefill_last_only(model) = false
+# true if the model's prefill accepts `hidden_ref=Ref()` and stores its final residual stream there
+_prefill_hidden(model) = false
 _is_state_layer(layer) = false
 _state_shapes(layer, max_seq, batch) =
     (a = layer.attention; ([a.head_dim, max_seq, a.n_kv_heads, batch], [a.head_dim, max_seq, a.n_kv_heads, batch]))
@@ -1027,7 +1029,8 @@ include("Gemma3.jl")
 export Gemma3, Gemma3Block, gemma3_config, model_template
 
 include("Qwen35.jl")
-export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config, load_qwen35_gguf
+export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config, load_qwen35_gguf,
+       Qwen35MTP, load_qwen35_mtp, mtp_prefill, mtp_decode_step
 
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,
