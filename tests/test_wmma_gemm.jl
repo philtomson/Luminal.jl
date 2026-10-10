@@ -66,7 +66,10 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
     @testset "4-bit Q4Weight prefill matmul takes the WMMA path" begin
         for (Out, In, N, group, sym) in ((128, 64, 20, 32, true), (128, 128, 100, 32, false),
                                          (192, 256, 70, 64, true), (64, 96, 17, 96, false),
-                                         (256, 512, 130, 128, false), (128, 64, 3, 32, true))
+                                         (256, 512, 130, 128, false), (128, 64, 3, 32, true),
+                                         # M % 128 == 0 and N >= 192: the 128x128 kernel
+                                         (256, 256, 200, 32, true), (384, 512, 300, 64, false),
+                                         (128, 128, 192, 32, false))
             W = randn(Float32, Out, In); x = randn(Float32, In, N)
             qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = group, symmetric = sym)
             out = Luminal.zero_tensor(dev, Float32, Out, N)
