@@ -65,4 +65,9 @@ end
     plain2 = only(generate_ids(s, [prompt2]; max_new_tokens=10))
     @test generate_ids_speculative(s, d, prompt2; max_new_tokens=10) == plain2
     @test generate_ids_speculative(s, d, prompt2; max_new_tokens=10, draft_hook=(n, dr) -> n + 1 <= length(plain2) ? plain2[n + 1] : dr) == plain2
+
+    # 5. a restricted draft vocabulary only changes which tokens get drafted, never the output
+    d2 = MTPDrafter(s; draft_vocab=model.config.vocab_size ÷ 2)
+    st = Dict{Symbol,Int}()
+    @test generate_ids_speculative(s, d2, prompt; max_new_tokens=14, stats=st) == plain
 end

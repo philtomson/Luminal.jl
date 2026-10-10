@@ -439,10 +439,14 @@ struct Qwen35MTP
 end
 
 function Qwen35MTP(graph::Luminal.Graph, reg=nothing; vocab_size, hidden, n_heads, n_kv_heads, head_dim,
-                   intermediate, rope_base=1f7, rotary_dim, rms_eps=1f-6, prefix="model.language_model", kwargs...)
+                   intermediate, rope_base=1f7, rotary_dim, rms_eps=1f-6, prefix="model.language_model",
+                   draft_vocab::Int=0, kwargs...)
     emb = Luminal.tensor(graph, [vocab_size, hidden])
     reg !== nothing && register_weight!(reg, "$(prefix).embed_tokens.weight", emb)
-    head = _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
+    # draft_vocab > 0: the head scores only the first draft_vocab token ids (the BPE's most frequent), which
+    # cuts the dominant weight read of a draft step; the base model still verifies every draft.
+    head = draft_vocab > 0 ? _linear(hidden, draft_vocab, graph, reg, "mtp.draft_head"; bias=false) :
+                             _linear(hidden, vocab_size, graph, reg, "lm_head"; bias=false)
     p = "mtp.block"
     block = Qwen35Block(:full,
                         qwen35_attention(hidden, graph, reg, "$(p).self_attn"; n_heads=n_heads, n_kv_heads=n_kv_heads,

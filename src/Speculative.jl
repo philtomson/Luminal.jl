@@ -24,14 +24,15 @@ mutable struct MTPDrafter
     pos::Int                  # next MTP position
     step::Any                 # compiled single draft step, built on first use
     prefill::Dict{Int,Any}    # padded length => compiled prefill
+    draft_vocab::Int          # 0 = full vocabulary, else the head scores only token ids 0..draft_vocab-1
 end
 
-function MTPDrafter(s::LlamaSession)
+function MTPDrafter(s::LlamaSession; draft_vocab::Int=0)
     haskey(s.weights, "mtp.eh_proj.weight") || error("the session's weights have no MTP head (merge load_qwen35_mtp's result)")
     c = s.model.config
     shape = (c.head_dim, s.max_seq, c.n_kv_heads, 1)
     MTPDrafter(s, Luminal.zero_tensor(s.device, s.kv_dtype, shape...), Luminal.zero_tensor(s.device, s.kv_dtype, shape...),
-               0, nothing, Dict{Int,Any}())
+               0, nothing, Dict{Int,Any}(), draft_vocab)
 end
 
 function _weight_dtype_for(s::LlamaSession, reg)
@@ -41,6 +42,19 @@ function _weight_dtype_for(s::LlamaSession, reg)
     return id -> get(by_id, id, Float32)
 end
 
+# The first n output rows (vocabulary entries) of a matmul weight, as the same kind of weight.
+_first_rows(w::AbstractMatrix, n::Int) = w[1:n, :]
+function _first_rows(w::Luminal.Q4Weight, n::Int)
+    p = w.p[:, 1:n]
+    v = Base.reshape(reinterpret(NTuple{16, UInt8}, vec(p)), size(p, 1) ÷ 16, n)
+    Luminal.Q4Weight(p, v, w.scale[:, 1:n], w.mn === nothing ? nothing : w.mn[:, 1:n], w.group)
+end
+function _first_rows(w::Luminal.QuantWeight, n::Int)
+    q = w.q[:, 1:n]
+    v = Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), size(q, 1) ÷ 16, n)
+    Luminal.QuantWeight(q, v, w.scale[:, 1:n], w.group)
+end
+
 # The draft step takes TWO (token, hidden) pairs at consecutive positions and returns both greedy tokens
 # (device-side argmax): after an accepted draft both pairs are real; otherwise the second is a dummy whose
 # K/V slot the next step overwrites (attention is causal, so it cannot affect the first).
@@ -48,13 +62,18 @@ function _mtp_step_graph(d::MTPDrafter)
     d.step === nothing || return d.step
     s = d.session; c = s.model.config
     g = Base.invokelatest(Graph); reg = WeightRegistry()
-    m = Qwen35MTP(g, reg; c...)
+    m = Qwen35MTP(g, reg; c..., draft_vocab=d.draft_vocab)
     tok = Luminal.tensor(g, [2, 1]); hid = Luminal.tensor(g, [c.hidden, 2, 1]); pos = Luminal.tensor(g, [1])
     pk = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=s.kv_dtype)
     pv = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=s.kv_dtype)
     logits, nk, nv = mtp_decode_step(m, tok, hid, 0, pos, pk, pv)
     am = Luminal.add_op!(g, Luminal.ArgMax(), [(logits.id, 0, logits.shape)], Luminal.ShapeTracker([2, 1]))
-    load_weights!(g, reg, s.weights; device=s.device)
+    W = s.weights
+    if d.draft_vocab > 0
+        W = copy(W)
+        W["mtp.draft_head.weight"] = _first_rows(W["lm_head.weight"], d.draft_vocab)
+    end
+    load_weights!(g, reg, W; device=s.device)
     retain = [logits.id, am.id, nk.id, nv.id, tok.id, hid.id, pos.id, pk.id, pv.id]
     @info "Compiling MTP draft step..."
     exec = compile(g; device=s.device, retain=retain, free_intermediates=false,

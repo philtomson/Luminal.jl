@@ -606,3 +606,9 @@ Speculative decoding on the 27B (79-token prompt, 128 tokens): decode **16.8 -> 
 74% accepted; verify step 97 -> 90 ms (plain step 83), MTP draft 5.4 ms, rollback ~0.4 ms per cycle.
 What is left in the verify step over a plain step (~7 ms): the S = 2 attention, DeltaRule/conv writing the snapshots (~150 MB),
 2-column rmsnorm / elementwise kernels, and 2 columns in the lm_head argmax.
+
+### MTP draft step with a restricted vocabulary (done)
+The draft step was 5.4 ms, 3 ms of it the 248k-row lm_head read. `MTPDrafter(s; draft_vocab=N)` (bench `--draft-vocab=N`)
+scores only token ids 0..N-1 (the BPE's most frequent) with a row-sliced copy of the head ("mtp.draft_head"), 165 MB at
+32768. On the 27B with N=32768: MTP steps 395 -> 178 ms over 73 cycles (5.4 -> 2.4 ms), acceptance unchanged (74%),
+output identical; ~18.9 tok/s (from 18.05, derived from the phase times). Default is still the full vocabulary (0).
