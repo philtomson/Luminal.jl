@@ -544,3 +544,26 @@ Ideas left, by size: GEMM efficiency (W8A8 / better tiling); one Float16 convers
   f16 path, and activation quantization costs accuracy. Skipped unless a probe shows otherwise.
 - Remaining headroom (29 vs ~43): LDS traffic (24 `ds_load_b128` per wave per 16 WMMAs) and the 2 waits per tile.
   Larger wave tiles (64x64) need > 192 VGPRs (AMDGPU.jl cannot raise the limit).
+
+### Short prompts: the skinny int4 kernel (2026-10-10)
+
+27B (int4): time to first token 16 tokens **478 -> 146 ms**, 32 tokens ~420 -> **188 ms**, 64 tokens 387 ms, 512 tokens 1.18 s
+(unchanged); decode unchanged. Weights alone at memory speed are ~95 ms, so 16 tokens is within 1.5x of the floor.
+- Cause: prompts of <= 16 tokens (N <= `QUANT_GEMM_COLS` columns) used the multi-pass GEMV, which re-reads the weights N/2
+  times; 17-64 columns used the 64x64 WMMA kernel with its columns padded to 64 and low occupancy (~1.2 ms vs 0.3 ms ideal
+  for a 17408 x 5120 weight).
+- `wmma_q4_skinny!` (`src/WMMA.jl`, used by `_q4_matmul!` for 7..32 columns when M % 16 == 0, K % 256 == 0, group 32;
+  `LUMINAL_WMMA_SKINNY=0` disables): one workgroup = 4 waves on the same 16 weight rows, each wave taking every 4th group of
+  8 K tiles (split-K, partial sums added through LDS), dequantizing straight into the WMMA A fragments (no block-level
+  LDS tile, no barriers in the loop). 1 or 2 16-column tiles.
+- What made it fast (probes, scratchpad): 16-byte loads from 16 different rows 2.5 KB apart ran at ~70 GB/s because the
+  128-byte lines were evicted before the next 7 tiles used them. Fix: lanes load 4 rows x 128 contiguous bytes (8 K tiles)
+  per instruction, park them in a per-wave LDS tile (a wave's LDS accesses execute in order, so no barrier is needed
+  between its own write and read) and read them back in the WMMA layout; scales as one 16-byte load per row. Split-K over the
+  waves of a workgroup fixed low occupancy for small M (320 row groups for M = 5120). Now ~130-140 GB/s of weights.
+- Pitfalls: LLVM hoisting the activation loads of all 8 unrolled K tiles spills (192 VGPRs, scratch), so the tile loop count
+  is made opaque (`nu`); 64 columns (4 tiles) still spill and are no faster than the 64x64 kernel, so they stay there.
+- GEMV vs skinny crossover at the 27B's shapes is ~7 columns (`SKINNY_MIN_COLS`); batch-of-N decode and speculative
+  verification (N = 4-8) can use it too (the GEMV is better below that).
+- Next for short prompts: 33-64 columns (two passes of the 2-tile kernel would only break even), the floor of ~95 ms for the
+  weights, and the remaining non-GEMM work (DeltaRule, attention, ~40 small kernels per layer, ~10-15 ms at 16 tokens).

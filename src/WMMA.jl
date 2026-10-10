@@ -345,7 +345,7 @@ end
     ntuple(j -> Pv[8g + l % 8 + 1, min(row0 + 4 * (j - 1) + l ÷ 8, M - 1) + 1], Val(4))
 end
 
-function _wmma_q4_skinny_kernel!(C, Pv, Sc8, Mn8, Bv, K, N, ::Val{SYM}, ::Val{NW}) where {SYM, NW}
+function _wmma_q4_skinny_kernel!(C, Pv, Sc8, Mn8, Bv, K, N, ::Val{SYM}, ::Val{NW}, ::Val{NT}) where {SYM, NW, NT}
     # One workgroup = NW waves = the same 16 weight rows, each wave streaming every NW-th group of
     # 8 K tiles (more independent streams per row block); the partial sums meet in LDS at the end.
     @inbounds begin
@@ -357,7 +357,8 @@ function _wmma_q4_skinny_kernel!(C, Pv, Sc8, Mn8, Bv, K, N, ::Val{SYM}, ::Val{NW
     Ls = @ROCStaticLocalArray(NTuple{16,UInt8}, (9, 16, NW), false)   # [chunk (+1 pad), row, wave]
     Rs = @ROCStaticLocalArray(Float32, (8, 32, NW), false)
     ng = K ÷ 256
-    acc0 = _wmma_zero(); acc1 = _wmma_zero()
+    nu = min(8, 8 * ng)   # = 8; opaque to the compiler, so the tile loop is not unrolled (it would hoist all 8 tiles' B loads: spills)
+    acc0 = ntuple(_ -> _wmma_zero(), Val(NT)); acc1 = ntuple(_ -> _wmma_zero(), Val(NT))   # per 16-column tile
     g0 = min(w, ng - 1)
     raw = _wmma_q4s_raw(Pv, row0, M, l, g0)
     sc = Sc8[g0 + 1, grow + 1]; mn = SYM ? sc : Mn8[g0 + 1, grow + 1]
@@ -369,48 +370,55 @@ function _wmma_q4_skinny_kernel!(C, Pv, Sc8, Mn8, Bv, K, N, ::Val{SYM}, ::Val{NW
         scn = Sc8[gn + 1, grow + 1]; mnn = SYM ? scn : Mn8[gn + 1, grow + 1]
         nraw = _wmma_q4s_raw(Pv, row0, M, l, gn)
         # (the tile is private to this wave: LDS accesses of a wave execute in order, so no barrier)
-        for u in 0:7
+        for u in 0:nu-1
             t = 8g + u
             qa = Ls[u + 1, r + 1, w + 1]
             sa = Float32(sc[u + 1]); ma = SYM ? -8f0 * sa : Float32(mn[u + 1])
-            b1 = Bv[4t + 1, r + 1]; b2 = Bv[4t + 2, r + 1]; b3 = Bv[4t + 3, r + 1]; b4 = Bv[4t + 4, r + 1]
             lo0, hi0 = _wmma_dq4(ntuple(i -> qa[i], Val(8)), sa, ma)
             lo1, hi1 = _wmma_dq4(ntuple(i -> qa[i + 8], Val(8)), sa, ma)
-            acc0 = _wmma16(_wmma_cat(lo0, hi0), _wmma_cat(b1, b2), acc0)
-            acc1 = _wmma16(_wmma_cat(lo1, hi1), _wmma_cat(b3, b4), acc1)
+            a0 = _wmma_cat(lo0, hi0); a1 = _wmma_cat(lo1, hi1)
+            acc0 = let a = acc0
+                ntuple(j -> _wmma16(a0, _wmma_cat(Bv[4t + 1, 16 * (j - 1) + r + 1], Bv[4t + 2, 16 * (j - 1) + r + 1]), a[j]), Val(NT))
+            end
+            acc1 = let a = acc1
+                ntuple(j -> _wmma16(a1, _wmma_cat(Bv[4t + 3, 16 * (j - 1) + r + 1], Bv[4t + 4, 16 * (j - 1) + r + 1]), a[j]), Val(NT))
+            end
         end
         raw = nraw; sc = scn; mn = mnn
     end
-    for i in 0:7
-        Rs[i + 1, l + 1, w + 1] = acc0[i + 1].value + acc1[i + 1].value
-    end
-    sync_workgroup()
-    if w == 0 && r < N
-        for i in 0:7   # lane l holds D[2i + l÷16, l%16]: weight row 2i + h, activation column r
-            row = row0 + 2i + h
-            v = 0f0
-            for k in 1:NW
-                v += Rs[i + 1, l + 1, k]
-            end
-            row < M && (C[row + 1, r + 1] = v)
+    for j in 1:NT
+        for i in 0:7
+            Rs[i + 1, l + 1, w + 1] = acc0[j][i + 1].value + acc1[j][i + 1].value
         end
+        sync_workgroup()
+        if w == 0 && 16 * (j - 1) + r < N
+            for i in 0:7   # lane l holds D[2i + l÷16, l%16]: weight row 2i + h, activation column 16(j-1) + r
+                row = row0 + 2i + h
+                v = 0f0
+                for k in 1:NW
+                    v += Rs[i + 1, l + 1, k]
+                end
+                row < M && (C[row + 1, 16 * (j - 1) + r + 1] = v)
+            end
+        end
+        sync_workgroup()
     end
     return
     end
 end
 
-# C (M, N <= 16) = dequantize(Pv, scale, mn)' * B for B (K, >= 16) Float16 (columns >= N ignored).
+# C (M, N <= 32) = dequantize(Pv, scale, mn)' * B for B (K, >= 16 * cld(N, 16)) Float16 (columns >= N ignored).
 function wmma_q4_skinny!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
                          group::Int, B::ROCArray{Float16,2}, N::Int)
     K32, M = size(Pv); K = 32 * K32
-    (M % 16 == 0 && K % 256 == 0 && group == 32 && size(B, 1) == K && size(B, 2) >= 16 && N <= 16 &&
+    (M % 16 == 0 && K % 256 == 0 && group == 32 && size(B, 1) == K && size(B, 2) >= 16 * cld(N, 16) && N <= 32 &&
      size(scale) == (K ÷ group, M) && size(C) == (M, N)) ||
-        throw(ArgumentError("wmma_q4_skinny!: need M % 16 == 0, K % 256 == 0, group == 32, N <= 16"))
+        throw(ArgumentError("wmma_q4_skinny!: need M % 16 == 0, K % 256 == 0, group == 32, N <= 32"))
     Bv = reinterpret(WMMA_V8H, B)
     Sc8 = reinterpret(NTuple{8,Float16}, scale)
     Mn8 = mn === nothing ? Sc8 : reinterpret(NTuple{8,Float16}, mn)
     @roc groupsize=32 * WMMA_SKINNY_WAVES[] gridsize=cld(M, 16) _wmma_q4_skinny_kernel!(
-        C, Pv, Sc8, Mn8, Bv, K, N, Val(mn === nothing), Val(WMMA_SKINNY_WAVES[]))
+        C, Pv, Sc8, Mn8, Bv, K, N, Val(mn === nothing), Val(WMMA_SKINNY_WAVES[]), Val(N <= 16 ? 1 : 2))
     return C
 end
 

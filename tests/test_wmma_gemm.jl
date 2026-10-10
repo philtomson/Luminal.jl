@@ -76,12 +76,13 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
                                          (48, 128, 100, 32, true), (80, 256, 250, 64, false), (176, 128, 200, 32, true),
                                          # 7..16 columns: the skinny kernel (group 32, K % 256 == 0), else the GEMV
                                          (128, 256, 8, 32, true), (48, 256, 16, 32, false), (256, 512, 12, 32, false), (80, 768, 9, 32, true),
-                                         (64, 96, 10, 32, true), (128, 128, 6, 32, false))
+                                         (64, 96, 10, 32, true), (128, 128, 6, 32, false),
+                                         (128, 256, 20, 32, true), (48, 512, 32, 32, false), (256, 256, 33, 32, true))
             W = randn(Float32, Out, In); x = randn(Float32, In, N)
             qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = group, symmetric = sym)
             out = Luminal.zero_tensor(dev, Float32, Out, N)
             Luminal.batch_matmul!(out, qw, Luminal.to_device(x, dev))
-            f16 = N > Luminal.QUANT_GEMM_COLS || (N >= Luminal.SKINNY_MIN_COLS && In % 256 == 0 && group == 32 && Out % 16 == 0)
+            f16 = N > Luminal.QUANT_GEMM_COLS || (Luminal.SKINNY_MIN_COLS <= N <= Luminal.SKINNY_MAX_COLS && In % 256 == 0 && group == 32 && Out % 16 == 0)
             xr = f16 ? Float32.(Float16.(x)) : x
             @test relerr(Array(out), Array(Luminal.dequantize(qw)) * xr) < 2e-3
         end
