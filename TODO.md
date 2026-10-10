@@ -463,3 +463,30 @@ Measured on the 27B (int4, 512 tokens, 2026-10-09): time to first token 2.97 s -
 1.44x); decode unchanged (11.4-12.3 tok/s). What is left of the 2.07 s: the int4 WMMA GEMM ~1.3 s (64%), the small
 kernels ~0.45 s, DeltaRule now ~0.1 s. Next: GEMM blocking, the small kernels, and prompts of <= 16 tokens
 (507 ms to the first token for a 16-token prompt: below `QUANT_GEMM_COLS` the weights are read several times).
+
+### GEMM blocking and small kernels (2026-10-09)
+
+Measured on the 27B (int4, 512 tokens): time to first token 2.07 s -> **1.38 s** (248 -> 370 tok/s; gufo ~0.78 s);
+16-token prompt 507 -> 462 ms; decode unchanged (11.1-12.3 tok/s, run-to-run noise from the other jobs).
+Three changes:
+- **int4 GEMM** (`_wmma_q4_big_kernel!`, used when M % 128 == 0 and the padded N % 128 == 0, i.e. N >= 192 gets
+  padded to 128): 128x128 block, 8 waves of 32x64, so each dequantized weight tile feeds twice the columns;
+  dequantization in packed Float16 (code ORed into the mantissa of 1024.0, one exact subtract, one packed fma with
+  scale and min; ~7% of the kernel time left). At the 27B's shapes 19 -> 27-28 TFLOPS (1.4x; f16 peak 51).
+  Tried and dropped: LDS double buffering (one barrier per tile; no gain) and BK = 64 (slower, ~10%).
+  `LUMINAL_WMMA_BIG=0` selects the 64x64 kernel. Still ~55% of peak; the remaining gap is not VGPRs (168-192 is
+  fine for occupancy on RDNA3.5) or the dequantization. Next ideas: gufo's W8A8 int8 kernel, a B tile staged once
+  per 2 K tiles, `v_perm`-based nibble expansion, direct-to-LDS loads.
+- **Logits only at the last position** (`LastToken` op, Qwen35 `last_only=true`; `NN._prefill_last_only`): prefill
+  computed the 248k-vocab lm_head for all 512 positions (a 48 ms GEMM, 0.5 GB of logits copied to the host,
+  another ~45 ms) and used one column. -90 ms, and 0.5 GB less scratch. Other models still return all positions.
+- **No zero fill for fully-overwritten outputs** (`_writes_all`, `Luminal.uninit_tensor`): elementwise groups,
+  reshape/permute/contiguous, rmsnorm, rotary, softmax and LastToken skip the `fill_kernel` launch (~2.5% of prefill).
+- `--layers=N` in `qwen35_gguf_bench.jl` runs the first N layers of the real model (3 DeltaNet + 1 attention at
+  N = 4): the same kernel mix at ~1/16 of the time and 2 GB, so it can be profiled with `rocprofv3` safely
+  (a profiled run of the whole 27B tripped the memory watchdog at 35 GB of HIP pool).
+Profile of the 4-layer slice after these (x16 for the 27B): GEMM ~70% of the kernel time, rocBLAS f32 attention GEMMs
+(`MT32x32x8`, 8 launches of ~0.7 ms per full-attention layer at ~2 TFLOPS) ~6%, DeltaRule ~4%, the rest is
+~40 small kernels per layer (4-D broadcasts, `linear_copy`, permutes, reduces) at 1-3% each.
+Next: a flash-style prefill attention (WMMA, GQA, causal) to replace the f32 sgemm pair; find which `linear_copy`
+and 4-D broadcast launches remain (45 copies per 4 layers); the 16-token path.
