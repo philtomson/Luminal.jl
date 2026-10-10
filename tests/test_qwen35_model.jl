@@ -95,11 +95,12 @@ end
     # one 2-token verify step from the same prefill
     sB, dcB = prefilled()
     vg = Luminal.Decoding._verify_graph(sB, 1, 2)
-    lg, hid = Luminal.Decoding._verify_step!(sB, vg, Base.reshape(toks, 2, 1))
+    lg, hid, am = Luminal.Decoding._verify_step!(sB, vg, Base.reshape(toks, 2, 1))
     lgh = Array(lg)
     @test relerr(lgh[:, 1, 1], lA[1]) < 1e-4
     @test relerr(lgh[:, 2, 1], lA[2]) < 1e-4
     @test size(Array(hid)) == (sB.model.config.hidden, 2, 1)
+    @test vec(am) == [argmax(lgh[:, 1, 1]) - 1, argmax(lgh[:, 2, 1]) - 1]      # the device-side greedy picks
     for (cA, cB, lay) in zip(dcA.cache.self_cache, dcB.cache.self_cache, sA.model.layers)
         Luminal.NN._is_state_layer(lay) && continue
         @test relerr(Array(cB[1])[:, 6:7, :, :], Array(cA[1])[:, 6:7, :, :]) < 1e-4    # K of the 2 new positions

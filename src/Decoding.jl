@@ -202,9 +202,9 @@ function _verify_graph(s::LlamaSession, B::Int, seq::Int)
         g = Base.invokelatest(Graph); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
         idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype,
-                                       seq=seq, snapshots=true, want_hidden=true)
+                                       seq=seq, snapshots=true, want_hidden=true, want_argmax=true)
         load_weights!(g, reg, s.weights; device=s.device)
-        retain = vcat(idg.logits_id, idg.hidden_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
+        retain = vcat(idg.logits_id, idg.hidden_id, idg.argmax_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
                       idg.lens_input_id == 0 ? Int[] : [idg.lens_input_id],
                       [i for ab in idg.snap_ids for i in ab])
         capture = s.device isa Luminal.AMDDevice
@@ -223,8 +223,9 @@ function _verify_graph(s::LlamaSession, B::Int, seq::Int)
 end
 
 # Run one verify step: tokens (seq, B) at each sequence's cache position, `lens` = seq. Returns
-# (logits (vocab, seq, B), hidden (Hidden, seq, B)) as device arrays; the cache has the new K/V, the
-# recurrent states are at the end of the `seq` tokens, and `snaps` hold them after the first token.
+# (logits (vocab, seq, B), hidden (Hidden, seq, B)) as device arrays and the greedy tokens (seq, B)
+# (0-based, host); the cache has the new K/V, the recurrent states are at the end of the `seq` tokens,
+# and `snaps` hold them after the first token.
 function _verify_step!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
     cache = vg.cache; idg = vg.idg
     inputs = Dict{Int, Any}()
@@ -241,7 +242,7 @@ function _verify_step!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
         inputs[idg.snap_ids[j][1]] = vg.snaps[j][1]; inputs[idg.snap_ids[j][2]] = vg.snaps[j][2]
     end
     res = vg.exec(inputs; device=s.device)
-    return res[idg.logits_id], res[idg.hidden_id]
+    return res[idg.logits_id], res[idg.hidden_id], Int.(Array(res[idg.argmax_id]))
 end
 
 # Roll the recurrent states back to their snapshots (the state after the first verified token).

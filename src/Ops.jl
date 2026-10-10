@@ -294,6 +294,10 @@ struct DeltaRule <: Op
 end
 DeltaRule(scale::Float32, fresh::Bool) = DeltaRule(scale, fresh, 0)
 
+# ArgMax: out (S, B) = the 0-based index of the first maximum along dim 1 of x (V, S, B), as Float32.
+#   Greedy decoding picks tokens on the device instead of reading the logits back.
+struct ArgMax <: Op end
+
 # LastToken: out (H, 1, B) holds each sequence's hidden state at its last real position,
 #   out[:, 1, b] = x[:, lens[b], b] (clamped to 1:S), for x (H, S, B) and lens (B,).
 #   A prefill needs the logits of those positions only, so the final norm and the

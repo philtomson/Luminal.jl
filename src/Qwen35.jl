@@ -486,14 +486,14 @@ function mtp_decode_step(m::Qwen35MTP, tokens, hidden, step_pos, pos_tensor, pk,
 end
 
 """
-    load_qwen35_mtp(path, cfg; device, quantize) -> Dict{String,Any}
+    load_qwen35_mtp(path, cfg; device, quantize, block=cfg.n_layers) -> Dict{String,Any}
 
-The MTP head's weights (`blk.<n_layers>.*` of a GGUF that has them), under the `mtp.*` names
+The MTP head's weights (`blk.<block>.*` of a GGUF that has them; `block` is the base model's layer count), under the `mtp.*` names
 `Qwen35MTP` registers; merge the result into the base model's weight dict.
 """
-function load_qwen35_mtp(path::String, cfg; device=Luminal.get_device(), quantize=nothing)
+function load_qwen35_mtp(path::String, cfg; device=Luminal.get_device(), quantize=nothing, block::Int=cfg.n_layers)
     f = Luminal.read_gguf(path)
-    b = "blk.$(cfg.n_layers)"
+    b = "blk.$block"
     haskey(f.tensors, "$b.nextn.eh_proj.weight") || error("$path has no MTP head ($b.nextn.eh_proj.weight)")
     W = Dict{String, Any}()
     function mat(name)

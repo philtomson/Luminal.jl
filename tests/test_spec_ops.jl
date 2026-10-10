@@ -71,3 +71,14 @@ end
         end
     end
 end
+
+@testset "ArgMax op ($(nameof(typeof(dev))))" for dev in devs
+    for (V, S, B) in ((1000, 2, 1), (257, 3, 2), (248320, 2, 1), (5, 1, 1))
+        x = randn(Float32, V, S, B)
+        x[V ÷ 2, 1, 1] = 100f0; x[V, 1, 1] = 100f0           # a tie: the first one wins
+        out = Luminal.zero_tensor(dev, Float32, S, B)
+        Luminal.execute_op!(out, Luminal.ArgMax(), dv_(dev, x))
+        ref = Float32[argmax(view(x, :, s, b)) - 1 for s in 1:S, b in 1:B]
+        @test Array(out) == ref
+    end
+end

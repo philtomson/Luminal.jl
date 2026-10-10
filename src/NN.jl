@@ -877,6 +877,7 @@ struct LlamaDecodeGraph
     step_pos::Luminal.DimType
     lens_input_id::Int            # (B,) tokens each sequence consumes (recurrent layers); 0 if none
     hidden_id::Int                # the final residual stream (Hidden, S, B) before the output norm; 0 unless requested
+    argmax_id::Int                # (S, B) index of each position's greedy token (computed on the device); 0 unless requested
     snap_ids::Vector{Tuple{Int,Int}}   # per recurrent layer, the snapshot buffers (see CausalConv); empty unless requested
     seq::Int                      # tokens per sequence per step
 end
@@ -900,7 +901,8 @@ function build_llama_decode_step!(model,
                                    kv_dtype::Type=Float32,
                                    seq::Int=1,
                                    snapshots::Bool=false,
-                                   want_hidden::Bool=false)
+                                   want_hidden::Bool=false,
+                                   want_argmax::Bool=false)
     # ── Inputs ────────────────────────────────────────────────────────────────
     token_in = Luminal.tensor(graph, [seq, batch])
     pos_tensor = Luminal.tensor(graph, [batch])   # each sequence's position
@@ -950,6 +952,8 @@ function build_llama_decode_step!(model,
         step_pos,
         lens === nothing ? 0 : lens.id,
         want_hidden ? x.id : 0,
+        want_argmax ? Luminal.add_op!(graph, Luminal.ArgMax(), [(logits.id, 0, logits.shape)],
+                                      Luminal.ShapeTracker([seq, batch])).id : 0,
         [(a.id, b.id) for (a, b) in snap_tensors],
         seq)
 end

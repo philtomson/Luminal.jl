@@ -380,6 +380,55 @@ function execute_op!(out, op::LastToken, x, lens)
     return out
 end
 
+# One workgroup per (position, batch) column: each thread scans a strided slice for its best (value, index),
+# then a tree reduction keeps the larger value, and the smaller index on ties (the first maximum).
+@kernel function _argmax_kernel!(out, @Const(x))
+    grp = @index(Group, Linear); lid = @index(Local, Linear)
+    T = @uniform @groupsize()[1]
+    V = @uniform size(x, 1)
+    col = @uniform (@index(Group, Linear) - 1)
+    s = @uniform col % size(x, 2) + 1
+    b = @uniform col ÷ size(x, 2) + 1
+    rv = @localmem Float32 (256,)
+    ri = @localmem Int32 (256,)
+    bv = -Inf32; bi = Int32(typemax(Int32))
+    i = lid
+    while i <= V
+        @inbounds v = x[i, s, b]
+        if v > bv || (v == bv && Int32(i) < bi)
+            bv = v; bi = Int32(i)
+        end
+        i += T
+    end
+    @inbounds rv[lid] = bv; @inbounds ri[lid] = bi
+    @synchronize
+    stride = T ÷ 2
+    while stride > 0
+        if lid <= stride
+            @inbounds ov = rv[lid + stride]; @inbounds oi = ri[lid + stride]
+            @inbounds cv = rv[lid]; @inbounds ci = ri[lid]
+            if ov > cv || (ov == cv && oi < ci)
+                @inbounds rv[lid] = ov; @inbounds ri[lid] = oi
+            end
+        end
+        @synchronize
+        stride ÷= 2
+    end
+    lid == 1 && (@inbounds out[s, b] = Float32(ri[1] - 1))
+end
+
+function execute_op!(out, op::ArgMax, x)
+    V, S, B = size(x, 1), size(x, 2), size(x, 3)
+    if !(out isa AnyGPUArray)
+        for b in 1:B, s in 1:S
+            out[s, b] = Float32(argmax(view(x, :, s, b)) - 1)
+        end
+        return out
+    end
+    _argmax_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x); ndrange = S * B * 256)
+    return out
+end
+
 function execute_op!(out, op::CausalAttention, q, k, v)
     D = size(q, 1)
     if out isa AMDGPU.ROCArray && wmma_supported() && D % 32 == 0
