@@ -113,7 +113,7 @@ function (m::Gemma3)(input::Luminal.GraphTensor, prev_seq::Int; return_kv::Bool=
     return return_kv ? (logits, kvs) : logits
 end
 
-function _decode_block(b::Gemma3Block, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing)
+function _decode_block(b::Gemma3Block, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing, snaps=nothing)
     attn_out, nk, nv = llama_self_attn_cached(b.attention, b.input_norm(x), step_pos, pos_tensor, pk, pv;
                                               rope_base=rope_base)
     x = x + b.post_attention_norm(attn_out)

@@ -66,3 +66,50 @@ end
     @test g16 == g32
     @test all(relerr(st16[k], st32[k]) < 1e-3 for k in eachindex(st32))
 end
+
+# A 2-token verify step (speculative decoding) against two single-token steps: the same logits for
+# both tokens, the same K/V and recurrent states afterwards, and the snapshot buffers hold each
+# recurrent layer's state after the first token only.
+@testset "multi-token verify step ($(nameof(typeof(dev))))" for dev in devices
+    model = model_template(REF)
+    ids = Int.(refarr("ids"))
+    prompt = ids[1:5, 1]
+    function prefilled()
+        s = LlamaSession(model, nothing, REF; max_seq=32, decode_weights=Float32, device=dev)
+        generate_ids(s, [prompt]; max_new_tokens=1)            # prefill (+ the first token's logits)
+        dc = Luminal.Decoding._decode_graph(s, 1)
+        s, dc
+    end
+    # two single-token steps
+    sA, dcA = prefilled()
+    toks = [7, 11]
+    lA = []
+    states1 = nothing
+    for (n, t) in enumerate(toks)
+        l = Luminal.NN.llama_decode_step!(dcA.exec, dcA.idg, dcA.cache, [t]; device=dev)
+        push!(lA, Array(l)[:, 1, 1])
+        if n == 1
+            states1 = [(Array(copy(c[1])), Array(copy(c[2]))) for (c, lay) in zip(dcA.cache.self_cache, sA.model.layers) if Luminal.NN._is_state_layer(lay)]
+        end
+    end
+    # one 2-token verify step from the same prefill
+    sB, dcB = prefilled()
+    vg = Luminal.Decoding._verify_graph(sB, 1, 2)
+    lg, hid = Luminal.Decoding._verify_step!(sB, vg, Base.reshape(toks, 2, 1))
+    lgh = Array(lg)
+    @test relerr(lgh[:, 1, 1], lA[1]) < 1e-4
+    @test relerr(lgh[:, 2, 1], lA[2]) < 1e-4
+    @test size(Array(hid)) == (sB.model.config.hidden, 2, 1)
+    for (cA, cB, lay) in zip(dcA.cache.self_cache, dcB.cache.self_cache, sA.model.layers)
+        Luminal.NN._is_state_layer(lay) && continue
+        @test relerr(Array(cB[1])[:, 6:7, :, :], Array(cA[1])[:, 6:7, :, :]) < 1e-4    # K of the 2 new positions
+    end
+    j = 0
+    for (cA, cB, lay) in zip(dcA.cache.self_cache, dcB.cache.self_cache, sA.model.layers)
+        Luminal.NN._is_state_layer(lay) || continue
+        j += 1
+        @test relerr(Array(cB[2]), Array(cA[2])) < 1e-4                                  # state after both tokens
+        @test relerr(Array(vg.snaps[j][2]), states1[j][2]) < 1e-4                        # snapshot = state after token 1
+        @test relerr(Array(vg.snaps[j][1]), states1[j][1]) < 1e-4
+    end
+end

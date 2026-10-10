@@ -59,7 +59,8 @@ sequence holding its position). `fresh=true` for a prefill from empty states,
 `false` to continue (decode).
 """
 function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTensor,
-                             rec_state::Luminal.GraphTensor, lens::Luminal.GraphTensor; fresh::Bool)
+                             rec_state::Luminal.GraphTensor, lens::Luminal.GraphTensor; fresh::Bool,
+                             snaps=nothing, snap_t::Int=1)
     g_ = x.graph_ref
     _, S, B = Luminal.realized_dims(x.shape)
     nk, nv, dk, dv = dn.nk, dn.nv, dn.dk, dn.dv
@@ -68,7 +69,8 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
     # projections, then the causal convolution over q, k and v together
     qkv = dn.in_proj_qkv(x)                                                   # (C, S, B)
     conv_ins = [(t.id, 0, t.shape) for t in (qkv, conv_state, dn.conv_w, lens)]
-    qkv = Luminal.add_op!(g_, Luminal.CausalConv(fresh), conv_ins, Luminal.ShapeTracker([C, S, B]))
+    snaps === nothing || push!(conv_ins, (snaps[1].id, 0, snaps[1].shape))   # state after `snap_t` tokens lands here
+    qkv = Luminal.add_op!(g_, Luminal.CausalConv(fresh, snaps === nothing ? 0 : snap_t), conv_ins, Luminal.ShapeTracker([C, S, B]))
 
     q = Luminal.reshape(Luminal.slice_along(qkv, 1, 0, nk * dk), [dk, nk, S, B])
     k = Luminal.reshape(Luminal.slice_along(qkv, 1, nk * dk, 2nk * dk), [dk, nk, S, B])
@@ -81,7 +83,8 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
     g = Luminal.expand(Luminal.expand(-exp(dn.A_log), 2, S), 3, B) * Luminal.softplus(a)
 
     ins = [(t.id, 0, t.shape) for t in (q, k, v, g, beta, rec_state, lens)]
-    o = Luminal.add_op!(g_, Luminal.DeltaRule(Float32(1 / sqrt(dk)), fresh), ins,
+    snaps === nothing || push!(ins, (snaps[2].id, 0, snaps[2].shape))
+    o = Luminal.add_op!(g_, Luminal.DeltaRule(Float32(1 / sqrt(dk)), fresh, snaps === nothing ? 0 : snap_t), ins,
                         Luminal.ShapeTracker([dv, nv, S, B]))
 
     # gated RMSNorm per value head: norm(o) * w * silu(z)
@@ -216,10 +219,10 @@ _state_shapes(l::Qwen35Block, max_seq, batch) =
     ([l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch], [l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch])
 _is_state_layer(l::Qwen35Block) = l.kind === :linear
 
-function _decode_block(l::Qwen35Block, x, step_pos, pos_tensor, s1, s2, rope_base; lens=nothing)
+function _decode_block(l::Qwen35Block, x, step_pos, pos_tensor, s1, s2, rope_base; lens=nothing, snaps=nothing)
     h = l.input_norm(x)
     if l.kind === :linear
-        a = l.mixer(h, s1, s2, lens; fresh=false)
+        a = l.mixer(h, s1, s2, lens; fresh=false, snaps=snaps, snap_t=1)
         nk, nv = s1, s2
     else
         a, nk, nv = llama_self_attn_cached(l.mixer, h, step_pos, pos_tensor, s1, s2; rope_base=rope_base)

@@ -832,30 +832,30 @@ function llama_self_attn_cached(sa::SelfAttention,
                                  past_k::Luminal.GraphTensor,
                                  past_v::Luminal.GraphTensor;
                                  rope_base::Float32=500000f0)
-    hidden, _, batch = Luminal.realized_dims(x.shape)
+    hidden, S, batch = Luminal.realized_dims(x.shape)    # S new tokens per sequence (1 for a plain decode step)
     D, KVH = sa.head_dim, sa.n_kv_heads
     G = div(sa.n_heads, KVH)              # query heads per KV head
     max_seq = Luminal.realized_dims(past_k.shape)[2]
 
-    # Project current token: (Hidden, 1, B) -> (D, 1, H, B), then RoPE
-    q, gate = _query_and_gate(sa, sa.q_proj(x), 1, batch)
+    # Project the current tokens: (Hidden, S, B) -> (D, S, H, B), then RoPE
+    q, gate = _query_and_gate(sa, sa.q_proj(x), S, batch)
     q     = Luminal.permute(q, [1, 3, 2, 4])
-    k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
-    v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, 1, batch]), [1, 3, 2, 4])
+    k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
+    v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
     base = _rope_base(sa, rope_base)
     q     = _rope(sa, _qk_norm(sa.q_norm, q),     step_pos_tensor, base)
     k_new = _rope(sa, _qk_norm(sa.k_norm, k_new), step_pos_tensor, base)
 
-    # Attention over cache slots [0, pos) plus the current token, in one kernel
+    # Attention over cache slots [0, pos) plus the current token(s), in one kernel
     # (see Luminal.DecodeAttention): scores, softmax and the weighted sum of V,
     # grouped-query heads reading their KV head directly. (D, H, B) is the
     # head-major order the output projection expects.
     ins = [(t.id, 0, t.shape) for t in (q, past_k, past_v, k_new, v_new, step_pos_tensor)]
-    # The op also writes this token's K/V into the cache slot (write_cache=true).
+    # The op also writes the tokens' K/V into the cache slots (write_cache=true).
     out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(sa.scale, true, sa.window), ins,
-                          Luminal.ShapeTracker([D, sa.n_heads, batch]))
-    out = Luminal.reshape(out, [D * sa.n_heads, 1, batch])
-    out = _gate_output(sa, out, gate, 1, batch)
+                          Luminal.ShapeTracker(S == 1 ? [D, sa.n_heads, batch] : [D, sa.n_heads, S, batch]))
+    out = Luminal.reshape(out, [D * sa.n_heads, S, batch])
+    out = _gate_output(sa, out, gate, S, batch)
 
     return sa.o_proj(out), k_new, v_new
 end
@@ -876,6 +876,9 @@ struct LlamaDecodeGraph
     new_self_v_ids::Vector{Int}   # this step's V slot per layer, (D, 1, KV_H, B)
     step_pos::Luminal.DimType
     lens_input_id::Int            # (B,) tokens each sequence consumes (recurrent layers); 0 if none
+    hidden_id::Int                # the final residual stream (Hidden, S, B) before the output norm; 0 unless requested
+    snap_ids::Vector{Tuple{Int,Int}}   # per recurrent layer, the snapshot buffers (see CausalConv); empty unless requested
+    seq::Int                      # tokens per sequence per step
 end
 
 
@@ -894,9 +897,12 @@ function build_llama_decode_step!(model,
                                    max_seq::Int=2048,
                                    batch::Int=1,
                                    rope_base::Float32=500000f0,
-                                   kv_dtype::Type=Float32)
+                                   kv_dtype::Type=Float32,
+                                   seq::Int=1,
+                                   snapshots::Bool=false,
+                                   want_hidden::Bool=false)
     # ── Inputs ────────────────────────────────────────────────────────────────
-    token_in = Luminal.tensor(graph, [1, batch])
+    token_in = Luminal.tensor(graph, [seq, batch])
     pos_tensor = Luminal.tensor(graph, [batch])   # each sequence's position
     lens = _needs_lens(model) ? Luminal.tensor(graph, [batch]) : nothing
 
@@ -909,22 +915,29 @@ function build_llama_decode_step!(model,
     self_v_tensors = [Luminal.tensor(graph, s[2]; dtype=cdt(l)) for (s, l) in zip(shapes, model.layers)]
 
     # ── Embedding ─────────────────────────────────────────────────────────────
-    x = _embed(model, token_in)  # (hidden, 1, batch)
+    x = _embed(model, token_in)  # (hidden, seq, batch)
 
     # ── Decoder layers ────────────────────────────────────────────────────────
     new_k_tensors = Luminal.GraphTensor[]
     new_v_tensors = Luminal.GraphTensor[]
+    # speculative steps (seq > 1): each recurrent layer also records its state after the first token
+    snap_tensors = Tuple{Luminal.GraphTensor,Luminal.GraphTensor}[]
 
     for (i, layer) in enumerate(model.layers)
+        snaps = nothing
+        if snapshots && _is_state_layer(layer)
+            snaps = (Luminal.tensor(graph, shapes[i][1]; dtype=Float32), Luminal.tensor(graph, shapes[i][2]; dtype=Float32))
+            push!(snap_tensors, snaps)
+        end
         x, nk, nv = _decode_block(layer, x, step_pos, pos_tensor, self_k_tensors[i], self_v_tensors[i], rope_base;
-                                  lens=lens)
+                                  lens=lens, snaps=snaps)
         push!(new_k_tensors, nk)
         push!(new_v_tensors, nv)
     end
 
     # ── Head ─────────────────────────────────────────────────────────────────
-    out    = model.norm(x)   # (Hidden, 1, Batch)
-    logits = model.head(out) # (Vocab, 1, Batch)
+    out    = model.norm(x)   # (Hidden, seq, Batch)
+    logits = model.head(out) # (Vocab, seq, Batch)
 
     return LlamaDecodeGraph(
         token_in.id,
@@ -935,7 +948,10 @@ function build_llama_decode_step!(model,
         [t.id for t in new_k_tensors],
         [t.id for t in new_v_tensors],
         step_pos,
-        lens === nothing ? 0 : lens.id)
+        lens === nothing ? 0 : lens.id,
+        want_hidden ? x.id : 0,
+        [(a.id, b.id) for (a, b) in snap_tensors],
+        seq)
 end
 
 
@@ -949,7 +965,7 @@ _prefill_last_only(model) = false
 _is_state_layer(layer) = false
 _state_shapes(layer, max_seq, batch) =
     (a = layer.attention; ([a.head_dim, max_seq, a.n_kv_heads, batch], [a.head_dim, max_seq, a.n_kv_heads, batch]))
-function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing)
+function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing, snaps=nothing)
     attn_out, nk, nv = llama_self_attn_cached(layer.attention, layer.attention_norm(x), step_pos, pos_tensor,
                                               pk, pv; rope_base=rope_base)
     x = x + attn_out

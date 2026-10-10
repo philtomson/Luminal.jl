@@ -87,6 +87,7 @@ mutable struct LlamaSession{M, D}
     prefill::Dict{Tuple{Int,Int}, Any}   # (padded length, batch) => compiled prefill
     decode::Dict{Int, Any}               # batch => compiled decode step and its cache
     kv_dtype::DataType                   # element type of the K/V caches
+    spec::Dict{Any, Any}                 # speculative decoding: compiled multi-token verify steps, MTP graphs
 end
 
 function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_dir::String;
@@ -109,7 +110,7 @@ function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_di
     end
     awq === nothing || awq_apply!(weights, awq, model)
     return LlamaSession(model, tokenizer, weights, dev, max_seq, Float32(rope_base), search, wdtype,
-                        Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}(), kv_dtype)
+                        Dict{Tuple{Int,Int}, Any}(), Dict{Int, Any}(), kv_dtype, Dict{Any, Any}())
 end
 
 Base.show(io::IO, s::LlamaSession) =
@@ -183,6 +184,70 @@ function _decode_graph(s::LlamaSession, B::Int)
         end
         cache = LlamaKVCacheState(s.model; batch=B, max_seq=s.max_seq, device=s.device, kv_dtype=s.kv_dtype)
         (exec=exec, idg=idg, cache=cache)
+    end
+end
+
+# The compiled multi-token decode step for speculative decoding: `seq` tokens per sequence in one
+# pass (the weights are read once for all of them), the recurrent layers also recording their state
+# after the first token (snapshot buffers `snaps`, for rolling a rejected draft back), and the final
+# residual stream (Hidden, seq, B) returned for the MTP head. It runs on the same cache arrays as the
+# plain decode step of batch B.
+function _verify_graph(s::LlamaSession, B::Int, seq::Int)
+    get!(s.spec, (:verify, B, seq)) do
+        dc = _decode_graph(s, B)
+        g = Base.invokelatest(Graph); reg = WeightRegistry()
+        m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
+        idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype,
+                                       seq=seq, snapshots=true, want_hidden=true)
+        load_weights!(g, reg, s.weights; device=s.device)
+        retain = vcat(idg.logits_id, idg.hidden_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
+                      idg.lens_input_id == 0 ? Int[] : [idg.lens_input_id],
+                      [i for ab in idg.snap_ids for i in ab])
+        capture = s.device isa Luminal.AMDDevice
+        wd = s.decode_weights
+        if !(wd isa Type)
+            by_id = Dict{Int, Type}(id => wd(name) for (name, id) in reg.mapping)
+            wd = id -> get(by_id, id, Float32)
+        end
+        @info "Compiling verify graph (batch $B, $seq tokens)..."
+        exec = compile(g; device=s.device, retain=retain, free_intermediates=false, weight_dtype=wd, capture=capture)
+        snaps = [(Luminal.zero_tensor(s.device, Float32, size(dc.cache.self_cache[i][1])...),
+                  Luminal.zero_tensor(s.device, Float32, size(dc.cache.self_cache[i][2])...))
+                 for (i, l) in enumerate(s.model.layers) if NN._is_state_layer(l)]
+        (exec=exec, idg=idg, snaps=snaps, cache=dc.cache)
+    end
+end
+
+# Run one verify step: tokens (seq, B) at each sequence's cache position, `lens` = seq. Returns
+# (logits (vocab, seq, B), hidden (Hidden, seq, B)) as device arrays; the cache has the new K/V, the
+# recurrent states are at the end of the `seq` tokens, and `snaps` hold them after the first token.
+function _verify_step!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
+    cache = vg.cache; idg = vg.idg
+    inputs = Dict{Int, Any}()
+    inputs[idg.token_input_id] = Float32.(tokens)
+    inputs[idg.pos_input_id] = Float32.(cache.positions)
+    idg.lens_input_id == 0 || (inputs[idg.lens_input_id] = fill(Float32(idg.seq), size(tokens, 2)))
+    for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
+        inputs[k_id] = cache.self_cache[i][1]; inputs[v_id] = cache.self_cache[i][2]
+    end
+    j = 0
+    for (i, l) in enumerate(s.model.layers)
+        NN._is_state_layer(l) || continue
+        j += 1
+        inputs[idg.snap_ids[j][1]] = vg.snaps[j][1]; inputs[idg.snap_ids[j][2]] = vg.snaps[j][2]
+    end
+    res = vg.exec(inputs; device=s.device)
+    return res[idg.logits_id], res[idg.hidden_id]
+end
+
+# Roll the recurrent states back to their snapshots (the state after the first verified token).
+function _rollback_states!(s::LlamaSession, vg)
+    j = 0
+    for (i, l) in enumerate(s.model.layers)
+        NN._is_state_layer(l) || continue
+        j += 1
+        copyto!(vg.cache.self_cache[i][1], vg.snaps[j][1])
+        copyto!(vg.cache.self_cache[i][2], vg.snaps[j][2])
     end
 end
 

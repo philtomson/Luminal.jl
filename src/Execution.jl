@@ -193,17 +193,19 @@ const DECODE_ATTN_MAX_CTX = 8192
     T = @uniform @groupsize()[1]
     D = @uniform size(q, 1)
     H = @uniform size(q, 3)
+    S = @uniform size(q, 2)                          # new tokens per sequence (1, or a speculative step's 2+)
     h = @uniform (@index(Group, Linear) - 1) % size(q, 3) + 1
-    b = @uniform (@index(Group, Linear) - 1) ÷ size(q, 3) + 1
+    s = @uniform ((@index(Group, Linear) - 1) ÷ size(q, 3)) % size(q, 2) + 1
+    b = @uniform (@index(Group, Linear) - 1) ÷ (size(q, 3) * size(q, 2)) + 1
     kv = @uniform (h - 1) ÷ Gq + 1
     pos = @uniform unsafe_trunc(Int, @inbounds posv[length(posv) == 1 ? 1 : b])
-    n = @uniform pos + 1
+    n = @uniform pos + s                             # attended positions: the cache's pos slots, new tokens 1..s
     lo = @uniform window > 0 ? max(1, n - window + 1) : 1   # first position attended to
     # write_cache: the first query head of each KV group stores this token's K/V in
     # slot pos + 1 (no workgroup reads that slot from the cache).
     if write_cache && (h - 1) % Gq == 0 && lid <= D
-        @inbounds pk[lid, pos + 1, kv, b] = kn[lid, 1, kv, b]
-        @inbounds pv[lid, pos + 1, kv, b] = vn[lid, 1, kv, b]
+        @inbounds pk[lid, pos + s, kv, b] = kn[lid, s, kv, b]
+        @inbounds pv[lid, pos + s, kv, b] = vn[lid, s, kv, b]
     end
     sc = @localmem Float32 (DECODE_ATTN_MAX_CTX,)
     red = @localmem Float32 (256,)
@@ -216,11 +218,11 @@ const DECODE_ATTN_MAX_CTX = 8192
             acc = -Inf32                                   # outside the window
         elseif j <= pos
             for d in 1:D
-                @inbounds acc += q[d, 1, h, b] * pk[d, j, kv, b]
+                @inbounds acc += q[d, s, h, b] * pk[d, j, kv, b]
             end
         else
             for d in 1:D
-                @inbounds acc += q[d, 1, h, b] * kn[d, 1, kv, b]
+                @inbounds acc += q[d, s, h, b] * kn[d, j - pos, kv, b]
             end
         end
         @inbounds sc[j] = j < lo ? -Inf32 : acc * scale
@@ -274,7 +276,7 @@ const DECODE_ATTN_MAX_CTX = 8192
             if j <= pos
                 @inbounds acc += sc[j] * pv[d, j, kv, b]
             else
-                @inbounds acc += sc[j] * vn[d, 1, kv, b]
+                @inbounds acc += sc[j] * vn[d, j - pos, kv, b]
             end
             j += P
         end
@@ -286,41 +288,43 @@ const DECODE_ATTN_MAX_CTX = 8192
         for p in 0:P-1
             @inbounds tot += red[lid + p * D]
         end
-        @inbounds out[lid, h, b] = tot * stats[2]
+        @inbounds out[lid, h, s, b] = tot * stats[2]
     end
 end
 
 function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
-    D, H, B = size(q, 1), size(q, 3), size(q, 4)
+    D, S, H, B = size(q, 1), size(q, 2), size(q, 3), size(q, 4)
     KVH = size(pk, 3)
     if !(out isa AnyGPUArray)          # CPU: plain loops (the kernel's reductions are GPU-shaped)
         G = H ÷ KVH
-        o3 = Base.reshape(out, D, H, B)
-        for b in 1:B, h in 1:H
+        o4 = Base.reshape(out, D, H, S, B)
+        for b in 1:B, h in 1:H, t in 1:S
             pos = Int(posv[length(posv) == 1 ? 1 : b])
             kv = (h - 1) ÷ G + 1
-            lo = op.window > 0 ? max(1, pos + 2 - op.window) : 1
-            s = Float32[j < lo ? -Inf32 : op.scale * sum(q[d, 1, h, b] * (j <= pos ? pk[d, j, kv, b] : kn[d, 1, kv, b]) for d in 1:D)
-                        for j in 1:pos+1]
+            n = pos + t
+            lo = op.window > 0 ? max(1, n - op.window + 1) : 1
+            kat(j, d) = j <= pos ? pk[d, j, kv, b] : kn[d, j - pos, kv, b]
+            vat(j, d) = j <= pos ? pv[d, j, kv, b] : vn[d, j - pos, kv, b]
+            s = Float32[j < lo ? -Inf32 : op.scale * sum(q[d, t, h, b] * kat(j, d) for d in 1:D) for j in 1:n]
             p = exp.(s .- maximum(s)); p ./= sum(p)
             for d in 1:D
-                o3[d, h, b] = sum(p[j] * (j <= pos ? pv[d, j, kv, b] : vn[d, 1, kv, b]) for j in 1:pos+1)
+                o4[d, h, t, b] = sum(p[j] * vat(j, d) for j in 1:n)
             end
         end
         if op.write_cache
             for b in 1:B
                 pos = Int(posv[length(posv) == 1 ? 1 : b])
-                pk[:, pos + 1, :, b] .= kn[:, 1, :, b]
-                pv[:, pos + 1, :, b] .= vn[:, 1, :, b]
+                pk[:, pos + 1:pos + S, :, b] .= kn[:, 1:S, :, b]
+                pv[:, pos + 1:pos + S, :, b] .= vn[:, 1:S, :, b]
             end
         end
         return out
     end
-    size(pk, 2) + 1 <= DECODE_ATTN_MAX_CTX || error("DecodeAttention: cache longer than $(DECODE_ATTN_MAX_CTX)")
+    size(pk, 2) <= DECODE_ATTN_MAX_CTX || error("DecodeAttention: cache longer than $(DECODE_ATTN_MAX_CTX)")
     (D <= 256 && 256 % D == 0) || error("DecodeAttention: head_dim must divide 256")
-    o3 = Base.reshape(out, D, H, B)
-    _decode_attn_kernel!(KernelAbstractions.get_backend(o3), 256)(
-        o3, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH, op.write_cache, op.window; ndrange = H * B * 256)
+    o4 = Base.reshape(out, D, H, S, B)
+    _decode_attn_kernel!(KernelAbstractions.get_backend(o4), 256)(
+        o4, q, pk, pv, kn, vn, posv, op.scale, H ÷ KVH, op.write_cache, op.window; ndrange = H * S * B * 256)
     return out
 end
 
@@ -329,7 +333,7 @@ end
 
 _silu(x) = x / (1 + exp(-x))
 
-@kernel function _causal_conv_kernel!(out, @Const(x), state, @Const(w), @Const(lens), ::Val{K}, fresh) where K
+@kernel function _causal_conv_kernel!(out, @Const(x), state, @Const(w), @Const(lens), snap, snap_t, ::Val{K}, fresh) where K
     I = @index(Global, Linear)
     C = size(x, 1); S = size(x, 2)
     c = (I - 1) % C + 1; b = (I - 1) ÷ C + 1
@@ -344,6 +348,16 @@ _silu(x) = x / (1 + exp(-x))
             @inbounds acc += Float32(w[c, 1, j]) * win[j]
         end
         @inbounds out[c, t, b] = _silu(acc)
+        if t == snap_t
+            for j in 1:K
+                @inbounds snap[c, j, b] = win[j]
+            end
+        end
+    end
+    if 0 < snap_t && L < snap_t
+        for j in 1:K
+            @inbounds snap[c, j, b] = win[j]
+        end
     end
     for t in L+1:S
         @inbounds out[c, t, b] = 0f0
@@ -376,23 +390,26 @@ function execute_op!(out, op::CausalAttention, q, k, v)
     return out
 end
 
-function execute_op!(out, op::CausalConv, x, state, w, lens)
+function execute_op!(out, op::CausalConv, x, state, w, lens, snap = state)
     C, S, B = size(x, 1), size(x, 2), size(x, 3)
     K = size(w, 3)
     if !(out isa AnyGPUArray)
         fill!(out, 0)
         for b in 1:B, c in 1:C
             win = op.fresh ? zeros(Float32, K) : Float32[state[c, j, b] for j in 1:K]
-            for t in 1:min(S, Int(lens[b]))
+            L = min(S, Int(lens[b]))
+            for t in 1:L
                 win = vcat(win[2:end], Float32(x[c, t, b]))
                 out[c, t, b] = _silu(sum(Float32(w[c, 1, j]) * win[j] for j in 1:K))
+                t == op.snap_t && (snap[c, :, b] .= win)
             end
+            0 < op.snap_t && L < op.snap_t && (snap[c, :, b] .= win)
             state[c, :, b] .= win
         end
         return out
     end
-    _causal_conv_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x), state, _dense(w), _dense(lens), Val(K), op.fresh;
-                                                                    ndrange = C * B)
+    _causal_conv_kernel!(KernelAbstractions.get_backend(out), 256)(out, _dense(x), state, _dense(w), _dense(lens),
+                                                                    snap, op.snap_t, Val(K), op.fresh; ndrange = C * B)
     return out
 end
 
@@ -400,7 +417,7 @@ end
 # column j of S (row j of the stored S^T, so a step's accesses are coalesced).
 const DELTA_MAX_DK = 256
 @kernel function _delta_rule_kernel!(out, @Const(q), @Const(k), @Const(v), @Const(g), @Const(beta), st,
-                                     @Const(lens), scale, G, fresh)
+                                     @Const(lens), snap, snap_t, scale, G, fresh)
     j = @index(Local, Linear)
     T = @uniform @groupsize()[1]
     dk = @uniform size(q, 1); dv = @uniform size(v, 1)
@@ -441,10 +458,20 @@ const DELTA_MAX_DK = 256
                 @inbounds o += s_ * qs[i]
             end
             @inbounds out[j, h, t, b] = o
+            if t == snap_t
+                for i in 1:dk
+                    @inbounds snap[j, i, h, b] = st[j, i, h, b]
+                end
+            end
         end
         @synchronize
     end
     if j <= dv
+        if 0 < snap_t && L < snap_t
+            for i in 1:dk
+                @inbounds snap[j, i, h, b] = st[j, i, h, b]
+            end
+        end
         for t in L+1:S
             @inbounds out[j, h, t, b] = 0f0
         end
@@ -473,7 +500,7 @@ const DELTA_REG_CHUNK = 16
 end
 # (A plain AMDGPU kernel, not a KernelAbstractions one: KA's lowering loses the types of the Val
 # parameter here. Grid: one workgroup per (value head, batch), 2 * dv threads.)
-function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh, ::Val{HD}) where {HD}
+function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, ::Val{HD}) where {HD}
     tid = workitemIdx().x
     T = workgroupDim().x
     j = (tid - 1) ÷ 2 + 1                  # value dim of this lane pair
@@ -516,6 +543,11 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fres
                 op = _seq_dot(s, qs, off)
                 o = op + AMDGPU.Device.shfl_xor(op, Cint(1))                                 # S^T q
                 hf == 0 && (@inbounds out[j, h, t, b] = o)
+                if t == snap_t
+                    for i in 1:HD
+                        @inbounds snap[j, hf * HD + i, h, b] = s[i]
+                    end
+                end
             end
         end
         sync_workgroup()
@@ -524,6 +556,11 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fres
     if active
         for i in 1:HD
             @inbounds st[j, hf * HD + i, h, b] = s[i]
+        end
+        if 0 < snap_t && L < snap_t
+            for i in 1:HD
+                @inbounds snap[j, hf * HD + i, h, b] = s[i]
+            end
         end
         if hf == 0
             for t in L+1:S
@@ -534,7 +571,7 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fres
     return
 end
 
-function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens)
+function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens, snap = st)
     dk, nk = size(q, 1), size(q, 2)
     dv, nv, S, B = size(v, 1), size(v, 2), size(v, 3), size(v, 4)
     G = nv ÷ nk
@@ -543,13 +580,16 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens)
         for b in 1:B, h in 1:nv
             hk = (h - 1) ÷ G + 1
             M = op.fresh ? zeros(Float32, dv, dk) : Float32.(st[:, :, h, b])     # S^T
-            for t in 1:min(S, Int(lens[b]))
+            L = min(S, Int(lens[b]))
+            for t in 1:L
                 kt = Float32.(k[:, hk, t, b]); qt = Float32.(q[:, hk, t, b]) .* op.scale
                 M .*= exp(Float32(g[h, t, b]))
                 delta = (Float32.(v[:, h, t, b]) .- M * kt) .* Float32(beta[h, t, b])
                 M .+= delta * kt'
                 out[:, h, t, b] .= M * qt
+                t == op.snap_t && (snap[:, :, h, b] .= M)
             end
+            0 < op.snap_t && L < op.snap_t && (snap[:, :, h, b] .= M)
             st[:, :, h, b] .= M
         end
         return out
@@ -558,11 +598,11 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens)
     gs = min(256, max(32, nextpow(2, max(dv, dk))))
     if out isa AMDGPU.ROCArray && dk <= DELTA_REG_MAX_DK && iseven(dk) && dv <= 128 && get(ENV, "LUMINAL_DELTA_REG", "1") != "0"
         @roc groupsize=cld(2dv, 32) * 32 gridsize=nv * B _delta_rule_reg_kernel!(
-            out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), op.scale, G, op.fresh, Val(dk ÷ 2))
+            out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), snap, op.snap_t, op.scale, G, op.fresh, Val(dk ÷ 2))
         return out
     end
     _delta_rule_kernel!(KernelAbstractions.get_backend(out), gs)(
-        out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), op.scale, G, op.fresh;
+        out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), snap, op.snap_t, op.scale, G, op.fresh;
         ndrange = nv * B * gs)
     return out
 end

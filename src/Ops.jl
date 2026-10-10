@@ -279,13 +279,20 @@ end
 #   head, lens; value head h reads key head (h - 1) ÷ (nv ÷ nk) + 1. Per token:
 #   S <- S exp(g); S <- S + k ((v - S^T k) beta)^T; out = S^T (q * scale).
 #   Output (dv, nv, S, B); the state is left at the final S^T.
+# With `snap_t` > 0 the op takes one more input, a buffer shaped like the state, and writes into it the
+# state after the first `snap_t` tokens (or after all of them if fewer are consumed): a speculative
+# decoding step that feeds several tokens keeps the state a rejected draft must roll back to.
 struct CausalConv <: Op
     fresh::Bool
+    snap_t::Int
 end
+CausalConv(fresh::Bool) = CausalConv(fresh, 0)
 struct DeltaRule <: Op
     scale::Float32
     fresh::Bool
+    snap_t::Int
 end
+DeltaRule(scale::Float32, fresh::Bool) = DeltaRule(scale, fresh, 0)
 
 # LastToken: out (H, 1, B) holds each sequence's hidden state at its last real position,
 #   out[:, 1, b] = x[:, lens[b], b] (clamped to 1:S), for x (H, S, B) and lens (B,).
