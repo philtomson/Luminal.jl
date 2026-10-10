@@ -79,6 +79,10 @@ function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Sy
             _run_traced(cg, device, sym_vals, live_counts)
             return
         end
+        if get(ENV, "LUMINAL_TRACE_TIME", "") != "" && device isa Luminal.AMDDevice
+            _run_timed(cg, device, sym_vals, live_counts)
+            return
+        end
         for step in cg.steps
             step(cg.results, device, sym_vals, live_counts)
         end
@@ -131,6 +135,26 @@ function _run_traced(cg, device, sym_vals, live_counts)
     return
 end
 
+# LUMINAL_TRACE_TIME=1 (AMD only): run the steps one at a time, synchronizing, and report the time
+# per (op, output shape), most expensive first (each includes its launch and the host work around it).
+function _run_timed(cg, device, sym_vals, live_counts)
+    nodes = get(cg.cache, :step_nodes, Int[])
+    by = Dict{String, Vector{Float64}}()
+    for (i, step) in enumerate(cg.steps)
+        AMDGPU.synchronize(); t = time_ns()
+        step(cg.results, device, sym_vals, live_counts)
+        AMDGPU.synchronize(); dt = (time_ns() - t) / 1e6
+        n = get(nodes, i, 0)
+        k = n == 0 ? "?" : string(typeof(cg.graph.nodes[n].op).name.name, " ", size(cg.results[n]))
+        v = get!(by, k, zeros(2)); v[1] += dt; v[2] += 1
+    end
+    tot = sum(v[1] for v in values(by))
+    println("[time] ", length(cg.steps), " steps, ", round(tot, digits = 1), " ms synchronized")
+    for (k, v) in sort(collect(by); by = x -> -x[2][1])[1:min(40, end)]
+        println("[time] ", lpad(round(v[1], digits = 2), 8), " ms ", lpad(Int(v[2]), 4), "x  ", k)
+    end
+end
+
 # Drop a dead intermediate. Buffers the graph allocated itself (`owned`) are
 # returned to the GPU pool right away instead of waiting for a GC finalizer.
 const _RELEASE_STATS = zeros(Int, 4)    # calls, owned GPU buffers freed, bytes freed, not owned (left to the GC)
@@ -171,6 +195,14 @@ end
 _writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa Luminal.Reshape ||
     op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp ||
     op isa Luminal.RotaryEmbed || op isa Luminal.SoftmaxOp || op isa Luminal.LastToken
+
+# A matmul against a quantized / half weight writes every element of its output when it has more
+# than QUANT_GEMM_COLS columns (matrix-core or dequantize + GEMM path; the GEMV path for fewer
+# columns is left alone).
+_gemm_writes_all(W, x) =
+    W isa Luminal.Q4Weight ? length(x) ÷ size(W, 2) > Luminal.QUANT_GEMM_COLS :
+    W isa Luminal.QuantWeight ? length(x) ÷ size(W.q, 1) > Luminal.QUANT_GEMM_COLS :
+    W isa Luminal.HalfWeight ? length(x) ÷ size(W.t, 1) > Luminal.QUANT_GEMM_COLS : false
 
 # True if a consumer reads node `id` through `st` exactly as produced (no
 # permute, slice, pad or broadcast), so `id` can be fused into that consumer.
@@ -762,8 +794,9 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             backing = Ref{Any}(nothing)
             push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
-                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
                 x = realize_view(res[xid], sts[1])
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id];
+                                 zero=!_gemm_writes_all(res[wid], x))
                 r = realize_view(res[rid], sts[2])
                 Luminal.matmul_residual!(res[node_id], mop, res[wid], x, r)
                 for id in (wid, xid, rid)
@@ -891,7 +924,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         res[node_id] = nothing
                         aliased[] = false
                     end
-                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, graph.dtypes[node_id]; zero=!_writes_all(op))
+                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, graph.dtypes[node_id]; zero=!(_writes_all(op) || ((op isa Luminal.MatMul || op isa Luminal.MatMulF16 || op isa Luminal.MatMulQ8 || op isa Luminal.MatMulQ4) && _gemm_writes_all(step_args[1], step_args[2]))))
                 end
 
                 # 3. Execute

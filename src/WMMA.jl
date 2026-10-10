@@ -42,14 +42,15 @@ end
 @inline function _wmma_store!(C, acc, m0, n0, r, h, N)
     a00, a01, a10, a11 = acc
     ok0 = n0 + r < N; ok1 = n0 + 16 + r < N
+    M = size(C, 1)   # rows past M (a ragged last block) are skipped
     for i in 0:7   # lane l holds D[2i + l÷16, l%16] of each 16x16 tile
         if ok0
-            C[m0+2i+h+1,    n0+r+1]    = a00[i+1].value
-            C[m0+16+2i+h+1, n0+r+1]    = a10[i+1].value
+            m0 + 2i + h < M && (C[m0+2i+h+1,    n0+r+1]    = a00[i+1].value)
+            m0 + 16 + 2i + h < M && (C[m0+16+2i+h+1, n0+r+1]    = a10[i+1].value)
         end
         if ok1
-            C[m0+2i+h+1,    n0+16+r+1] = a01[i+1].value
-            C[m0+16+2i+h+1, n0+16+r+1] = a11[i+1].value
+            m0 + 2i + h < M && (C[m0+2i+h+1,    n0+16+r+1] = a01[i+1].value)
+            m0 + 16 + 2i + h < M && (C[m0+16+2i+h+1, n0+16+r+1] = a11[i+1].value)
         end
     end
     return
@@ -172,10 +173,11 @@ function _wmma_q4_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}) where {SYM
     Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
     acc = _wmma_zeros()
     arow = tid ÷ 2; ah = tid % 2
+    grow = min(bm + arow, size(C, 1) - 1)   # a ragged last block re-reads the last row
     c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 32
     nk = K ÷ 32
-    qa = Pv[1, bm + arow + 1]; sa = Float32(Sc[1, bm + arow + 1])
-    ma = SYM ? -8f0 * sa : Float32(Mn[1, bm + arow + 1])
+    qa = Pv[1, grow + 1]; sa = Float32(Sc[1, grow + 1])
+    ma = SYM ? -8f0 * sa : Float32(Mn[1, grow + 1])
     rb0 = Bv[c0 + 1, bn + row0 + 1]; rb1 = Bv[c0 + 1, bn + row1 + 1]
     for t in 0:nk-1
         bytes = let q = qa   # (a closure must not capture the reassigned qa)
@@ -187,8 +189,8 @@ function _wmma_q4_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}) where {SYM
         sync_workgroup()
         if t + 1 < nk
             gi = (32 * (t + 1)) ÷ group + 1
-            qa = Pv[t + 2, bm + arow + 1]; sa = Float32(Sc[gi, bm + arow + 1])
-            ma = SYM ? -8f0 * sa : Float32(Mn[gi, bm + arow + 1])
+            qa = Pv[t + 2, grow + 1]; sa = Float32(Sc[gi, grow + 1])
+            ma = SYM ? -8f0 * sa : Float32(Mn[gi, grow + 1])
             kc = (t + 1) * 4 + c0 + 1
             rb0 = Bv[kc, bn + row0 + 1]; rb1 = Bv[kc, bn + row1 + 1]
         end
@@ -223,7 +225,8 @@ end
     for j in 0:3
         n0 + 16j + r < N || continue
         for i in 0:1, e in 0:7   # lane l holds D[2e + l÷16, l%16] of each 16x16 tile
-            C[m0 + 16i + 2e + h + 1, n0 + 16j + r + 1] = acc[4i + j + 1][e + 1].value
+            m0 + 16i + 2e + h < size(C, 1) &&
+                (C[m0 + 16i + 2e + h + 1, n0 + 16j + r + 1] = acc[4i + j + 1][e + 1].value)
         end
     end
     return
@@ -237,11 +240,12 @@ function _wmma_q4_big_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}) where 
     As = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 128), false)
     Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 128), false)
     acc = ntuple(_ -> _wmma_zero(), Val(8))
-    arow = tid ÷ 2; ah = tid % 2                       # A: 128 rows x 2 half-chunks per K tile
+    arow = tid ÷ 2; ah = tid % 2
+    grow = min(bm + arow, size(C, 1) - 1)   # a ragged last block re-reads the last row (A: 128 rows x 2 half-chunks per K tile)
     c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 64     # B: 128 columns x 4 chunks
     nk = K ÷ 32
-    qa = Pv[1, bm + arow + 1]; sa = Float32(Sc[1, bm + arow + 1])
-    ma = SYM ? -8f0 * sa : Float32(Mn[1, bm + arow + 1])
+    qa = Pv[1, grow + 1]; sa = Float32(Sc[1, grow + 1])
+    ma = SYM ? -8f0 * sa : Float32(Mn[1, grow + 1])
     rb0 = Bv[c0 + 1, bn + row0 + 1]; rb1 = Bv[c0 + 1, bn + row1 + 1]
     for t in 0:nk-1
         bytes = let q = qa
@@ -253,8 +257,8 @@ function _wmma_q4_big_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}) where 
         sync_workgroup()
         if t + 1 < nk
             gi = (32 * (t + 1)) ÷ group + 1
-            qa = Pv[t + 2, bm + arow + 1]; sa = Float32(Sc[gi, bm + arow + 1])
-            ma = SYM ? -8f0 * sa : Float32(Mn[gi, bm + arow + 1])
+            qa = Pv[t + 2, grow + 1]; sa = Float32(Sc[gi, grow + 1])
+            ma = SYM ? -8f0 * sa : Float32(Mn[gi, grow + 1])
             kc = (t + 1) * 4 + c0 + 1
             rb0 = Bv[kc, bn + row0 + 1]; rb1 = Bv[kc, bn + row1 + 1]
         end
@@ -309,15 +313,15 @@ end
 function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
                        group::Int, B::ROCArray{Float16,2}, N::Int)
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
-    (M % 64 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
+    (M % 16 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
-        throw(ArgumentError("wmma_q4_gemm!: need M % 64 == 0, group % 32 == 0, padded N % 64 == 0"))
+        throw(ArgumentError("wmma_q4_gemm!: need M % 16 == 0, group % 32 == 0, padded N % 64 == 0"))
     Bv = reinterpret(WMMA_V8H, B)
     args = (C, Pv, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing))
     if M % 128 == 0 && Npad % 128 == 0 && get(ENV, "LUMINAL_WMMA_BIG", "1") != "0"
         @roc groupsize=256 gridsize=(Npad ÷ 128, M ÷ 128) _wmma_q4_big_kernel!(args...)
     else
-        @roc groupsize=128 gridsize=(Npad ÷ 64, M ÷ 64) _wmma_q4_kernel!(args...)
+        @roc groupsize=128 gridsize=(Npad ÷ 64, cld(M, 64)) _wmma_q4_kernel!(args...)
     end
     return C
 end
