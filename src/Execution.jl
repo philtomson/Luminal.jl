@@ -1058,7 +1058,7 @@ end
     end
 end
 
-# Activations rounded to Float16 and zero-padded to a multiple of 64 (128 from 192 columns) columns, for the
+# Activations rounded to Float16 and zero-padded to a multiple of 64 (128 from 192 columns, 256 from 384) columns, for the
 # WMMA GEMM; reused per (array type, K, padded N) like _GEMM_EX_WORKSPACE. The padding
 # columns are never written, so they stay zero.
 const _WMMA_WORKSPACE = Dict{Any, Any}()
@@ -1066,7 +1066,8 @@ const _WMMA_WORKSPACE = Dict{Any, Any}()
 # B (K, N) rounded to Float16 in the zero-padded workspace; returns (x16, Bc), Bc being
 # the dense copy to free afterwards when B had to be copied.
 function _wmma_activations(B, K, N)
-    Npad = cld(N, N >= 192 ? 128 : 64) * (N >= 192 ? 128 : 64)   # 128 for the 128x128 int4 kernel
+    blk = N >= 384 ? 256 : N >= 192 ? 128 : 64   # the int4 kernels' block widths: 128x256, 128x128, 64x64
+    Npad = cld(N, blk) * blk
     Bc = B isa DenseArray ? B : copy(B)
     x16 = get!(() -> (x = similar(Bc, Float16, K, Npad); fill!(x, Float16(0)); x),
                _WMMA_WORKSPACE, (typeof(Bc), K, Npad))

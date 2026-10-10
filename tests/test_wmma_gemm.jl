@@ -70,6 +70,8 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
                                          # M % 128 == 0 and N >= 192: the 128x128 kernel
                                          (256, 256, 200, 32, true), (384, 512, 300, 64, false),
                                          (128, 128, 192, 32, false),
+                                         # N >= 384: the 128x256 kernel
+                                         (256, 128, 400, 32, true), (128, 256, 512, 64, false), (256, 96, 384, 32, false),
                                          # M % 16 == 0 only: a ragged last block
                                          (48, 128, 100, 32, true), (80, 256, 250, 64, false), (176, 128, 200, 32, true))
             W = randn(Float32, Out, In); x = randn(Float32, In, N)
