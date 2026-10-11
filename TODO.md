@@ -742,7 +742,8 @@ chunk steps (B > 1), int4 KV.
 Up to 3 drafts per cycle; after each verify the loop picks 1..3 drafts maximizing expected tokens per ms, from an EMA (0.1) of the
 conditional acceptance of each draft position (only cycles that tested it) and fixed costs (verify 86/91.5/96.6 ms for 2/3/4
 columns, draft chain 5/12/16 ms). The first draft step is padded to the previous cycle's width, so graphs for every width get
-compiled on first use. Output identical to plain decoding (checked on two prompts). Measured so far (27B int4, 128 new tokens,
-lighthouse-story prompt): 20.5-24 tok/s, 69-88% first drafts accepted (run-to-run variation from the model load state); the
-ndraft=1/3 comparison on low-acceptance text is still to be measured, so the benefit over a fixed 3 is unconfirmed.
+compiled on first use. Output identical to plain decoding. Lighthouse-story prompt, 128 tokens, 27B int4, decode-only tok/s: adaptive 21.1, fixed 3 drafts 20.5,
+fixed 1 draft 18.0 (same 69% first-draft acceptance; adaptive spent 805 ms in MTP steps vs 915 ms). So it is about +3% over a fixed 3 here
+and never loses to it; the case where fixed 3 loses (low acceptance) was not hit by this prompt, and the starting estimate (0.7) and
+EMA rate are untuned.
 Cheaper MTP chain: not started.
