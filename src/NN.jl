@@ -785,8 +785,9 @@ function LlamaKVCacheState(n_layers::Int, n_kv_heads::Int, head_dim::Int;
                             batch::Int=1, max_seq::Int=2048,
                             device::Luminal.AbstractDevice=Luminal.CPUDevice(),
                             kv_dtype::Type=Float32)
-    self = [(Luminal.zero_tensor(device, kv_dtype, head_dim, max_seq, n_kv_heads, batch),
-             Luminal.zero_tensor(device, kv_dtype, head_dim, max_seq, n_kv_heads, batch))
+    hd = kv_dtype === Int8 ? head_dim + Luminal.DA_Q8_PAD : head_dim
+    self = [(Luminal.zero_tensor(device, kv_dtype, hd, max_seq, n_kv_heads, batch),
+             Luminal.zero_tensor(device, kv_dtype, hd, max_seq, n_kv_heads, batch))
             for _ in 1:n_layers]
     return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
 end
@@ -802,7 +803,7 @@ function LlamaKVCacheState(model; batch::Int=1, max_seq::Int=2048,
                            device::Luminal.AbstractDevice=Luminal.CPUDevice(),
                            kv_dtype::Type=Float32)
     self = [Tuple(Luminal.zero_tensor(device, _is_state_layer(l) ? Float32 : kv_dtype, s...)
-                  for s in _state_shapes(l, max_seq, batch))
+                  for s in _kv_shapes(l, max_seq, batch, kv_dtype))
             for l in model.layers]
     return LlamaKVCacheState(zeros(Int, batch), max_seq, self)
 end
@@ -910,7 +911,7 @@ function build_llama_decode_step!(model,
     lens = _needs_lens(model) ? Luminal.tensor(graph, [batch]) : nothing
 
     # per layer: the K/V cache, or a recurrent layer's two state buffers
-    shapes = [_state_shapes(l, max_seq, batch) for l in model.layers]
+    shapes = [_kv_shapes(l, max_seq, batch, kv_dtype) for l in model.layers]
     # (declared with the cache's element type: the executor converts an input of any other type
     # to the declared one, which would hand the attention kernel a copy instead of the cache)
     cdt(l) = _is_state_layer(l) ? Float32 : kv_dtype
@@ -979,6 +980,9 @@ _prefill_last_only(model) = false
 # true if the model's prefill accepts `hidden_ref=Ref()` and stores its final residual stream there
 _prefill_hidden(model) = false
 _is_state_layer(layer) = false
+# a layer's cache/state shapes; an int8 K/V cache appends DA_Q8_PAD bytes (the row's scale) to each head's row
+_kv_shapes(l, max_seq, batch, kv_dtype) = (sh = _state_shapes(l, max_seq, batch);
+    kv_dtype === Int8 && !_is_state_layer(l) ? map(x -> [x[1] + Luminal.DA_Q8_PAD, x[2:end]...], sh) : sh)
 _state_shapes(layer, max_seq, batch) =
     (a = layer.attention; ([a.head_dim, max_seq, a.n_kv_heads, batch], [a.head_dim, max_seq, a.n_kv_heads, batch]))
 function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing, snaps=nothing, nsnap=1)

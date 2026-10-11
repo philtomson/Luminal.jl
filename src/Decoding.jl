@@ -52,7 +52,8 @@ Generate with `generate(session, prompt_or_prompts; max_new_tokens)`.
 - `tokenizer`     : a `LlamaTokenizer` loaded from the model directory
 - `model_dir`     : directory containing the `.safetensors` weights
 - `max_seq`       : KV cache capacity per sequence (default 2048)
-- `kv_dtype`      : element type of the K/V caches (default Float32; Float16 halves them)
+- `kv_dtype`      : element type of the K/V caches (default Float32; Float16 halves them; Int8 quarters them: per-token,
+                    per-head absmax scales, AMD GPU only, see src/DecodeAttn.jl)
 - `rope_base`     : RoPE base frequency; defaults to the model's (see `llama_config`)
 - `device`        : device to run on; defaults to `get_device()`
 - `search`        : `:none`, `:static` or `:measured`: compile the graphs through the
@@ -96,6 +97,7 @@ function LlamaSession(model, tokenizer::Union{LlamaTokenizer, Nothing}, model_di
                       weight_storage=nothing, weights=nothing, kv_dtype::Type=Float32)
     dev = device === nothing ? get_device() : device
     on_gpu = dev isa Luminal.AbstractGPUDevice
+    kv_dtype === Int8 && !(dev isa Luminal.AMDDevice) && error("kv_dtype=Int8 (the int8 KV cache) needs an AMD GPU")
     # weight_storage: load straight into reduced precision (prefill and decode both
     # use it; decode_weights follows it unless given)
     ws = weight_storage isa Symbol ? weight_preset(weight_storage) :
@@ -318,7 +320,7 @@ function _chunk_graph(s::LlamaSession, C::Int)
 end
 
 # Can this session prefill in chunks?
-_can_chunk(s::LlamaSession) = s.device isa Luminal.AMDDevice && s.kv_dtype === Float16 && NN._needs_lens(s.model) &&
+_can_chunk(s::LlamaSession) = s.device isa Luminal.AMDDevice && s.kv_dtype in (Float16, Int8) && NN._needs_lens(s.model) &&
                               NN._prefill_hidden(s.model) && get(ENV, "LUMINAL_PREFILL_CHUNK", "") != "0"
 
 # Prefill `prompt` (0-based ids) chunk by chunk into the decode cache; returns the last token's logits
@@ -409,12 +411,16 @@ function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}})
         # Prefill K/V (head_dim, slen, kv_heads, B) -> cache (head_dim, max_seq, kv_heads, B),
         # in place on the device; only each prompt's own positions.
         for b in 1:B
-            view(cache.self_cache[i][1], :, 1:plens[b], :, b) .= view(res[k], :, 1:plens[b], :, b)
-            view(cache.self_cache[i][2], :, 1:plens[b], :, b) .= view(res[v], :, 1:plens[b], :, b)
+            _store_kv!(cache.self_cache[i][1], res[k], plens[b], b)
+            _store_kv!(cache.self_cache[i][2], res[v], plens[b], b)
         end
     end
     return pf, res, dc, plens, logits
 end
+
+# prefill's K/V (head_dim, slen, kv_heads, B) -> the cache's first n slots of sequence b (an int8 cache quantizes)
+_store_kv!(dst, src, n::Int, b::Int) =
+    eltype(dst) === Int8 ? Luminal.quantize_kv!(dst, src, n, b) : (view(dst, :, 1:n, :, b) .= view(src, :, 1:n, :, b); dst)
 
 function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
                       last_logits=nothing, step_logits=nothing)

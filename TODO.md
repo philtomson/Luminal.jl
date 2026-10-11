@@ -714,3 +714,26 @@ ndraft=3 28.6 (3.41 tokens/step, 95% / 89% / 81% of the first / second / third d
 So ndraft=3 pays on predictable text and costs ~4% on prose; the default stays 1. Next: choose the draft count per cycle from the
 recent acceptance rate (adaptive), and make the MTP chain cheaper (each chain step is a full ~4 ms graph launch).
 
+### Int8 KV cache (done, option `kv_dtype=Int8`; examples `--kv-int8`) -- `src/DecodeAttn.jl`
+Per (slot, KV head) row: D signed bytes + 16 bytes of padding whose first word is the Float32 scale (absmax/127), so the cache's
+first dimension is head_dim + `DA_Q8_PAD` (shapes via `NN._kv_shapes`; 1 byte + 0.06 byte of scale per element: half the Float16
+cache). AMD GPU, Qwen3.5/3.6-style full-attention layers (the split-K kernel: D 128/256, no window, <= 24 rows per KV head; the
+chunk path for longer steps; anything else with an Int8 cache is an error, not a silent fallback).
+Write: `_da_write_q8_kernel!` (decode/verify steps and chunk steps quantize the new tokens on the way in), `quantize_kv!` (one-shot
+prefill's K/V). Read: the K tile goes int8 -> Float16 exactly with the 0x6400 mantissa trick (byte ^ 0x80, OR into 1024.0, minus
+1152; dims in the order b0 b2 b1 b3 of each word, the staged queries are permuted the same way) into the same WMMA, the scores are
+scaled per key; V's scale is folded into the probabilities after the softmax sum (the V pass reads a byte pair per lane). Chunked
+prefill dequantizes the cache prefix to Float16 per layer-chunk and runs the flash kernel over it (`_kv_dequant_kernel!`). The MTP
+head's own cache stays Float16 (one layer).
+Microbenchmark at 32k keys (S=1/3/4): 722/926/984 us (Float16) -> 525/762/790 us; relative difference to the Float16 kernel on the
+same dequantized values 4e-4..6e-4. 27B int4 decode step at 32k context: plain 93.4 -> 90.5 ms, verify3 105.8 -> 103.0 ms (about
+3% faster; at 1k no difference); the cache for 32k tokens is 1.1 GB instead of 2.1 GB. Chunked prefill is as fast (308 tok/s @2048,
+275 @8192 vs 289 / 271). Quality: greedy 96-token continuations after 3000/1500/700-token prompts of real text match the Float16
+cache token for token on two of three prompts and diverge at token 86 on the third (the first token's top-5 identical on all three);
+speculative decoding output is identical to plain with either cache. One-shot vs chunked prefill differ more with the int8 cache
+(logits rel err 5.6e-3 on 192 tokens, the chunked path reads earlier chunks quantized) than with Float16 (0).
+Tests: tests/test_decode_split.jl ("int8 KV cache": decode, verify, 4-token, 2-sequence, chunk steps against the Float16 kernel over
+the dequantized cache). No end-to-end tiny-model test (its head_dim is 16, below the kernel's 128/256).
+Not done: a perplexity measurement (only greedy-agreement spot checks), int8 for the Gemma / windowed layers and for batched
+chunk steps (B > 1), int4 KV.
+

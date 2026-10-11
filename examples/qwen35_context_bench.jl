@@ -4,7 +4,7 @@
 # the weights plus the cache (65 KB per token on the 27B).
 #
 # Usage:
-#   julia -t auto,1 --project=. examples/qwen35_context_bench.jl <base.gguf> [--int4|--int8] [--max-ctx=32768]
+#   julia -t auto,1 --project=. examples/qwen35_context_bench.jl <base.gguf> [--int4|--int8] [--kv-int8] [--max-ctx=32768]
 #       [--lens=128,1024,4096,16384,32000] [--reps=20] [--layers=N] [--min-avail=20] [--swap-gb=3]
 using Luminal
 using Luminal.NN
@@ -44,14 +44,19 @@ function main()
     tok = LlamaTokenizer(f)
     W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
     s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = maxctx + 8, weights = W, decode_weights = T,
-                     kv_dtype = Float16)
+                     kv_dtype = ("--kv-int8" in ARGS ? Int8 : Float16))
     dc = Luminal.Decoding._decode_graph(s, 1)
     vg = Luminal.Decoding._verify_graph(s, 1, 3)
     # random K/V for the full-attention layers (the recurrent layers' states stay zero)
     for (i, l) in enumerate(s.model.layers)
         Luminal.NN._is_state_layer(l) && continue
         for a in dc.cache.self_cache[i]
-            copyto!(a, ROCArray(Float16.(0.5f0 .* randn(Float32, size(a)...))))
+            if eltype(a) === Int8           # --kv-int8: random bytes, and a scale (~0.5 / 127 * 8) in each row's first padding word
+                copyto!(a, ROCArray(rand(Int8, size(a)...)))
+                reinterpret(Float32, a)[(size(a, 1) - Luminal.DA_Q8_PAD) ÷ 4 + 1, :, :, :] .= 0.016f0
+            else
+                copyto!(a, ROCArray(Float16.(0.5f0 .* randn(Float32, size(a)...))))
+            end
         end
     end
     function timed(f)

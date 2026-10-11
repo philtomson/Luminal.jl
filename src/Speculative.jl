@@ -27,11 +27,15 @@ mutable struct MTPDrafter
     draft_vocab::Int          # 0 = full vocabulary, else the head scores only token ids 0..draft_vocab-1
 end
 
+# (one layer's cache: not worth quantizing)
+_mtp_kv_dtype(s::LlamaSession) = s.kv_dtype === Int8 ? Float16 : s.kv_dtype
+
 function MTPDrafter(s::LlamaSession; draft_vocab::Int=0)
     haskey(s.weights, "mtp.eh_proj.weight") || error("the session's weights have no MTP head (merge load_qwen35_mtp's result)")
     c = s.model.config
     shape = (c.head_dim, s.max_seq, c.n_kv_heads, 1)
-    MTPDrafter(s, Luminal.zero_tensor(s.device, s.kv_dtype, shape...), Luminal.zero_tensor(s.device, s.kv_dtype, shape...),
+    dt = _mtp_kv_dtype(s)
+    MTPDrafter(s, Luminal.zero_tensor(s.device, dt, shape...), Luminal.zero_tensor(s.device, dt, shape...),
                0, Dict{Int,Any}(), Dict{Int,Any}(), draft_vocab)
 end
 
@@ -64,8 +68,8 @@ function _mtp_step_graph(d::MTPDrafter, np::Int=2)
     g = Base.invokelatest(Graph); reg = WeightRegistry()
     m = Qwen35MTP(g, reg; c..., draft_vocab=d.draft_vocab)
     tok = Luminal.tensor(g, [np, 1]); hid = Luminal.tensor(g, [c.hidden, np, 1]); pos = Luminal.tensor(g, [1])
-    pk = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=s.kv_dtype)
-    pv = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=s.kv_dtype)
+    pk = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=_mtp_kv_dtype(s))
+    pv = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=_mtp_kv_dtype(s))
     logits, nk, nv, xpre = mtp_decode_step_hidden(m, tok, hid, 0, pos, pk, pv)
     am = Luminal.add_op!(g, Luminal.ArgMax(), [(logits.id, 0, logits.shape)], Luminal.ShapeTracker([np, 1]))
     W = s.weights
@@ -102,7 +106,7 @@ function _mtp_prime!(d::MTPDrafter, prompt::Vector{Int}, H)
     n = length(prompt)
     d.pos = 0
     n >= 2 || return
-    if n - 1 > prefill_chunk() && size(H, 2) == n && d.session.kv_dtype === Float16 && d.session.device isa Luminal.AMDDevice
+    if n - 1 > prefill_chunk() && size(H, 2) == n && _mtp_kv_dtype(d.session) === Float16 && d.session.device isa Luminal.AMDDevice
         # long prompt: the pairs go through the MTP layer in chunks of multi-token steps
         C = prefill_chunk(); hbuf = Luminal.zero_tensor(d.session.device, Float32, size(H, 1), C, 1)
         i = 0

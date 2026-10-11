@@ -2,7 +2,7 @@
 # (real text repeated to length), plus a check against the one-shot prefill on a prompt that fits it.
 #
 # Usage:
-#   julia -t auto,1 --project=. examples/qwen35_prefill_bench.jl <base.gguf> [--int4|--int8] [--max-ctx=33000]
+#   julia -t auto,1 --project=. examples/qwen35_prefill_bench.jl <base.gguf> [--int4|--int8] [--kv-int8] [--max-ctx=33000]
 #       [--lens=512,2048,8192,16384] [--chunk=512] [--layers=N] [--min-avail=20] [--swap-gb=3] [--no-check]
 using Luminal
 using Luminal.NN
@@ -47,7 +47,7 @@ function main()
     ids = Int.(Luminal.LlamaTokenization.encode(tok, repeat(TEXT, 400); bos = false))
     W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
     s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = maxctx, weights = W, decode_weights = T,
-                     kv_dtype = Float16)
+                     kv_dtype = ("--kv-int8" in ARGS ? Int8 : Float16))
     # pre-flight: weights are already loaded; the largest scratch is one chunk (or the one-shot check) at ~32 MB/token (27B)
     scale = nl / 64
     check_n = parse(Int, flag("check-n", "192")); check_chunk = parse(Int, flag("check-chunk", "64"))

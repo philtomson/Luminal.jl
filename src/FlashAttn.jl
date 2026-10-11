@@ -146,8 +146,15 @@ end
 # a big step, and this is not captured in a graph).
 function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
     D, S, H, B = size(q); KVH = size(pk, 3)
-    (D % 32 == 0 && H % KVH == 0 && B == 1 && pk isa ROCArray{Float16,4} && pv isa ROCArray{Float16,4}) || return false
-    @roc groupsize=256 gridsize=cld(D * S * KVH * B, 256) _da_write_kernel!(pk, pv, kn, vn, posv, S)
+    q8 = pk isa ROCArray{Int8,4} && pv isa ROCArray{Int8,4}
+    (D % 32 == 0 && H % KVH == 0 && B == 1 && (q8 || (pk isa ROCArray{Float16,4} && pv isa ROCArray{Float16,4}))) || return false
+    ksc = vsc = nothing
+    if q8
+        ksc = reinterpret(Float32, pk); vsc = reinterpret(Float32, pv)
+        @roc groupsize=32 gridsize=S * KVH * B _da_write_q8_kernel!(pk, pv, ksc, vsc, kn, vn, posv, S)
+    else
+        @roc groupsize=256 gridsize=cld(D * S * KVH * B, 256) _da_write_kernel!(pk, pv, kn, vn, posv, S)
+    end
     o4 = Base.reshape(out, D, H, S, B)
     posh = Int.(round.(Array(posv)))
     for b in 1:B
@@ -156,13 +163,20 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
         q16 = AMDGPU.zeros(Float16, D, S, H, 1); q16 .= q
         Spad = cld(NK, 64) * 64
         vt = AMDGPU.zeros(Float16, Spad, D, KVH, 1)
-        view(vt, 1:NK, :, :, :) .= PermutedDimsArray(view(pv, :, 1:NK, :, :), (2, 1, 3, 4))
-        Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, pk); Vv = reinterpret(WMMA_V8H, vt)
+        kt = pk
+        if q8                                   # attend to the dequantized cache (the same values the decode kernel uses)
+            kt = AMDGPU.zeros(Float16, D, Spad, KVH, 1)
+            @roc groupsize=256 gridsize=cld(D * NK * KVH, 256) _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK)
+        else
+            view(vt, 1:NK, :, :, :) .= PermutedDimsArray(view(pv, :, 1:NK, :, :), (2, 1, 3, 4))
+        end
+        Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, kt); Vv = reinterpret(WMMA_V8H, vt)
         ob = AMDGPU.zeros(Float32, D, S, H, 1)
         @roc groupsize=128 gridsize=(cld(S, 32), H) _flash_prefill_kernel!(
             ob, Qv, Kb, Vv, S, H, KVH, scale * 1.4426950408889634f0, pos, Val(D ÷ 32))
         o4 .= PermutedDimsArray(ob, (1, 3, 2, 4))
         AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(vt); AMDGPU.unsafe_free!(ob)
+        q8 && AMDGPU.unsafe_free!(kt)
     end
     return true
 end
