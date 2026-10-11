@@ -1,7 +1,7 @@
 # Split-K ("flash-decoding") attention for the decode step on gfx11: the cache is cut into chunks of
 # DA_CH keys and every (chunk, KV head, sequence) is its own workgroup, so a long cache keeps the whole
 # GPU streaming instead of one workgroup per query head scanning it serially. All the query heads of a
-# KV group and all S new tokens of a speculative step share each K/V read (rows = S * Gq <= 18).
+# KV group and all S new tokens of a speculative step share each K/V read (rows = S * Gq <= 24).
 #
 # Per workgroup (8 waves): the rows' queries are staged as Float16 in LDS; the waves compute the
 # chunk's scores with WMMA (16 query rows x 16 keys per tile, D contiguous in the cache), a softmax
@@ -14,7 +14,7 @@ using AMDGPU
 using KernelAbstractions.Extras: @unroll
 
 const DA_CH = 256                # keys per workgroup
-const DA_MAX_ROWS = 18           # S * Gq limit (LDS)
+const DA_MAX_ROWS = 24           # S * Gq limit (LDS; 4 tokens x 6 query heads per KV head)
 const DA_WS = Dict{Any, Any}()   # partial-result workspaces (a captured graph bakes in the pointers)
 
 # helpers with their own scopes (closures in the kernel body must not capture reassigned variables)
@@ -45,12 +45,12 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, posv, scale2, S, Gq, ::Val{D},
     k0 = c * DA_CH
     k0 < nmax || return
     qs = @ROCStaticLocalArray(Float16, (256, 32), false)
-    scT = @ROCStaticLocalArray(Float32, (4608,), false)      # (key, row) = DA_CH * DA_MAX_ROWS
+    scT = @ROCStaticLocalArray(Float32, (6144,), false)      # (key, row) = DA_CH * DA_MAX_ROWS
     # a key group's partial sums = D * QR floats. With many rows they reuse the scores' LDS (dead after the first sync of the
     # reduction), which lets a third workgroup fit on a CU; with few rows a separate array is faster (fewer concurrent streams).
     exch = QR > 8 ? scT : (@ROCStaticLocalArray(Float32, (4608,), false))
-    mq = @ROCStaticLocalArray(Float32, (18,), false)
-    lq = @ROCStaticLocalArray(Float32, (18,), false)
+    mq = @ROCStaticLocalArray(Float32, (24,), false)
+    lq = @ROCStaticLocalArray(Float32, (24,), false)
     # stage the queries: row = (token s, head g); rows >= QR are zero
     idx = tid
     while idx < 32 * D
@@ -111,51 +111,85 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, posv, scale2, S, Gq, ::Val{D},
         row += 8
     end
     sync_workgroup()
-    # out[row, d] = sum_key p[row, key] V[d, key]: thread (dp, g) takes the key subset g, d pair dp
-    ndp = D ÷ 2
-    ngrp = 256 ÷ ndp
-    dp = tid % ndp; g = tid ÷ ndp
-    nv = min(nmax - k0, DA_CH)
-    a0 = ntuple(_ -> 0f0, Val(QR)); a1 = ntuple(_ -> 0f0, Val(QR))
-    kj = g
-    while kj + 7 * ngrp < nv               # 8 keys at a time: their V loads are in flight together
-        vs = _da_vload8(Vp, dp, k0 + kj, ngrp, kvh, b)
-        @unroll for u in 1:8
-            p = _da_lds(scT, (kj + (u - 1) * ngrp) * QR, Val(QR))
-            a0 = _da_fma(a0, p, Float32(vs[u][1])); a1 = _da_fma(a1, p, Float32(vs[u][2]))
+    if QR > 12
+        _da_vhalf!(WO, scT, Vp, tid, min(nmax - k0, DA_CH), k0, c, kvh, b, Val(D), Val(QR))
+    else
+        # out[row, d] = sum_key p[row, key] V[d, key]: thread (dp, g) takes the key subset g, d pair dp
+        ndp = D ÷ 2
+        ngrp = 256 ÷ ndp
+        dp = tid % ndp; g = tid ÷ ndp
+        nv = min(nmax - k0, DA_CH)
+        a0 = ntuple(_ -> 0f0, Val(QR)); a1 = ntuple(_ -> 0f0, Val(QR))
+        kj = g
+        while kj + 7 * ngrp < nv               # 8 keys at a time: their V loads are in flight together
+            vs = _da_vload8(Vp, dp, k0 + kj, ngrp, kvh, b)
+            @unroll for u in 1:8
+                p = _da_lds(scT, (kj + (u - 1) * ngrp) * QR, Val(QR))
+                a0 = _da_fma(a0, p, Float32(vs[u][1])); a1 = _da_fma(a1, p, Float32(vs[u][2]))
+            end
+            kj += 8 * ngrp
         end
-        kj += 8 * ngrp
-    end
-    while kj < nv
-        v = @inbounds Vp[dp + 1, k0 + kj + 1, kvh + 1, b + 1]
-        p = _da_lds(scT, kj * QR, Val(QR))
-        a0 = _da_fma(a0, p, Float32(v[1])); a1 = _da_fma(a1, p, Float32(v[2]))
-        kj += ngrp
-    end
-    # sum the key groups' partials into group 0
-    for gg in 1:ngrp-1
-        sync_workgroup()
-        if g == gg
-            @unroll for q in 1:QR
-                @inbounds exch[(q - 1) * D + 2dp + 1] = a0[q]
-                @inbounds exch[(q - 1) * D + 2dp + 2] = a1[q]
+        while kj < nv
+            v = @inbounds Vp[dp + 1, k0 + kj + 1, kvh + 1, b + 1]
+            p = _da_lds(scT, kj * QR, Val(QR))
+            a0 = _da_fma(a0, p, Float32(v[1])); a1 = _da_fma(a1, p, Float32(v[2]))
+            kj += ngrp
+        end
+        # sum the key groups' partials into group 0
+        for gg in 1:ngrp-1
+            sync_workgroup()
+            if g == gg
+                @unroll for q in 1:QR
+                    @inbounds exch[(q - 1) * D + 2dp + 1] = a0[q]
+                    @inbounds exch[(q - 1) * D + 2dp + 2] = a1[q]
+                end
+            end
+            sync_workgroup()
+            if g == 0
+                a0 = _da_add_exch(a0, exch, 2dp + 1, D)
+                a1 = _da_add_exch(a1, exch, 2dp + 2, D)
             end
         end
-        sync_workgroup()
         if g == 0
-            a0 = _da_add_exch(a0, exch, 2dp + 1, D)
-            a1 = _da_add_exch(a1, exch, 2dp + 2, D)
-        end
-    end
-    if g == 0
-        @unroll for q in 1:QR
-            @inbounds WO[2dp + 1, q, c + 1, kvh + 1, b + 1] = a0[q]
-            @inbounds WO[2dp + 2, q, c + 1, kvh + 1, b + 1] = a1[q]
+            @unroll for q in 1:QR
+                @inbounds WO[2dp + 1, q, c + 1, kvh + 1, b + 1] = a0[q]
+                @inbounds WO[2dp + 2, q, c + 1, kvh + 1, b + 1] = a1[q]
+            end
         end
     end
     if tid < QR
         @inbounds WM[tid + 1, c + 1, kvh + 1, b + 1] = mq[tid + 1]
         @inbounds WL[tid + 1, c + 1, kvh + 1, b + 1] = lq[tid + 1]
+    end
+    return
+end
+# Many rows (QR > 12, D = 256): two thread groups, each takes half of the rows and all the keys (half the accumulators a thread
+# and no reduction across groups; the two groups read the same V). Thread (dp, g): head dims 2dp, 2dp + 1, rows g*QH + 1..
+function _da_vhalf!(WO, scT, Vp, tid, nv, k0, c, kvh, b, ::Val{D}, ::Val{QR}) where {D, QR}
+    QH = (QR + 1) ÷ 2
+    dp = tid % (D ÷ 2); g = tid ÷ (D ÷ 2)
+    r0 = g * QH
+    a0 = ntuple(_ -> 0f0, Val(QH)); a1 = ntuple(_ -> 0f0, Val(QH))
+    kj = 0
+    while kj + 7 < nv
+        vs = _da_vload8(Vp, dp, k0 + kj, 1, kvh, b)
+        @unroll for u in 1:8
+            p = _da_lds(scT, (kj + u - 1) * QR + r0, Val(QH))
+            a0 = _da_fma(a0, p, Float32(vs[u][1])); a1 = _da_fma(a1, p, Float32(vs[u][2]))
+        end
+        kj += 8
+    end
+    while kj < nv
+        v = @inbounds Vp[dp + 1, k0 + kj + 1, kvh + 1, b + 1]
+        p = _da_lds(scT, kj * QR + r0, Val(QH))
+        a0 = _da_fma(a0, p, Float32(v[1])); a1 = _da_fma(a1, p, Float32(v[2]))
+        kj += 1
+    end
+    @unroll for q in 1:QH
+        if r0 + q <= QR
+            @inbounds WO[2dp + 1, r0 + q, c + 1, kvh + 1, b + 1] = a0[q]
+            @inbounds WO[2dp + 2, r0 + q, c + 1, kvh + 1, b + 1] = a1[q]
+        end
     end
     return
 end
@@ -243,7 +277,7 @@ function decode_attention_split!(out, q, pk, pv, kn, vn, posv, scale::Float32, w
     (D in (128, 256) && H % KVH == 0 && size(pk, 1) == D && cld(T, DA_CH) <= 1024) || return false
     Gq = H ÷ KVH
     QR = S * Gq
-    QR <= DA_MAX_ROWS || return false
+    QR <= DA_MAX_ROWS && (QR <= 12 || D == 256) || return false
     if write_cache
         @roc groupsize=256 gridsize=cld(D * S * KVH * B, 256) _da_write_kernel!(pk, pv, kn, vn, posv, S)
     end

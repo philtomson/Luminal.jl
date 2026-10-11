@@ -698,3 +698,19 @@ Untried: DA_CH=128 (twice the workgroups, half the LDS; needs the tile loops gen
 phases, int8 KV (halves the traffic).
 The MTP-priming gap from the 32k speculative run is confirmed in the code: `generate_ids_speculative` returns before `_mtp_prime!`
 when max_new_tokens <= 1, so the ~19 s priming cost (32k tokens) is a one-time cost of any longer generation.
+
+### Three drafts per cycle (done, option `ndraft=3`) -- `_spec_loopN!`
+`generate_ids_speculative(...; ndraft=1|2|3)`: the loop for 2 and 3 drafts is one generic function (`_spec_loopN!`, replaces
+`_spec_loop2!`): verify [y, d1..dND] in one (ND+1)-token step, emit the leading matches plus the model's own next token, roll the
+recurrent states back to the snapshot after the last emitted token; the MTP head drafts d1 from the last accepted token and the
+rest as a chain of one-pair steps (d.pos is advanced during the chain and restored). Stats: :accepted, :accepted2, :accepted3.
+What it took for the 4-token verify step to be cheap: (1) decode attention allowed 24 rows (DA_MAX_ROWS; 4 tokens x 6 query heads);
+24 accumulators a thread spilled (2570 us at 32k), so for more than 12 rows two thread groups split the rows and read the same V
+(`_da_vhalf!`: 991 us; also 18 rows 943 -> 926 us); (2) the int4 GEMV was launched with 3 columns per pass, so 4 columns read the
+weights twice (+17.6 ms); now 4 per pass: verify4 113.6 -> 96.6 ms (verify3 91.5).
+27B int4, 128 new tokens, steam-engine prose: ndraft=2 22.5 tok/s decode-only (2.31 tokens/step, 11.9 ms MTP per cycle),
+ndraft=3 21.6 (2.54 tokens/step, 16.1 ms MTP): a wash. Julia code prompt (192 tokens): ndraft=2 25.6 tok/s (2.73 tokens/step),
+ndraft=3 28.6 (3.41 tokens/step, 95% / 89% / 81% of the first / second / third drafts accepted): +12%. Outputs identical to plain.
+So ndraft=3 pays on predictable text and costs ~4% on prose; the default stays 1. Next: choose the draft count per cycle from the
+recent acceptance rate (adaptive), and make the MTP chain cheaper (each chain step is a full ~4 ms graph launch).
+

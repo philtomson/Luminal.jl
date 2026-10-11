@@ -1344,7 +1344,7 @@ function _q4d_matmul!(C, W::Q4Weight, B, residual; threads::Int = 128)
     Xq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(X16)), K ÷ 8, N)
     lpg = W.group ÷ 32
     ispow2(lpg) || return false
-    _q4d_kernel!(backend, threads)(Base.reshape(C, M, N), Wq, W.scale, Xq, K ÷ 32, N, trailing_zeros(lpg), Val(min(N, 3)),
+    _q4d_kernel!(backend, threads)(Base.reshape(C, M, N), Wq, W.scale, Xq, K ÷ 32, N, trailing_zeros(lpg), Val(min(N, 4)),
                                    _residual_arg(residual, C, M, N)...; ndrange = (M ÷ 4) * threads)
     Bc === B || _free_now!(Bc)
     return true

@@ -2,7 +2,7 @@
 #
 # Usage:
 #   julia -t auto,1 --project=. examples/qwen35_spec_bench.jl <base.gguf> <mtp.gguf> [--int4|--int8]
-#       [--new=128] [--reps=2] [--min-avail=20] [--swap-gb=3] [--layers=N] [--oracle=P] [--draft-vocab=N] [--ndraft=1|2] [--max-seq=1024] [--prompt="text"]
+#       [--new=128] [--reps=2] [--min-avail=20] [--swap-gb=3] [--layers=N] [--oracle=P] [--draft-vocab=N] [--ndraft=1|2|3] [--max-seq=1024] [--prompt="text"]
 # The base weights come from <base.gguf>, the MTP head (`blk.<n>.nextn.*`) from <mtp.gguf> (a GGUF that has it).
 # Prints tokens/s for both loops, the acceptance rate, and whether the two outputs are identical.
 using Luminal
@@ -86,6 +86,7 @@ function main()
     @printf("acceptance   : %d of %d drafts (%.0f%%), %.2f tokens per verify step\n", st[:accepted], st[:cycles],
             100 * st[:accepted] / max(st[:cycles], 1), (length(spec) - 1) / max(st[:cycles], 1))
     haskey(st, :accepted2) && @printf("second drafts: %d accepted of %d first-accepted\n", st[:accepted2], st[:accepted])
+    haskey(st, :accepted3) && @printf("third drafts: %d accepted of %d second-accepted\n", st[:accepted3], st[:accepted2])
     @printf("phases (ms, whole run): verify %d, MTP steps %d, rollback %d (%d cycles)\n",
             st[:ms_verify], st[:ms_mtp], st[:ms_rollback], st[:cycles])
     same = plain[1:min(length(plain), length(spec))] == spec[1:min(length(plain), length(spec))]

@@ -149,7 +149,7 @@ and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
                                   stats=nothing, draft_hook=nothing, ndraft::Int=1)
-    ndraft in (1, 2) || error("ndraft must be 1 or 2")
+    ndraft in (1, 2, 3) || error("ndraft must be 1, 2 or 3")
     d.session === s || error("the drafter belongs to another session")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt])
     pf.hidden_id == 0 && error("this model's prefill does not return its hidden states")
@@ -163,7 +163,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
-    ndraft == 2 && return _spec_loop2!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats)
+    ndraft >= 2 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft)
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -208,51 +208,59 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
 end
 
 
-# Two drafts per cycle: the base model verifies [y, d1, d2] in one 3-token step (3 columns cost about what 2 do, see
-# `_q4d_kernel!`) and the MTP head drafts d1 from the last accepted token and d2 from d1 and its own output state.
-#   a = argmax after y, b = after d1, c = after d2:  a != d1: emit a;  b != d2: emit a, b;  else emit a, b, c.
-# The recurrent states roll back to the snapshot after y (slot 1) or after d1 (slot 2), or stay.
-# The MTP pairs are (emitted[i], hidden of the position before it), padded with dummies to 3.
-function _spec_loop2!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats)
-    draft_pair!(toks, hid, nreal) = begin
+# Several drafts per cycle (ND = 2 or 3): the base model verifies [y, d1, ..., dND] in one (ND+1)-token step (up to 4 columns cost
+# about what 2 do, see `_q4d_kernel!`); the MTP head drafts d1 from the last accepted token and d_j from d_(j-1) and its own
+# output state (a chain of one-pair steps that overwrite each other's K/V slot).
+#   a_i = argmax after the i-th fed token:  the first i with a_i != d_i ends the cycle (emit a_1..a_i); all equal: emit all ND+1.
+# The recurrent states roll back to the snapshot after the last emitted token (slot = number emitted), or stay when all are.
+# The MTP pairs are (emitted[i], hidden of the position before it), padded with dummies to ND+1.
+function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int)
+    K = ND + 1
+    function draft_chain!(toks, hid, nreal)
         am, xp = _mtp_step!(d, toks, hid, nreal; with_hidden=true)
-        d1 = hook(am[nreal], 0)
-        d2 = hook(_mtp_step!(d, [d1], xp[:, nreal:nreal, :], 0)[1], 1)
-        (d1, d2)
+        ds = Int[hook(am[nreal], 0)]
+        x = xp[:, nreal:nreal, :]
+        for j in 2:ND
+            am, x = _mtp_step!(d, [ds[end]], x, 1; with_hidden=true)   # position d.pos + j - 2: the slot after the previous draft's
+            push!(ds, hook(am[1], j - 1))
+        end
+        d.pos -= ND - 1                                              # the chain's slots are scratch: the next real step overwrites them
+        ds
     end
-    d1, d2 = draft_pair!([y, y, y], cat(h1, h1, h1; dims=2), 1)
-    vg = _verify_graph(s, 1, 3)
-    cycles = acc1 = acc2 = 0
+    ds = draft_chain!(fill(y, K), cat(ntuple(_ -> h1, K)...; dims=2), 1)
+    vg = _verify_graph(s, 1, K)
+    cycles = 0
+    acc = zeros(Int, ND)                                              # acc[j]: cycles in which drafts 1..j were all accepted
     tm = zeros(3)
     while length(out) < max_new_tokens
-        cache.positions[1] + 3 <= s.max_seq || break
+        cache.positions[1] + K <= s.max_seq || break
         t0 = time_ns()
-        _, hid, am = _verify_step!(s, vg, [y; d1; d2;;])
+        _, hid, am = _verify_step!(s, vg, [y; ds;;])
         t1 = time_ns(); tm[1] += (t1 - t0) / 1e9
         cycles += 1
-        a, b, c = am[1], am[2], am[3]
-        if a != d1
-            emitted = [a]
-        elseif b != d2
-            acc1 += 1; emitted = [a, b]
-        else
-            acc1 += 1; acc2 += 1; emitted = [a, b, c]
+        m = 0                                                         # leading drafts the base model confirmed
+        while m < ND && am[m + 1] == ds[m + 1]
+            m += 1
         end
-        nreal = length(emitted)
+        acc[1:m] .+= 1
+        emitted = am[1:m + 1]
+        nreal = m + 1
         append!(out, emitted)
         cache.positions[1] += nreal
-        nreal < 3 && _rollback_states!(s, vg; slot=nreal)
+        nreal < K && _rollback_states!(s, vg; slot=nreal)
         y = emitted[end]
         any(e -> e in eos_ids, emitted) && break
         t2 = time_ns(); tm[3] += (t2 - t1) / 1e9
-        d1, d2 = draft_pair!([emitted; fill(y, 3 - nreal)], hid, nreal)
+        ds = draft_chain!([emitted; fill(y, K - nreal)], hid, nreal)
         tm[2] += (time_ns() - t2) / 1e9
     end
     k = findfirst(t -> t in eos_ids, out)
     k === nothing || (out = out[1:k])
     length(out) > max_new_tokens && (out = out[1:max_new_tokens])
     if stats !== nothing
-        stats[:cycles] = cycles; stats[:accepted] = acc1; stats[:accepted2] = acc2; stats[:emitted] = length(out)
+        stats[:cycles] = cycles; stats[:accepted] = acc[1]; stats[:emitted] = length(out)
+        ND >= 2 && (stats[:accepted2] = acc[2])
+        ND >= 3 && (stats[:accepted3] = acc[3])
         for (k, name) in enumerate((:ms_verify, :ms_mtp, :ms_rollback))
             stats[name] = round(Int, 1000 * tm[k])
         end

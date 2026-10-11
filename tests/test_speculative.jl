@@ -81,6 +81,22 @@ end
     @test 0 < st[:accepted] && st[:accepted2] < st[:cycles]          # all three outcomes: reject, 2 tokens, 3 tokens
     @test generate_ids_speculative(s, d3, prompt2; max_new_tokens=10, ndraft=2) == plain2
 
+    # 7. three drafts per cycle (a 4-token verify step with three state snapshots)
+    d4 = MTPDrafter(s)
+    st = Dict{Symbol,Int}()
+    @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3) == plain
+    @test st[:emitted] == 14
+    st = Dict{Symbol,Int}()
+    @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3, draft_hook=oracle) == plain
+    @test st[:accepted3] >= st[:cycles] - 1 && st[:cycles] >= 3   # all 4 tokens per cycle (bar the last)
+    for period in (2, 3, 4, 5)                                     # wrong drafts at different positions of the cycle
+        cnt = Ref(0)
+        wrongs(n, draft) = (cnt[] += 1; cnt[] % period != 0 && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, model.config.vocab_size))
+        st = Dict{Symbol,Int}()
+        @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3, draft_hook=wrongs) == plain
+    end
+    @test generate_ids_speculative(s, d4, prompt2; max_new_tokens=10, ndraft=3) == plain2
+
     # 5. a restricted draft vocabulary only changes which tokens get drafted, never the output
     d2 = MTPDrafter(s; draft_vocab=model.config.vocab_size ÷ 2)
     st = Dict{Symbol,Int}()

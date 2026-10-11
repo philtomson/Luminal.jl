@@ -145,3 +145,21 @@ if Luminal.get_device() isa Luminal.AMDDevice
         @test Array(Luminal.dequantize(Luminal.HalfWeight(Luminal.to_device(vals[3], dev)))) ≈ vals[3] rtol=1e-3
     end
 end
+
+# The int4 GEMV for 2-4 columns (one pass over the weights for all of them) against the dequantized matmul.
+if Luminal.get_device() isa Luminal.AMDDevice
+    @testset "int4 GEMV, 1-5 columns" begin
+        dev = Luminal.get_device()
+        for N in 1:5
+            g = Luminal.Graph()
+            W = Luminal.tensor(g, [96, 256]); x = Luminal.tensor(g, [256, N])
+            out = Luminal.matmul(W, x)
+            wv = randn(Float32, 96, 256); xv = randn(Float32, 256, N)
+            g.tensors[(W.id, 1)] = Luminal.to_device(wv, dev)
+            cg = compile(g; device=dev, retain=[out.id], weight_dtype=_ -> Luminal.Int4)
+            got = Array(cg(Dict{Int,Any}(x.id => xv); device=dev)[out.id])
+            D = Array(Luminal.dequantize(cg.results[W.id]))
+            @test got ≈ D * xv rtol=2e-3
+        end
+    end
+end
