@@ -737,3 +737,12 @@ the dequantized cache). No end-to-end tiny-model test (its head_dim is 16, below
 Not done: a perplexity measurement (only greedy-agreement spot checks), int8 for the Gemma / windowed layers and for batched
 chunk steps (B > 1), int4 KV.
 
+
+### Adaptive draft count (done, option `ndraft=0`; `--ndraft=0` in the bench) -- `_spec_loopN!(...; adaptive=true)`
+Up to 3 drafts per cycle; after each verify the loop picks 1..3 drafts maximizing expected tokens per ms, from an EMA (0.1) of the
+conditional acceptance of each draft position (only cycles that tested it) and fixed costs (verify 86/91.5/96.6 ms for 2/3/4
+columns, draft chain 5/12/16 ms). The first draft step is padded to the previous cycle's width, so graphs for every width get
+compiled on first use. Output identical to plain decoding (checked on two prompts). Measured so far (27B int4, 128 new tokens,
+lighthouse-story prompt): 20.5-24 tok/s, 69-88% first drafts accepted (run-to-run variation from the model load state); the
+ndraft=1/3 comparison on low-acceptance text is still to be measured, so the benefit over a fixed 3 is unconfirmed.
+Cheaper MTP chain: not started.

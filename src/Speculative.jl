@@ -153,7 +153,7 @@ and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
                                   stats=nothing, draft_hook=nothing, ndraft::Int=1)
-    ndraft in (1, 2, 3) || error("ndraft must be 1, 2 or 3")
+    ndraft in (0, 1, 2, 3) || error("ndraft must be 1, 2, 3, or 0 (adaptive: 1 to 3 drafts per cycle from the recent acceptance rate)")
     d.session === s || error("the drafter belongs to another session")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt])
     pf.hidden_id == 0 && error("this model's prefill does not return its hidden states")
@@ -167,7 +167,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
-    ndraft >= 2 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft)
+    ndraft != 1 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? 3 : ndraft; adaptive=ndraft == 0)
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -218,9 +218,28 @@ end
 #   a_i = argmax after the i-th fed token:  the first i with a_i != d_i ends the cycle (emit a_1..a_i); all equal: emit all ND+1.
 # The recurrent states roll back to the snapshot after the last emitted token (slot = number emitted), or stay when all are.
 # The MTP pairs are (emitted[i], hidden of the position before it), padded with dummies to ND+1.
-function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int)
+#
+# adaptive = true: ND is the maximum; each cycle drafts the count (1..ND) with the best expected tokens per millisecond, from running
+# estimates of the conditional acceptance rate of each draft position (an exponential average over the cycles that tested it) and
+# fixed relative costs of a verify step with K columns and of a draft chain (`_SPEC_COST_VERIFY`, `_SPEC_COST_MTP`, ms at 27B int4).
+const _SPEC_COST_VERIFY = (86.0, 91.5, 96.6)       # K = 2, 3, 4 columns
+const _SPEC_COST_MTP = (5.0, 12.0, 16.0)           # 1, 2, 3 drafts
+function _best_ndraft(q, ND)
+    best, bn = -1.0, 1
+    e = 1.0; p = 1.0
+    for nd in 1:ND
+        p *= q[nd]; e += p
+        r = e / (_SPEC_COST_VERIFY[nd] + _SPEC_COST_MTP[nd])
+        r > best && ((best, bn) = (r, nd))
+    end
+    bn
+end
+
+function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false)
     K = ND + 1
-    function draft_chain!(toks, hid, nreal)
+    q = fill(0.7, ND)                                                 # conditional acceptance of draft j given 1..j-1 were
+    sel = zeros(Int, ND)                                              # cycles run with each draft count
+    function draft_chain!(toks, hid, nreal, ND)
         am, xp = _mtp_step!(d, toks, hid, nreal; with_hidden=true)
         ds = Int[hook(am[nreal], 0)]
         x = xp[:, nreal:nreal, :]
@@ -231,22 +250,28 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         d.pos -= ND - 1                                              # the chain's slots are scratch: the next real step overwrites them
         ds
     end
-    ds = draft_chain!(fill(y, K), cat(ntuple(_ -> h1, K)...; dims=2), 1)
+    ndc = adaptive ? _best_ndraft(q, ND) : ND
+    K = ndc + 1
+    ds = draft_chain!(fill(y, K), cat(ntuple(_ -> h1, K)...; dims=2), 1, ndc)
     vg = _verify_graph(s, 1, K)
     cycles = 0
     acc = zeros(Int, ND)                                              # acc[j]: cycles in which drafts 1..j were all accepted
     tm = zeros(3)
     while length(out) < max_new_tokens
         cache.positions[1] + K <= s.max_seq || break
+        ND_c = K - 1; sel[ND_c] += 1
         t0 = time_ns()
         _, hid, am = _verify_step!(s, vg, [y; ds;;])
         t1 = time_ns(); tm[1] += (t1 - t0) / 1e9
         cycles += 1
         m = 0                                                         # leading drafts the base model confirmed
-        while m < ND && am[m + 1] == ds[m + 1]
+        while m < ND_c && am[m + 1] == ds[m + 1]
             m += 1
         end
         acc[1:m] .+= 1
+        for j in 1:min(m + 1, ND_c)                                   # draft j was tested iff 1..j-1 matched
+            q[j] += 0.1 * ((j <= m) - q[j])
+        end
         emitted = am[1:m + 1]
         nreal = m + 1
         append!(out, emitted)
@@ -255,7 +280,10 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         y = emitted[end]
         any(e -> e in eos_ids, emitted) && break
         t2 = time_ns(); tm[3] += (t2 - t1) / 1e9
-        ds = draft_chain!([emitted; fill(y, K - nreal)], hid, nreal)
+        ndn = adaptive ? _best_ndraft(q, ND) : ND
+        ds = draft_chain!([emitted; fill(y, K - nreal)], hid, nreal, ndn)
+        K = ndn + 1
+        vg = _verify_graph(s, 1, K)
         tm[2] += (time_ns() - t2) / 1e9
     end
     k = findfirst(t -> t in eos_ids, out)
@@ -265,6 +293,7 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         stats[:cycles] = cycles; stats[:accepted] = acc[1]; stats[:emitted] = length(out)
         ND >= 2 && (stats[:accepted2] = acc[2])
         ND >= 3 && (stats[:accepted3] = acc[3])
+        adaptive && (stats[:cycles_nd1] = sel[1]; stats[:cycles_nd2] = sel[2]; stats[:cycles_nd3] = sel[3])
         for (k, name) in enumerate((:ms_verify, :ms_mtp, :ms_rollback))
             stats[name] = round(Int, 1000 * tm[k])
         end
