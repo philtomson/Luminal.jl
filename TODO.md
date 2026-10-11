@@ -633,3 +633,11 @@ Together: plain decode 11.88 -> 12.04 tok/s, verify cycle 90.3 -> 88.7 ms, specu
 Removing a kernel is worth ~4 us, so SiLU*up into the down-proj GEMV (64 launches) is ~0.3 ms and add+RMSNorm (129) ~0.5 ms;
 a general fusion pass would reach maybe 2-3 ms in total. Not done: add+norm into one two-output op, SiLU*up in the GEMV.
 A decode "megakernel" is not attractive here: 91% of the step is int4 GEMV at ~217 of ~225 GB/s.
+
+### int4 GEMV with Float16 activations and v_dot2_f32_f16 (done, 2-4 columns)
+The Float32 multi-column GEMV is instruction-bound (3 instr per weight and column). `_q4d_kernel!`: activations as Float16
+in the weights' nibble pair order (`_q4d_xprep_kernel!`), each weight word dequantized once into packed Float16 pairs
+((1024+q) - 1032 = q - 8, exact), then one `v_dot2_f32_f16` per 2 weights per column. 17408x5120: N=2 232 us, N=3 229 us
+(old: 236 / 308), N=4 292 us; same for the 27B's other shapes. Symmetric weights only; N=1 keeps the Float32 kernel.
+Relative error ~2e-4 (Float16 activations). Verify step on the 27B: 2 tokens 88.3 -> 86.5 ms, 3 tokens 111.2 -> 87.1 ms,
+so drafting more than one token per cycle no longer costs a 3-column penalty. Speculative output still identical.

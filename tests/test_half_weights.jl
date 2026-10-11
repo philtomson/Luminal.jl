@@ -140,7 +140,7 @@ if Luminal.get_device() isa Luminal.AMDDevice
         @test !(cg.results[W3.id] isa Union{Luminal.Q4Weight, Luminal.QuantWeight, Luminal.HalfWeight})
         got = Array(cg(Dict{Int,Any}(x.id => xv); device=dev)[out.id])
         D1 = Array(Luminal.dequantize(cg.results[W1.id])); D2 = Array(Luminal.dequantize(cg.results[W2.id]))
-        @test got ≈ vals[3] * (D2 * (D1 * xv)) rtol=1e-4
+        @test got ≈ vals[3] * (D2 * (D1 * xv)) rtol=2e-3   # (the 2..4-column int4 GEMV takes Float16 activations)
         @test D1 ≈ vals[1] rtol=0.1          # 4-bit is close to the original, not equal
         @test Array(Luminal.dequantize(Luminal.HalfWeight(Luminal.to_device(vals[3], dev)))) ≈ vals[3] rtol=1e-3
     end

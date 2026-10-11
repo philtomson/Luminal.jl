@@ -1211,11 +1211,144 @@ _q4_threads(K32::Int, N::Int) = (N == 1 && K32 >= 256) ? 256 : 128
 # threads of the 4-row kernel: 64 for tall matrices with a short K (many workgroups), else 128 (measured at the 27B's shapes)
 _q4_threads_r4(M::Int, K32::Int) = (K32 <= 256 && M >= 8192) ? 64 : 128
 
+# --- int4 GEMV with Float16 activations and v_dot2_f32_f16 ------------------------------------------------
+# The Float32 kernels above spend ~3 instructions per weight and column (nibble extract, convert, FMA), so
+# they are instruction-bound from 2 columns on. Here the activations are Float16 in a pair order matching
+# the weights' nibbles, a weight word is dequantized once per 8 weights into packed Float16 pairs ((1024 + q)
+# from the 0x6400 mantissa trick, minus 1032 -> q - 8, exact), and every column then costs one
+# v_dot2_f32_f16 per 2 weights: 2, 3 columns run at the 1-column speed (bandwidth). Symmetric weights only.
+# (Float16 activations: relative error ~2e-4 of the result, like the WMMA kernels.)
+@inline function _fdot2(a::UInt32, b::UInt32, c::Float32)
+    Base.llvmcall(("declare float @llvm.amdgcn.fdot2(<2 x half>, <2 x half>, float, i1)
+define float @entry(i32 %a, i32 %b, float %c) #0 {
+  %x = bitcast i32 %a to <2 x half>
+  %y = bitcast i32 %b to <2 x half>
+  %r = call float @llvm.amdgcn.fdot2(<2 x half> %x, <2 x half> %y, float %c, i1 false)
+  ret float %r
+}
+attributes #0 = { alwaysinline }", "entry"), Float32, Tuple{UInt32,UInt32,Float32}, a, b, c)
+end
+@inline function _pkadd(a::UInt32, b::UInt32)
+    Base.llvmcall(("define i32 @entry(i32 %a, i32 %b) #0 {
+  %x = bitcast i32 %a to <2 x half>
+  %y = bitcast i32 %b to <2 x half>
+  %r = fadd <2 x half> %x, %y
+  %o = bitcast <2 x half> %r to i32
+  ret i32 %o
+}
+attributes #0 = { alwaysinline }", "entry"), UInt32, Tuple{UInt32,UInt32}, a, b)
+end
+const _Q4D_NEG1032 = 0xe408e408     # -1032 in f16 pairs: (1024 + q) - 1032 = q - 8
+@inline _q4d_dq(w::UInt32, sh) = _pkadd(((w >> sh) & 0x000f000f) | 0x64006400, _Q4D_NEG1032)
+
+@inline function _q4d_wdot(wi::UInt32, x1::UInt32, x2::UInt32, x3::UInt32, x4::UInt32, acc::Float32)
+    q0 = _q4d_dq(wi, 0x00000000); q1 = _q4d_dq(wi, 0x00000004); q2 = _q4d_dq(wi, 0x00000008); q3 = _q4d_dq(wi, 0x0000000c)
+    return _fdot2(q3, x4, _fdot2(q2, x3, _fdot2(q1, x2, _fdot2(q0, x1, acc))))
+end
+# one row's chunk dot against one column's 16 activation pairs
+@inline function _q4d_coldot(w::NTuple{4,UInt32}, x::NTuple{16,UInt32})
+    a = _q4d_wdot(w[1], x[1], x[2], x[3], x[4], 0f0)
+    a = _q4d_wdot(w[2], x[5], x[6], x[7], x[8], a)
+    a = _q4d_wdot(w[3], x[9], x[10], x[11], x[12], a)
+    return _q4d_wdot(w[4], x[13], x[14], x[15], x[16], a)
+end
+@inline _q4d_rowdots(w::NTuple{4,UInt32}, xs::NTuple{C,NTuple{16,UInt32}}) where {C} = ntuple(c -> _q4d_coldot(w, xs[c]), Val(C))
+
+@inline _q4d_cat4(a::NTuple{4,UInt32}, b::NTuple{4,UInt32}, c::NTuple{4,UInt32}, d::NTuple{4,UInt32}) =
+    (a[1], a[2], a[3], a[4], b[1], b[2], b[3], b[4], c[1], c[2], c[3], c[4], d[1], d[2], d[3], d[4])
+@inline _q4d_xcol(Xv, kk, c) = @inbounds _q4d_cat4(Xv[4kk - 3, c], Xv[4kk - 2, c], Xv[4kk - 1, c], Xv[4kk, c])
+@inline _q4d_xcols(Xv, kk, cb, N, ::Val{C}) where {C} = ntuple(j -> _q4d_xcol(Xv, kk, min(cb + j, N)), Val(C))
+@kernel function _q4d_kernel!(Y, @Const(Wv), @Const(sc), @Const(Xv), K32, N, shift, ::Val{C}, @Const(Res), ::Val{RES}) where {C, RES}
+    grp = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256, 4 * C)
+    row0 = (grp - 1) * 4
+    c0 = 0
+    while c0 < N
+        acc1 = ntuple(_ -> 0f0, Val(C)); acc2 = ntuple(_ -> 0f0, Val(C))
+        acc3 = ntuple(_ -> 0f0, Val(C)); acc4 = ntuple(_ -> 0f0, Val(C))
+        k = lid
+        while k <= K32
+            gi = ((k - 1) >> shift) + 1
+            @inbounds w1 = Wv[k, row0 + 1]; @inbounds w2 = Wv[k, row0 + 2]
+            @inbounds w3 = Wv[k, row0 + 3]; @inbounds w4 = Wv[k, row0 + 4]
+            @inbounds s1 = Float32(sc[gi, row0 + 1]); @inbounds s2 = Float32(sc[gi, row0 + 2])
+            @inbounds s3 = Float32(sc[gi, row0 + 3]); @inbounds s4 = Float32(sc[gi, row0 + 4])
+            kk = k; cb = c0
+            acc1, acc2, acc3, acc4 = let a1 = acc1, a2 = acc2, a3 = acc3, a4 = acc4
+                xs = _q4d_xcols(Xv, kk, cb, N, Val(C))
+                d1 = _q4d_rowdots(w1, xs); d2 = _q4d_rowdots(w2, xs); d3 = _q4d_rowdots(w3, xs); d4 = _q4d_rowdots(w4, xs)
+                (ntuple(j -> a1[j] + s1 * d1[j], Val(C)), ntuple(j -> a2[j] + s2 * d2[j], Val(C)),
+                 ntuple(j -> a3[j] + s3 * d3[j], Val(C)), ntuple(j -> a4[j] + s4 * d4[j], Val(C)))
+            end
+            k += G
+        end
+        @unroll for j in 1:C
+            @inbounds s[lid, (j - 1) * 4 + 1] = acc1[j]; @inbounds s[lid, (j - 1) * 4 + 2] = acc2[j]
+            @inbounds s[lid, (j - 1) * 4 + 3] = acc3[j]; @inbounds s[lid, (j - 1) * 4 + 4] = acc4[j]
+        end
+        @synchronize
+        stride = G ÷ 2
+        while stride > 0
+            if lid <= stride
+                @unroll for i in 1:4*C
+                    @inbounds s[lid, i] += s[lid + stride, i]
+                end
+            end
+            @synchronize
+            stride ÷= 2
+        end
+        if lid <= 4 * C
+            r = (lid - 1) % 4 + 1; j = (lid - 1) ÷ 4 + 1
+            if c0 + j <= N
+                @inbounds Y[row0 + r, c0 + j] = RES ? s[1, lid] + Res[row0 + r, c0 + j] : s[1, lid]
+            end
+        end
+        @synchronize
+        c0 += C
+    end
+end
+
+# f16 activations in the kernel's pair order: within each 8, [0,4,1,5,2,6,3,7]
+@kernel function _q4d_xprep_kernel!(X16, @Const(X))
+    i = @index(Global, Linear)
+    K = size(X, 1)
+    n = (i - 1) ÷ K; k = (i - 1) % K          # 0-based
+    g = k ÷ 8; r = k % 8                       # position within the 8-group in the new order
+    src = 8g + (r ÷ 2) + 4 * (r % 2)
+    @inbounds X16[k + 1, n + 1] = Float16(X[src + 1, n + 1])
+end
+
+
+const Q4_DOT2_MIN_N = Ref(2)
+const Q4_DOT2_MAX_N = Ref(4)
+const _Q4D_WORKSPACE = Dict{Any, Any}()
+# Y (M, N) = Wq * B (+ residual) with the kernel above; false if the weight or arrays don't qualify.
+function _q4d_matmul!(C, W::Q4Weight, B, residual; threads::Int = 128)
+    (C isa ROCArray{Float32} && W.p isa ROCArray{UInt8} && W.mn === nothing && W.scale isa ROCArray{Float16} &&
+     get(ENV, "LUMINAL_Q4_DOT2", "1") != "0") || return false
+    M, K = size(W)
+    (M % 4 == 0 && K % 32 == 0) || return false
+    N = length(B) ÷ K
+    Bc = B isa DenseArray ? B : copy(B)
+    X16 = get!(() -> similar(Bc, Float16, K, N), _Q4D_WORKSPACE, (typeof(Bc), K, N))
+    backend = KernelAbstractions.get_backend(C)
+    _q4d_xprep_kernel!(backend, 256)(X16, Base.reshape(Bc, K, N); ndrange = K * N)
+    Wq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(W.p)), K ÷ 32, M)
+    Xq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(X16)), K ÷ 8, N)
+    lpg = W.group ÷ 32
+    ispow2(lpg) || return false
+    _q4d_kernel!(backend, threads)(Base.reshape(C, M, N), Wq, W.scale, Xq, K ÷ 32, N, trailing_zeros(lpg), Val(min(N, 3)),
+                                   _residual_arg(residual, C, M, N)...; ndrange = (M ÷ 4) * threads)
+    Bc === B || _free_now!(Bc)
+    return true
+end
+
 function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::Int = 0,
                      residual = nothing)
     M, K = size(W)
     N = length(B) ÷ K
     SKINNY_MIN_COLS <= N <= SKINNY_MAX_COLS && _wmma_q4_skinny_gemm!(C, W, B, residual) && return C
+    Q4_DOT2_MIN_N[] <= N <= Q4_DOT2_MAX_N[] && _q4d_matmul!(C, W, B, residual) && return C
     N > QUANT_GEMM_COLS && _wmma_q4_gemm!(C, W, B, residual) && return C
     (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
