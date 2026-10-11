@@ -621,10 +621,25 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     # storage (freeing the Float32 value) as soon as it is complete.
     folded = falses(length(graph.nodes))
     pending = [length(consumers[i]) for i in eachindex(graph.nodes)]   # consumers not yet folded
+    # (A Constant is persistent too, so `w + 1` or `exp(w)` on a weight is computed here, not on every step;
+    # `from_const` bounds what that may materialize, e.g. a scalar expanded to a large shape.)
+    from_const = falses(length(graph.nodes))
     for (node_id, node) in enumerate(graph.nodes)
         fold || break
+        if node.op isa Luminal.Constant && !persistent[node_id]
+            cv = node.op.value
+            if cv isa Number || (cv isa AbstractArray && length(cv) <= 1 << 16)
+                results[node_id] = to_device(cv, compile_device)
+                persistent[node_id] = from_const[node_id] = true
+            end
+            continue
+        end
         (persistent[node_id] || isempty(node.inputs)) && continue
         all(persistent[id] for (id, _, _) in node.inputs) || continue
+        if any(from_const[id] for (id, _, _) in node.inputs)
+            prod(try [eval_dim(d) for d in realized_dims(graph.shapes[node_id])] catch; [typemax(Int) >> 8] end) <= 1 << 22 || continue
+            from_const[node_id] = true
+        end
         val = try
             none = Dict{Symbol,Int}()
             dims = [eval_dim(d) for d in realized_dims(graph.shapes[node_id])]

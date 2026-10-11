@@ -68,11 +68,11 @@ end
 # --- RMS normalization --------------------------------------------------------
 # One workgroup per column (all dims after the first): sum of squares over dim 1
 # with a tree reduction, then the normalized, weighted write.
-@kernel function _rmsnorm_kernel!(out, @Const(x), @Const(w), eps)
+@kernel function _rmsnorm_kernel!(out, @Const(x), @Const(w), eps, ::Val{T}) where {T}
     col = @index(Group, Linear); lid = @index(Local, Linear)
-    T = @uniform @groupsize()[1]
     H = @uniform size(x, 1)
-    red = @localmem Float32 (256,)
+    red = @localmem Float32 (T,)
+    part = @localmem Float32 (32,)
     acc = 0f0
     i = lid
     while i <= H
@@ -82,13 +82,22 @@ end
     end
     @inbounds red[lid] = acc
     @synchronize
-    stride = T ÷ 2
-    while stride > 0
-        lid <= stride && (@inbounds red[lid] += red[lid + stride])
-        @synchronize
-        stride ÷= 2
+    # two-level sum (32 partial sums, then one pass over them): 3 barriers instead of log2(T)
+    if lid <= 32
+        a = 0f0
+        j = lid
+        while j <= T
+            @inbounds a += red[j]
+            j += 32
+        end
+        @inbounds part[lid] = a
     end
-    @inbounds r = 1f0 / sqrt(red[1] / H + eps)
+    @synchronize
+    s = 0f0
+    for j in 1:32
+        @inbounds s += part[j]
+    end
+    r = 1f0 / sqrt(s / H + eps)
     i = lid
     while i <= H
         @inbounds out[i, col] = x[i, col] * r * w[i]
@@ -109,7 +118,8 @@ function execute_op!(out, op::RMSNormOp, x, w)
         end
         return out
     end
-    _rmsnorm_kernel!(KernelAbstractions.get_backend(o2), 256)(o2, x2, wv, op.epsilon; ndrange = size(x2, 2) * 256)
+    T = H >= 2048 ? 512 : 256        # one workgroup per column; wide hidden sizes want more threads
+    _rmsnorm_kernel!(KernelAbstractions.get_backend(o2), T)(o2, x2, wv, op.epsilon, Val(T); ndrange = size(x2, 2) * T)
     return out
 end
 

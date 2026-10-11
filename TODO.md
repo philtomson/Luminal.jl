@@ -622,3 +622,14 @@ Plain step 82.5 ms wall / 76.9 GPU-busy; verify step 91.5 / 85.1. The extra ~8 m
 - gpu_linear_copy / permutedims +0.4 ms: reshape(slice(qkv)) of q, k, v is a view at S=1 but a copy at S=2 (3 per layer).
 - ArgMax +0.34 ms: one workgroup per column over 248k. Fixed: 64 workgroups per column plus a merge kernel, 182 -> 17 us.
 The wall-minus-GPU gap (~5.6 ms) is launch gaps between ~1000 kernels, the same in both steps.
+
+### Small-kernel fusion prototype (partial; measured gains are small)
+Profile of the plain 27B step: 1839 kernels, 1278 of them small (4.5 ms of work, ~4 us each incl. launch; 5.6 ms of
+wall time is gaps). Findings: (1) the Gemma-style `w + 1` of every norm weight ran as its own kernel each step (129 + q/k
+norms): the compiler now folds Constants, so `w + 1` is computed once at compile (-39 steps per 8 layers; folding of
+constant-derived nodes is capped at 4M elements); (2) the residual adds were already fused into the GEMV; (3) the RMSNorm
+kernel used a log2(T)-barrier tree: now a 2-level sum (3 barriers), 512 threads for H >= 2048 (9.3 -> 5.4 us standalone).
+Together: plain decode 11.88 -> 12.04 tok/s, verify cycle 90.3 -> 88.7 ms, speculative 18.47 -> 18.61 tok/s.
+Removing a kernel is worth ~4 us, so SiLU*up into the down-proj GEMV (64 launches) is ~0.3 ms and add+RMSNorm (129) ~0.5 ms;
+a general fusion pass would reach maybe 2-3 ms in total. Not done: add+norm into one two-output op, SiLU*up in the GEMV.
+A decode "megakernel" is not attractive here: 91% of the step is int4 GEMV at ~217 of ~225 GB/s.
