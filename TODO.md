@@ -673,5 +673,12 @@ Gotcha found: buffers the graph does not free itself are only released by the GC
 24 GB on the 27B), so a long chunked prefill ran the machine out of memory; `_chunk_reclaim!` now runs a young-generation GC + HIP
 reclaim after every chunk (a full GC costs ~130 ms per chunk, LUMINAL_CHUNK_GC=full). The one-shot prefill path has the same
 property but is bounded by the prompt length.
-Next: bigger chunks need more headroom than this shared machine has (512 -> ~16 GB); prefill at 32k not run yet (the cache
-holds it: 2.1 GB); int8 KV cache and sparse attention are the lossy options for the decode-side read traffic.
+32k prompt (27B int4, chunk 256, real text = this repo's sources/notes): prefill 146 s = 224 tok/s (rate falls with the cache
+length: 300 @512, 271 @8k, 224 @32k); memory flat (min available 36 GB with other jobs running, swap 0).
+Decode after the 32k prompt, 192 new tokens, output identical plain vs speculative: plain 9.81 tok/s (~102 ms/token);
+speculative (2 drafts) ~21.6 tok/s = 191 tokens / 73 cycles (2.62 tokens per cycle; 66/73 first drafts, 52/66 second drafts
+accepted) at verify 108 ms + MTP 12 ms per cycle (from the loop's phase timers). The wall-clock difference of a 1-token and a
+192-token speculative run is NOT usable (6.9 tok/s): the extra ~19 s is most likely the MTP priming over the 32k prompt, which
+the 1-token run seems to skip (unverified). At short context: ~12 plain / 23.6 speculative, so 32k costs ~18% / ~8%.
+Next: bigger chunks need more headroom than this shared machine has (512 -> ~16 GB); int8 KV cache and sparse attention are
+the lossy options for the decode-side read traffic; split-K kernel is at 125-170 of ~215 GB/s.
