@@ -682,3 +682,19 @@ accepted) at verify 108 ms + MTP 12 ms per cycle (from the loop's phase timers).
 the 1-token run seems to skip (unverified). At short context: ~12 plain / 23.6 speculative, so 32k costs ~18% / ~8%.
 Next: bigger chunks need more headroom than this shared machine has (512 -> ~16 GB); int8 KV cache and sparse attention are
 the lossy options for the decode-side read traffic; split-K kernel is at 125-170 of ~215 GB/s.
+
+### Split-K attention bandwidth tuning (small win) -- `src/DecodeAttn.jl`
+Microbenchmark at 32k keys (D=256, 4 KV heads, 24 heads; copy ceiling ~212 GB/s): S=1 (plain step) 728 us = 180 GB/s;
+S=3 (verify step) 1043 us = 126 GB/s, i.e. the 3-token case is where the headroom is. Part kernel = 96% of the time (merge 38 us,
+cache write 4 us); 192 VGPRs, 53.8 KB LDS per workgroup. Ablations at S=1: without the V pass -200 us, without the K/score phase
+-436 us; the phases run one after another inside a workgroup, so the memory pipe idles between them.
+Tried: (1) `exch` aliased onto the scores' LDS (frees 18 KB, a third workgroup fits): S=3 1043 -> 946 us but S=1 728 -> 800 us, so
+it is applied only when QR = S*Gq > 8 (kept: S=3 954 us, S=1 732 us). (2) Score row stride padded to a multiple of 4 (vector LDS
+reads): no change. (3) Software-pipelined V loads (next batch issued before the current is consumed, first batch before the
+softmax): much slower (S=3 1431 us; register pressure). Both (2) and (3) reverted.
+End to end on the 27B the verify step at 32k is 107.5 ms (was 107.7): the ~1.4 ms predicted is inside the run-to-run noise of the
+shared machine (plain step at 1k read 111-114 ms in these runs against 82.6 before, so another job was using the GPU).
+Untried: DA_CH=128 (twice the workgroups, half the LDS; needs the tile loops generalised), staging K through LDS to overlap the
+phases, int8 KV (halves the traffic).
+The MTP-priming gap from the 32k speculative run is confirmed in the code: `generate_ids_speculative` returns before `_mtp_prime!`
+when max_new_tokens <= 1, so the ~19 s priming cost (32k tokens) is a one-time cost of any longer generation.

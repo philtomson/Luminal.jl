@@ -46,7 +46,9 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, posv, scale2, S, Gq, ::Val{D},
     k0 < nmax || return
     qs = @ROCStaticLocalArray(Float16, (256, 32), false)
     scT = @ROCStaticLocalArray(Float32, (4608,), false)      # (key, row) = DA_CH * DA_MAX_ROWS
-    exch = @ROCStaticLocalArray(Float32, (4608,), false)     # a key group's partial sums = 256 * DA_MAX_ROWS
+    # a key group's partial sums = D * QR floats. With many rows they reuse the scores' LDS (dead after the first sync of the
+    # reduction), which lets a third workgroup fit on a CU; with few rows a separate array is faster (fewer concurrent streams).
+    exch = QR > 8 ? scT : (@ROCStaticLocalArray(Float32, (4608,), false))
     mq = @ROCStaticLocalArray(Float32, (18,), false)
     lq = @ROCStaticLocalArray(Float32, (18,), false)
     # stage the queries: row = (token s, head g); rows >= QR are zero
