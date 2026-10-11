@@ -902,7 +902,8 @@ function build_llama_decode_step!(model,
                                    seq::Int=1,
                                    snapshots::Union{Bool,Int}=false,
                                    want_hidden::Bool=false,
-                                   want_argmax::Bool=false)
+                                   want_argmax::Bool=false,
+                                   head::Symbol=:all)
     # ── Inputs ────────────────────────────────────────────────────────────────
     token_in = Luminal.tensor(graph, [seq, batch])
     pos_tensor = Luminal.tensor(graph, [batch])   # each sequence's position
@@ -941,7 +942,13 @@ function build_llama_decode_step!(model,
     end
 
     # ── Head ─────────────────────────────────────────────────────────────────
-    out    = model.norm(x)   # (Hidden, seq, Batch)
+    xh = x
+    if head === :last      # a prefill chunk: logits of each sequence's last real token (position lens[b]) only
+        Hd = Luminal.realized_dims(x.shape)[1]
+        xh = Luminal.add_op!(graph, Luminal.LastToken(), [(x.id, 0, x.shape), (lens.id, 0, lens.shape)],
+                             Luminal.ShapeTracker([Hd, 1, batch]))
+    end
+    out    = model.norm(xh)  # (Hidden, seq, Batch)
     logits = model.head(out) # (Vocab, seq, Batch)
 
     return LlamaDecodeGraph(

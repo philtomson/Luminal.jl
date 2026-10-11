@@ -285,6 +285,79 @@ function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=
     return [LlamaTokenization.decode(s.tokenizer, g) for g in generate_ids(s, prompt_ids; max_new_tokens)]
 end
 
+# --- Chunked prefill -------------------------------------------------------------------------------
+# A long prompt goes through the model in chunks of `prefill_chunk()` tokens, each one a multi-token
+# decode step (the same graph builder as a speculative verify step, with seq = chunk): the recurrent
+# layers continue from their states, the attention layers write the chunk's K/V into the cache and attend
+# to all of it (`chunk_attention!`). Memory stays at one chunk's intermediates (~32 MB per token) whatever
+# the prompt length, and the cost stays linear in the recurrent layers. Float16 cache, batch 1, Qwen3.5.
+# (a young-generation GC is enough and ~10x cheaper than a full one; LUMINAL_CHUNK_GC=full for the full collection)
+_chunk_reclaim!(device) = get(ENV, "LUMINAL_CHUNK_GC", "") == "full" ? Luminal.reclaim!(device) :
+                          (GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim(); nothing)
+prefill_chunk() = parse(Int, get(ENV, "LUMINAL_PREFILL_CHUNK", "512"))
+
+function _chunk_graph(s::LlamaSession, C::Int)
+    get!(s.spec, (:chunk, C)) do
+        dc = _decode_graph(s, 1)
+        g = Base.invokelatest(Graph); reg = WeightRegistry()
+        m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
+        idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=1, rope_base=s.rope_base, kv_dtype=s.kv_dtype,
+                                       seq=C, want_hidden=true, head=:last)
+        load_weights!(g, reg, s.weights; device=s.device)
+        retain = vcat(idg.logits_id, idg.hidden_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
+                      [idg.lens_input_id])
+        wd = s.decode_weights
+        if !(wd isa Type)
+            by_id = Dict{Int, Type}(id => wd(name) for (name, id) in reg.mapping)
+            wd = id -> get(by_id, id, Float32)
+        end
+        @info "Compiling prefill chunk graph ($C tokens)..."
+        exec = compile(g; device=s.device, retain=retain, weight_dtype=wd)
+        (exec=exec, idg=idg, cache=dc.cache)
+    end
+end
+
+# Can this session prefill in chunks?
+_can_chunk(s::LlamaSession) = s.device isa Luminal.AMDDevice && s.kv_dtype === Float16 && NN._needs_lens(s.model) &&
+                              NN._prefill_hidden(s.model) && get(ENV, "LUMINAL_PREFILL_CHUNK", "") != "0"
+
+# Prefill `prompt` (0-based ids) chunk by chunk into the decode cache; returns the last token's logits
+# (vocab, 1, 1) on the host and the final residual stream of all n tokens (Hidden, n, 1) on the device.
+function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=prefill_chunk())
+    n = length(prompt)
+    n < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
+    n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
+    gr = _chunk_graph(s, chunk)
+    idg = gr.idg; cache = gr.cache
+    Hd = s.model.config.hidden
+    Hall = Luminal.zero_tensor(s.device, Float32, Hd, n, 1)
+    logits = nothing
+    # the recurrent layers start from empty states (the cache may hold a previous prompt's)
+    for (i, l) in enumerate(s.model.layers)
+        NN._is_state_layer(l) || continue
+        fill!(cache.self_cache[i][1], 0); fill!(cache.self_cache[i][2], 0)
+    end
+    a = 0
+    while a < n
+        m = min(chunk, n - a)
+        toks = zeros(Float32, chunk, 1); toks[1:m, 1] .= prompt[a+1:a+m]
+        inputs = Dict{Int, Any}(idg.token_input_id => toks, idg.pos_input_id => Float32[a], idg.lens_input_id => Float32[m])
+        for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
+            inputs[k_id] = cache.self_cache[i][1]; inputs[v_id] = cache.self_cache[i][2]
+        end
+        res = gr.exec(inputs; device=s.device)
+        view(Hall, :, a+1:a+m, :) .= view(res[idg.hidden_id], :, 1:m, :)
+        a + m == n && (logits = Array{Float32}(res[idg.logits_id]))
+        a += m
+        # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per
+        # token they would pile up (24 GB per 1024 tokens on the 27B) until it ran
+        res = nothing
+        _chunk_reclaim!(s.device)
+    end
+    cache.positions .= n
+    return logits, Hall
+end
+
 """
     generate_ids(session, prompt_ids::Vector{Vector{Int}}; max_new_tokens=200,
                  last_logits=nothing, step_logits=nothing) -> Vector{Vector{Int}}
@@ -303,6 +376,11 @@ function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}})
     B = length(prompt_ids)
     plens = length.(prompt_ids)
     maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
+    if B == 1 && plens[1] > prefill_chunk() && _can_chunk(s)
+        logits, Hall = _prefill_chunked!(s, prompt_ids[1])
+        pf = (last_only=true, hidden_id=1, chunked=true)
+        return pf, Dict{Any,Any}(1 => Hall), _decode_graph(s, 1), plens, logits
+    end
 
     # Prefill. Recurrent layers' states are bound straight to the decode cache's
     # buffers, which the prefill leaves at each prompt's end.

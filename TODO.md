@@ -659,3 +659,19 @@ for the scores, a coalesced scalar PV pass, an LDS softmax, then a merge kernel)
 S*Gq <= 18. Per layer at 32k keys: 0.76 ms (1 token), 1.05 ms (3 tokens), ~170 and ~125 GB/s. No cache-length cap.
 27B int4 decode step by context (random K/V fill): plain 82.6 ms @1k, 83.7 @4k, 88.4 @16k, 93.6 @32k (12.1 -> 10.7 tok/s);
 3-token verify step 91.8 / 93.5 / 100.0 / 107.7 ms (speculative ~24 -> ~20 tok/s at 2.2 tokens per step).
+
+### Chunked prefill (done) -- `_prefill_chunked!`, `chunk_attention!`, `examples/qwen35_prefill_bench.jl`
+A prompt longer than `LUMINAL_PREFILL_CHUNK` (default 512; 0 disables) goes through the model in chunks, each a multi-token
+decode step (seq = chunk, `head=:last`, `lens` = the real tokens of the last chunk): the recurrent layers continue from their
+states (zeroed at the start), the attention layers write the chunk's K/V into the Float16 cache and `chunk_attention!` (the flash
+prefill kernel with a query offset, V transposed per call) attends to all of it. Memory is one chunk's intermediates
+(~32 MB/token) for any prompt length; the MTP head is primed per chunk the same way. Batch 1, Float16 cache, Qwen3.5/3.6.
+Needs max_seq >= prompt + chunk. 27B int4, chunk 256: 300 tok/s @512 tokens, 289 @2048, 271 @8192 (8192 tokens in 30 s);
+logits match the one-shot prefill (rel err 0 on the 27B, 3e-4 on a smaller chunk); speculative decode after a 1067-token
+prompt: 22.6 tok/s, output identical to plain greedy.
+Gotcha found: buffers the graph does not free itself are only released by the GC (~3 GB per 1024 tokens on an 8-layer slice,
+24 GB on the 27B), so a long chunked prefill ran the machine out of memory; `_chunk_reclaim!` now runs a young-generation GC + HIP
+reclaim after every chunk (a full GC costs ~130 ms per chunk, LUMINAL_CHUNK_GC=full). The one-shot prefill path has the same
+property but is bounded by the prompt length.
+Next: bigger chunks need more headroom than this shared machine has (512 -> ~16 GB); prefill at 32k not run yet (the cache
+holds it: 2.1 GB); int8 KV cache and sparse attention are the lossy options for the decode-side read traffic.

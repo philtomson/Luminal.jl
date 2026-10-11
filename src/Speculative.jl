@@ -77,7 +77,7 @@ function _mtp_step_graph(d::MTPDrafter, np::Int=2)
     retain = [logits.id, am.id, nk.id, nv.id, tok.id, hid.id, pos.id, pk.id, pv.id, xpre.id]
     @info "Compiling MTP draft step ($np pairs)..."
     exec = compile(g; device=s.device, retain=retain, free_intermediates=false,
-                   weight_dtype=_weight_dtype_for(s, reg), capture=s.device isa Luminal.AMDDevice)
+                   weight_dtype=_weight_dtype_for(s, reg), capture=s.device isa Luminal.AMDDevice && np <= 16)
     d.steps[np] = (exec=exec, tok=tok.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id, logits=logits.id, argmax=am.id, xpre=xpre.id)
     return d.steps[np]
 end
@@ -102,6 +102,20 @@ function _mtp_prime!(d::MTPDrafter, prompt::Vector{Int}, H)
     n = length(prompt)
     d.pos = 0
     n >= 2 || return
+    if n - 1 > prefill_chunk() && size(H, 2) == n && d.session.kv_dtype === Float16 && d.session.device isa Luminal.AMDDevice
+        # long prompt: the pairs go through the MTP layer in chunks of multi-token steps
+        C = prefill_chunk(); hbuf = Luminal.zero_tensor(d.session.device, Float32, size(H, 1), C, 1)
+        i = 0
+        while i < n - 1
+            m = min(C, n - 1 - i)
+            toks = zeros(Int, C); toks[1:m] .= prompt[i+2:i+m+1]
+            view(hbuf, :, 1:m, :) .= view(H, :, i+1:i+m, :)
+            _mtp_step!(d, toks, hbuf, m)
+            i += m
+            Luminal.reclaim!(d.session.device)
+        end
+        return
+    end
     slen = _prefill_bucket(n - 1)
     gr = _mtp_prefill_graph(d, slen)
     toks = zeros(Float32, slen, 1); toks[1:n-1, 1] .= prompt[2:n]

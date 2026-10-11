@@ -2,7 +2,7 @@
 #
 # Usage:
 #   julia -t auto,1 --project=. examples/qwen35_spec_bench.jl <base.gguf> <mtp.gguf> [--int4|--int8]
-#       [--new=128] [--reps=2] [--min-avail=20] [--swap-gb=3] [--layers=N] [--oracle=P] [--draft-vocab=N] [--ndraft=1|2] [--prompt="text"]
+#       [--new=128] [--reps=2] [--min-avail=20] [--swap-gb=3] [--layers=N] [--oracle=P] [--draft-vocab=N] [--ndraft=1|2] [--max-seq=1024] [--prompt="text"]
 # The base weights come from <base.gguf>, the MTP head (`blk.<n>.nextn.*`) from <mtp.gguf> (a GGUF that has it).
 # Prints tokens/s for both loops, the acceptance rate, and whether the two outputs are identical.
 using Luminal
@@ -44,7 +44,7 @@ function main()
     oracle = parse(Float64, flag("oracle", "-1"))
     ndraft = parse(Int, flag("ndraft", "1"))
     start_watchdog(parse(Int, flag("min-avail", "20")); swap_gb = parse(Int, flag("swap-gb", "3")))
-    prompt = flag("prompt", DEFAULT_PROMPT)
+    prompt = String(flag("prompt", DEFAULT_PROMPT))
     f = read_gguf(base); cfg = qwen35_config(f)
     nblocks = cfg.n_layers                       # (the MTP head is block number n_layers of the full model)
     nl = parse(Int, flag("layers", string(cfg.n_layers)))
@@ -57,7 +57,7 @@ function main()
         merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = nblocks))
     end
     status(@sprintf("load %.1f s", t_load))
-    s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = 1024, weights = W, decode_weights = T,
+    s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = parse(Int, flag("max-seq", "1024")), weights = W, decode_weights = T,
                      kv_dtype = Float16)
     d = MTPDrafter(s; draft_vocab = parse(Int, flag("draft-vocab", "0")))
     prompt_ids = Int.(ids)

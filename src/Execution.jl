@@ -331,6 +331,8 @@ function execute_op!(out, op::DecodeAttention, q, pk, pv, kn, vn, posv)
         return out
     end
     op.window == 0 && decode_attention_split!(out, q, pk, pv, kn, vn, posv, op.scale, op.write_cache) && return out
+    op.window == 0 && op.write_cache && out isa ROCArray && S * (H ÷ KVH) > DA_MAX_ROWS &&
+        chunk_attention!(out, q, pk, pv, kn, vn, posv, op.scale) && return out
     size(pk, 2) <= DECODE_ATTN_MAX_CTX || error("DecodeAttention: cache longer than $(DECODE_ATTN_MAX_CTX)")
     (D <= 256 && 256 % D == 0) || error("DecodeAttention: head_dim must divide 256")
     o4 = Base.reshape(out, D, H, S, B)

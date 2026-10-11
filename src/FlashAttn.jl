@@ -27,7 +27,7 @@ end
     return x
 end
 
-function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, ::Val{NT}) where {NT}
+function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
     D = 32 * NT
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; hh = l ÷ 16; w = tid ÷ 32; rg = w ÷ 2; dh = w % 2
@@ -39,14 +39,15 @@ function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, ::Val{NT}) whe
     m = ntuple(_ -> -1f30, Val(8))
     lsum = ntuple(_ -> 0f0, Val(8))
     acc = ntuple(_ -> _wmma_zero(), Val(NT))
-    ktmax = (min(S, qblk * 32 + 32) - 1) ÷ 64
+    NK = qoff + S                      # keys: the qoff cached ones, then the S queries' own
+    ktmax = (qoff + min(S, qblk * 32 + 32) - 1) ÷ 64
     for kt in 0:ktmax
         # scores of the wave's 16 rows against 64 keys: 4 tiles
         s0 = _wmma_zero(); s1 = _wmma_zero(); s2 = _wmma_zero(); s3 = _wmma_zero()
         for ks in 0:2NT-1
             qa = _wmma_cat(Qv[2ks + 1, qrow + 1, head + 1, b + 1], Qv[2ks + 2, qrow + 1, head + 1, b + 1])
-            k0 = min(kt * 64 + r, S - 1) + 1;      k1 = min(kt * 64 + 16 + r, S - 1) + 1
-            k2 = min(kt * 64 + 32 + r, S - 1) + 1; k3 = min(kt * 64 + 48 + r, S - 1) + 1
+            k0 = min(kt * 64 + r, NK - 1) + 1;      k1 = min(kt * 64 + 16 + r, NK - 1) + 1
+            k2 = min(kt * 64 + 32 + r, NK - 1) + 1; k3 = min(kt * 64 + 48 + r, NK - 1) + 1
             s0 = _wmma16(qa, _wmma_cat(Kv[2ks + 1, k0, kvh + 1, b + 1], Kv[2ks + 2, k0, kvh + 1, b + 1]), s0)
             s1 = _wmma16(qa, _wmma_cat(Kv[2ks + 1, k1, kvh + 1, b + 1], Kv[2ks + 2, k1, kvh + 1, b + 1]), s1)
             s2 = _wmma16(qa, _wmma_cat(Kv[2ks + 1, k2, kvh + 1, b + 1], Kv[2ks + 2, k2, kvh + 1, b + 1]), s2)
@@ -57,7 +58,7 @@ function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, ::Val{NT}) whe
         mn = m
         for i in 0:7
             row = q0 + 2i + hh
-            sv(t, x) = (kk = kt * 64 + 16t + r; (kk <= row && kk < S) ? x * scale2 : -1f30)
+            sv(t, x) = (kk = kt * 64 + 16t + r; (kk <= qoff + row && kk < NK) ? x * scale2 : -1f30)
             e0 = sv(0, s0[i + 1].value); e1 = sv(1, s1[i + 1].value)
             e2 = sv(2, s2[i + 1].value); e3 = sv(3, s3[i + 1].value)
             tm = _fa_max16(max(max(e0, e1), max(e2, e3)))
@@ -115,7 +116,7 @@ function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
     view(vt, 1:S, :, :, :) .= PermutedDimsArray(v, (2, 1, 3, 4))
     Qv = reinterpret(WMMA_V8H, q16); Kv = reinterpret(WMMA_V8H, k16); Vv = reinterpret(WMMA_V8H, vt)
     @roc groupsize=128 gridsize=(cld(S, 32), H * B) _flash_prefill_kernel!(
-        out, Qv, Kv, Vv, S, H, KVH, scale * 1.4426950408889634f0, Val(D ÷ 32))
+        out, Qv, Kv, Vv, S, H, KVH, scale * 1.4426950408889634f0, 0, Val(D ÷ 32))
     AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(k16); AMDGPU.unsafe_free!(vt)
     return out
 end
@@ -136,4 +137,32 @@ function causal_attention_ref(q, k, v, scale::Float32)
         out[:, :, h, b] = v[:, :, kv, b] * p'
     end
     return out
+end
+
+
+# Attention of a chunk of S new tokens (a prefill chunk) over the cache: the chunk's K/V are written to
+# slots pos + 1.. of the Float16 cache pk/pv (D, T, KVH, B) first, then query i attends to slots 1..pos + i.
+# q (D, S, H, B) Float32; writes out (D, H, S, B). Sequence b's pos is read from posv on the host (a chunk is
+# a big step, and this is not captured in a graph).
+function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
+    D, S, H, B = size(q); KVH = size(pk, 3)
+    (D % 32 == 0 && H % KVH == 0 && B == 1 && pk isa ROCArray{Float16,4} && pv isa ROCArray{Float16,4}) || return false
+    @roc groupsize=256 gridsize=cld(D * S * KVH * B, 256) _da_write_kernel!(pk, pv, kn, vn, posv, S)
+    o4 = Base.reshape(out, D, H, S, B)
+    posh = Int.(round.(Array(posv)))
+    for b in 1:B
+        pos = posh[length(posh) == 1 ? 1 : b]
+        NK = pos + S
+        q16 = AMDGPU.zeros(Float16, D, S, H, 1); q16 .= q
+        Spad = cld(NK, 64) * 64
+        vt = AMDGPU.zeros(Float16, Spad, D, KVH, 1)
+        view(vt, 1:NK, :, :, :) .= PermutedDimsArray(view(pv, :, 1:NK, :, :), (2, 1, 3, 4))
+        Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, pk); Vv = reinterpret(WMMA_V8H, vt)
+        ob = AMDGPU.zeros(Float32, D, S, H, 1)
+        @roc groupsize=128 gridsize=(cld(S, 32), H) _flash_prefill_kernel!(
+            ob, Qv, Kb, Vv, S, H, KVH, scale * 1.4426950408889634f0, pos, Val(D ÷ 32))
+        o4 .= PermutedDimsArray(ob, (1, 3, 2, 4))
+        AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(vt); AMDGPU.unsafe_free!(ob)
+    end
+    return true
 end
