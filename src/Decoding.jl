@@ -202,7 +202,7 @@ function _verify_graph(s::LlamaSession, B::Int, seq::Int)
         g = Base.invokelatest(Graph); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
         idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype,
-                                       seq=seq, snapshots=true, want_hidden=true, want_argmax=true)
+                                       seq=seq, snapshots=seq - 1, want_hidden=true, want_argmax=true)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(idg.logits_id, idg.hidden_id, idg.argmax_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
                       idg.lens_input_id == 0 ? Int[] : [idg.lens_input_id],
@@ -215,8 +215,10 @@ function _verify_graph(s::LlamaSession, B::Int, seq::Int)
         end
         @info "Compiling verify graph (batch $B, $seq tokens)..."
         exec = compile(g; device=s.device, retain=retain, free_intermediates=false, weight_dtype=wd, capture=capture)
-        snaps = [(Luminal.zero_tensor(s.device, Float32, size(dc.cache.self_cache[i][1])...),
-                  Luminal.zero_tensor(s.device, Float32, size(dc.cache.self_cache[i][2])...))
+        # (the state after each of the first seq - 1 tokens: seq - 1 times the batch dim)
+        sn(a) = (d = collect(size(a)); d[end] *= seq - 1; d)
+        snaps = [(Luminal.zero_tensor(s.device, Float32, sn(dc.cache.self_cache[i][1])...),
+                  Luminal.zero_tensor(s.device, Float32, sn(dc.cache.self_cache[i][2])...))
                  for (i, l) in enumerate(s.model.layers) if NN._is_state_layer(l)]
         (exec=exec, idg=idg, snaps=snaps, cache=dc.cache)
     end
@@ -246,13 +248,16 @@ function _verify_step!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
 end
 
 # Roll the recurrent states back to their snapshots (the state after the first verified token).
-function _rollback_states!(s::LlamaSession, vg)
+function _rollback_states!(s::LlamaSession, vg; slot::Int=1)
     j = 0
     for (i, l) in enumerate(s.model.layers)
         NN._is_state_layer(l) || continue
         j += 1
-        copyto!(vg.cache.self_cache[i][1], vg.snaps[j][1])
-        copyto!(vg.cache.self_cache[i][2], vg.snaps[j][2])
+        for q in 1:2
+            dst = vg.cache.self_cache[i][q]; B = size(dst, ndims(dst))
+            src = selectdim(vg.snaps[j][q], ndims(dst), (slot - 1) * B + 1:slot * B)
+            copyto!(dst, src)
+        end
     end
 end
 

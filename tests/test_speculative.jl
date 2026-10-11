@@ -66,6 +66,21 @@ end
     @test generate_ids_speculative(s, d, prompt2; max_new_tokens=10) == plain2
     @test generate_ids_speculative(s, d, prompt2; max_new_tokens=10, draft_hook=(n, dr) -> n + 1 <= length(plain2) ? plain2[n + 1] : dr) == plain2
 
+    # 6. two drafts per cycle (a 3-token verify step with two state snapshots): same output for any drafts
+    d3 = MTPDrafter(s)
+    st = Dict{Symbol,Int}()
+    @test generate_ids_speculative(s, d3, prompt; max_new_tokens=14, stats=st, ndraft=2) == plain
+    @test st[:emitted] == 14
+    st = Dict{Symbol,Int}()
+    @test generate_ids_speculative(s, d3, prompt; max_new_tokens=14, stats=st, ndraft=2, draft_hook=oracle) == plain
+    @test st[:accepted2] >= st[:cycles] - 1 && st[:cycles] >= 4   # all 3 tokens per cycle (bar the last, past the end of `plain`)
+    flip2 = Ref(0)
+    mixed2(n, draft) = (flip2[] += 1; flip2[] % 3 != 0 && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, model.config.vocab_size))
+    st = Dict{Symbol,Int}()
+    @test generate_ids_speculative(s, d3, prompt; max_new_tokens=14, stats=st, ndraft=2, draft_hook=mixed2) == plain
+    @test 0 < st[:accepted] && st[:accepted2] < st[:cycles]          # all three outcomes: reject, 2 tokens, 3 tokens
+    @test generate_ids_speculative(s, d3, prompt2; max_new_tokens=10, ndraft=2) == plain2
+
     # 5. a restricted draft vocabulary only changes which tokens get drafted, never the output
     d2 = MTPDrafter(s; draft_vocab=model.config.vocab_size ÷ 2)
     st = Dict{Symbol,Int}()

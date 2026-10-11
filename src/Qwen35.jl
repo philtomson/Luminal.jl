@@ -221,10 +221,10 @@ _state_shapes(l::Qwen35Block, max_seq, batch) =
     ([l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch], [l.mixer.head_dim, max_seq, l.mixer.n_kv_heads, batch])
 _is_state_layer(l::Qwen35Block) = l.kind === :linear
 
-function _decode_block(l::Qwen35Block, x, step_pos, pos_tensor, s1, s2, rope_base; lens=nothing, snaps=nothing)
+function _decode_block(l::Qwen35Block, x, step_pos, pos_tensor, s1, s2, rope_base; lens=nothing, snaps=nothing, nsnap=1)
     h = l.input_norm(x)
     if l.kind === :linear
-        a = l.mixer(h, s1, s2, lens; fresh=false, snaps=snaps, snap_t=1)
+        a = l.mixer(h, s1, s2, lens; fresh=false, snaps=snaps, snap_t=nsnap)
         nk, nv = s1, s2
     else
         a, nk, nv = llama_self_attn_cached(l.mixer, h, step_pos, pos_tensor, s1, s2; rope_base=rope_base)
@@ -484,9 +484,16 @@ end
 # One draft step: token (1, B), hidden (Hidden, 1, B), the MTP layer's cache tensors. Returns
 # (logits (Vocab, 1, B), new K, new V); the attention op writes K/V into the cache at `pos`.
 function mtp_decode_step(m::Qwen35MTP, tokens, hidden, step_pos, pos_tensor, pk, pv)
+    logits, nk, nv, _ = mtp_decode_step_hidden(m, tokens, hidden, step_pos, pos_tensor, pk, pv)
+    return logits, nk, nv
+end
+
+# The same, also returning the layer's output before the head norm (Hidden, S, B): the "previous hidden state"
+# a chained second draft feeds back in.
+function mtp_decode_step_hidden(m::Qwen35MTP, tokens, hidden, step_pos, pos_tensor, pk, pv)
     x = _mtp_input(m, tokens, hidden)
     x, nk, nv = _decode_block(m.block, x, step_pos, pos_tensor, pk, pv, m.rope_base)
-    return m.head(m.head_norm(x)), nk, nv
+    return m.head(m.head_norm(x)), nk, nv, x
 end
 
 """

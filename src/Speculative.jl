@@ -22,7 +22,7 @@ mutable struct MTPDrafter
     k::Any                    # (head_dim, max_seq, kv_heads, 1) MTP K cache
     v::Any
     pos::Int                  # next MTP position
-    step::Any                 # compiled single draft step, built on first use
+    steps::Dict{Int,Any}      # pairs per step => compiled draft step, built on first use
     prefill::Dict{Int,Any}    # padded length => compiled prefill
     draft_vocab::Int          # 0 = full vocabulary, else the head scores only token ids 0..draft_vocab-1
 end
@@ -32,7 +32,7 @@ function MTPDrafter(s::LlamaSession; draft_vocab::Int=0)
     c = s.model.config
     shape = (c.head_dim, s.max_seq, c.n_kv_heads, 1)
     MTPDrafter(s, Luminal.zero_tensor(s.device, s.kv_dtype, shape...), Luminal.zero_tensor(s.device, s.kv_dtype, shape...),
-               0, nothing, Dict{Int,Any}(), draft_vocab)
+               0, Dict{Int,Any}(), Dict{Int,Any}(), draft_vocab)
 end
 
 function _weight_dtype_for(s::LlamaSession, reg)
@@ -58,28 +58,28 @@ end
 # The draft step takes TWO (token, hidden) pairs at consecutive positions and returns both greedy tokens
 # (device-side argmax): after an accepted draft both pairs are real; otherwise the second is a dummy whose
 # K/V slot the next step overwrites (attention is causal, so it cannot affect the first).
-function _mtp_step_graph(d::MTPDrafter)
-    d.step === nothing || return d.step
+function _mtp_step_graph(d::MTPDrafter, np::Int=2)
+    haskey(d.steps, np) && return d.steps[np]
     s = d.session; c = s.model.config
     g = Base.invokelatest(Graph); reg = WeightRegistry()
     m = Qwen35MTP(g, reg; c..., draft_vocab=d.draft_vocab)
-    tok = Luminal.tensor(g, [2, 1]); hid = Luminal.tensor(g, [c.hidden, 2, 1]); pos = Luminal.tensor(g, [1])
+    tok = Luminal.tensor(g, [np, 1]); hid = Luminal.tensor(g, [c.hidden, np, 1]); pos = Luminal.tensor(g, [1])
     pk = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=s.kv_dtype)
     pv = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=s.kv_dtype)
-    logits, nk, nv = mtp_decode_step(m, tok, hid, 0, pos, pk, pv)
-    am = Luminal.add_op!(g, Luminal.ArgMax(), [(logits.id, 0, logits.shape)], Luminal.ShapeTracker([2, 1]))
+    logits, nk, nv, xpre = mtp_decode_step_hidden(m, tok, hid, 0, pos, pk, pv)
+    am = Luminal.add_op!(g, Luminal.ArgMax(), [(logits.id, 0, logits.shape)], Luminal.ShapeTracker([np, 1]))
     W = s.weights
     if d.draft_vocab > 0
         W = copy(W)
         W["mtp.draft_head.weight"] = _first_rows(W["lm_head.weight"], d.draft_vocab)
     end
     load_weights!(g, reg, W; device=s.device)
-    retain = [logits.id, am.id, nk.id, nv.id, tok.id, hid.id, pos.id, pk.id, pv.id]
-    @info "Compiling MTP draft step..."
+    retain = [logits.id, am.id, nk.id, nv.id, tok.id, hid.id, pos.id, pk.id, pv.id, xpre.id]
+    @info "Compiling MTP draft step ($np pairs)..."
     exec = compile(g; device=s.device, retain=retain, free_intermediates=false,
                    weight_dtype=_weight_dtype_for(s, reg), capture=s.device isa Luminal.AMDDevice)
-    d.step = (exec=exec, tok=tok.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id, logits=logits.id, argmax=am.id)
-    return d.step
+    d.steps[np] = (exec=exec, tok=tok.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id, logits=logits.id, argmax=am.id, xpre=xpre.id)
+    return d.steps[np]
 end
 
 function _mtp_prefill_graph(d::MTPDrafter, slen::Int)
@@ -114,12 +114,14 @@ end
 # One draft step for the pairs (tokens[1], hidden[:, 1]) at the MTP cache's next position and
 # (tokens[2], hidden[:, 2]) at the one after; `advance` = how many of them are real (the cache position
 # moves by that). Returns the two greedy tokens (0-based, host).
-function _mtp_step!(d::MTPDrafter, tokens::Vector{Int}, hidden, advance::Int)
-    gr = _mtp_step_graph(d)
-    res = gr.exec(Dict{Int,Any}(gr.tok => Float32.(Base.reshape(tokens, 2, 1)), gr.hid => hidden, gr.pos => Float32[d.pos],
+function _mtp_step!(d::MTPDrafter, tokens::Vector{Int}, hidden, advance::Int; with_hidden::Bool=false)
+    np = length(tokens)
+    gr = _mtp_step_graph(d, np)
+    res = gr.exec(Dict{Int,Any}(gr.tok => Float32.(Base.reshape(tokens, np, 1)), gr.hid => hidden, gr.pos => Float32[d.pos],
                                 gr.pk => d.k, gr.pv => d.v); device=d.session.device)
     d.pos += advance
-    return Int.(vec(Array(res[gr.argmax])))
+    am = Int.(vec(Array(res[gr.argmax])))
+    return with_hidden ? (am, res[gr.xpre]) : am
 end
 
 """
@@ -132,7 +134,8 @@ Greedy generation for one prompt with MTP speculative decoding (0-indexed token 
 and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
-                                  stats=nothing, draft_hook=nothing)
+                                  stats=nothing, draft_hook=nothing, ndraft::Int=1)
+    ndraft in (1, 2) || error("ndraft must be 1 or 2")
     d.session === s || error("the drafter belongs to another session")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt])
     pf.hidden_id == 0 && error("this model's prefill does not return its hidden states")
@@ -144,8 +147,9 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     (y in eos_ids || max_new_tokens <= 1) && return out
     H = res[pf.hidden_id]                                         # (Hidden, slen, 1)
     _mtp_prime!(d, prompt, H)
-    hook(draft) = draft_hook === nothing ? draft : draft_hook(length(out), draft)
+    hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
+    ndraft == 2 && return _spec_loop2!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats)
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -189,6 +193,58 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     return out
 end
 
+
+# Two drafts per cycle: the base model verifies [y, d1, d2] in one 3-token step (3 columns cost about what 2 do, see
+# `_q4d_kernel!`) and the MTP head drafts d1 from the last accepted token and d2 from d1 and its own output state.
+#   a = argmax after y, b = after d1, c = after d2:  a != d1: emit a;  b != d2: emit a, b;  else emit a, b, c.
+# The recurrent states roll back to the snapshot after y (slot 1) or after d1 (slot 2), or stay.
+# The MTP pairs are (emitted[i], hidden of the position before it), padded with dummies to 3.
+function _spec_loop2!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats)
+    draft_pair!(toks, hid, nreal) = begin
+        am, xp = _mtp_step!(d, toks, hid, nreal; with_hidden=true)
+        d1 = hook(am[nreal], 0)
+        d2 = hook(_mtp_step!(d, [d1], xp[:, nreal:nreal, :], 0)[1], 1)
+        (d1, d2)
+    end
+    d1, d2 = draft_pair!([y, y, y], cat(h1, h1, h1; dims=2), 1)
+    vg = _verify_graph(s, 1, 3)
+    cycles = acc1 = acc2 = 0
+    tm = zeros(3)
+    while length(out) < max_new_tokens
+        cache.positions[1] + 3 <= s.max_seq || break
+        t0 = time_ns()
+        _, hid, am = _verify_step!(s, vg, [y; d1; d2;;])
+        t1 = time_ns(); tm[1] += (t1 - t0) / 1e9
+        cycles += 1
+        a, b, c = am[1], am[2], am[3]
+        if a != d1
+            emitted = [a]
+        elseif b != d2
+            acc1 += 1; emitted = [a, b]
+        else
+            acc1 += 1; acc2 += 1; emitted = [a, b, c]
+        end
+        nreal = length(emitted)
+        append!(out, emitted)
+        cache.positions[1] += nreal
+        nreal < 3 && _rollback_states!(s, vg; slot=nreal)
+        y = emitted[end]
+        any(e -> e in eos_ids, emitted) && break
+        t2 = time_ns(); tm[3] += (t2 - t1) / 1e9
+        d1, d2 = draft_pair!([emitted; fill(y, 3 - nreal)], hid, nreal)
+        tm[2] += (time_ns() - t2) / 1e9
+    end
+    k = findfirst(t -> t in eos_ids, out)
+    k === nothing || (out = out[1:k])
+    length(out) > max_new_tokens && (out = out[1:max_new_tokens])
+    if stats !== nothing
+        stats[:cycles] = cycles; stats[:accepted] = acc1; stats[:accepted2] = acc2; stats[:emitted] = length(out)
+        for (k, name) in enumerate((:ms_verify, :ms_mtp, :ms_rollback))
+            stats[name] = round(Int, 1000 * tm[k])
+        end
+    end
+    return out
+end
 
 """
     generate_speculative(session, drafter, prompt::String; max_new_tokens=200) -> String

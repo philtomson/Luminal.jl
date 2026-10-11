@@ -279,9 +279,10 @@ end
 #   head, lens; value head h reads key head (h - 1) ÷ (nv ÷ nk) + 1. Per token:
 #   S <- S exp(g); S <- S + k ((v - S^T k) beta)^T; out = S^T (q * scale).
 #   Output (dv, nv, S, B); the state is left at the final S^T.
-# With `snap_t` > 0 the op takes one more input, a buffer shaped like the state, and writes into it the
-# state after the first `snap_t` tokens (or after all of them if fewer are consumed): a speculative
-# decoding step that feeds several tokens keeps the state a rejected draft must roll back to.
+# With `snap_t` = n > 0 the op takes one more input, a buffer shaped like the state but with n times the batch
+# dim, and writes into batch slot (t - 1) * B + b the state after the first t tokens, t = 1..n (the final state
+# for those t the sequence is too short for): a speculative decoding step that feeds several tokens keeps the
+# states a rejected draft must roll back to.
 struct CausalConv <: Op
     fresh::Bool
     snap_t::Int

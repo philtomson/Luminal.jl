@@ -35,18 +35,18 @@ dv_(dev, x) = Luminal.to_device(x, dev)
 end
 
 @testset "state snapshots ($(nameof(typeof(dev))))" for dev in devs
-    # CausalConv: snapshot after token 1 == the state of a run that consumes only 1 token
+    # snap_t = n: slot t (batch slot (t - 1) * B + b) holds the state after min(t, len_b) tokens of sequence b
     C, S, B, K = 24, 3, 2, 4
     x = randn(Float32, C, S, B); w = randn(Float32, C, 1, K); st0 = randn(Float32, C, K, B)
-    for snap_t in (1, 2)
+    for n in (1, 2, 3)
         lens = dv_(dev, Float32.([3, 1]))
-        st = dv_(dev, copy(st0)); snap = dv_(dev, zeros(Float32, C, K, B)); out = Luminal.zero_tensor(dev, Float32, C, S, B)
-        Luminal.execute_op!(out, Luminal.CausalConv(false, snap_t), dv_(dev, x), st, dv_(dev, w), lens, snap)
-        for b in 1:B
+        st = dv_(dev, copy(st0)); snap = dv_(dev, zeros(Float32, C, K, n * B)); out = Luminal.zero_tensor(dev, Float32, C, S, B)
+        Luminal.execute_op!(out, Luminal.CausalConv(false, n), dv_(dev, x), st, dv_(dev, w), lens, snap)
+        for t in 1:n, b in 1:B
             ref = dv_(dev, copy(st0)); o = Luminal.zero_tensor(dev, Float32, C, S, B)
             Luminal.execute_op!(o, Luminal.CausalConv(false), dv_(dev, x), ref, dv_(dev, w),
-                                dv_(dev, Float32.([min(snap_t, [3, 1][b]), min(snap_t, [3, 1][b])])))
-            @test rel(Array(snap)[:, :, b], Array(ref)[:, :, b]) < 1e-6
+                                dv_(dev, Float32.([min(t, [3, 1][1]), min(t, [3, 1][2])])))
+            @test rel(Array(snap)[:, :, (t - 1) * B + b], Array(ref)[:, :, b]) < 1e-6
         end
         # and the state itself is the same as without a snapshot
         st2 = dv_(dev, copy(st0)); o2 = Luminal.zero_tensor(dev, Float32, C, S, B)
@@ -58,16 +58,16 @@ end
     q = nrm(randn(Float32, dk, nk, S, B)); k = nrm(randn(Float32, dk, nk, S, B))
     v = randn(Float32, dv, nv, S, B); g = -abs.(randn(Float32, nv, S, B)) .* 0.1f0
     beta = rand(Float32, nv, S, B); st0 = randn(Float32, dv, dk, nv, B) .* 0.1f0
-    for snap_t in (1, 2), lenv in ([3, 3], [3, 1])
+    for n in (1, 2, 3), lenv in ([3, 3], [3, 1])
         lens = dv_(dev, Float32.(lenv))
-        st = dv_(dev, copy(st0)); snap = dv_(dev, zeros(Float32, dv, dk, nv, B)); out = Luminal.zero_tensor(dev, Float32, dv, nv, S, B)
-        Luminal.execute_op!(out, Luminal.DeltaRule(Float32(1 / sqrt(dk)), false, snap_t), dv_(dev, q), dv_(dev, k), dv_(dev, v),
+        st = dv_(dev, copy(st0)); snap = dv_(dev, zeros(Float32, dv, dk, nv, n * B)); out = Luminal.zero_tensor(dev, Float32, dv, nv, S, B)
+        Luminal.execute_op!(out, Luminal.DeltaRule(Float32(1 / sqrt(dk)), false, n), dv_(dev, q), dv_(dev, k), dv_(dev, v),
                             dv_(dev, g), dv_(dev, beta), st, lens, snap)
-        for b in 1:B
+        for t in 1:n, b in 1:B
             ref = dv_(dev, copy(st0)); o = Luminal.zero_tensor(dev, Float32, dv, nv, S, B)
             Luminal.execute_op!(o, Luminal.DeltaRule(Float32(1 / sqrt(dk)), false), dv_(dev, q), dv_(dev, k), dv_(dev, v),
-                                dv_(dev, g), dv_(dev, beta), ref, dv_(dev, Float32.([min(snap_t, lenv[1]), min(snap_t, lenv[2])])))
-            @test rel(Array(snap)[:, :, :, b], Array(ref)[:, :, :, b]) < 1e-5
+                                dv_(dev, g), dv_(dev, beta), ref, dv_(dev, Float32.([min(t, lenv[1]), min(t, lenv[2])])))
+            @test rel(Array(snap)[:, :, :, (t - 1) * B + b], Array(ref)[:, :, :, b]) < 1e-5
         end
     end
 end

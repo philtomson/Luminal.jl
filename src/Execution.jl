@@ -358,15 +358,15 @@ _silu(x) = x / (1 + exp(-x))
             @inbounds acc += Float32(w[c, 1, j]) * win[j]
         end
         @inbounds out[c, t, b] = _silu(acc)
-        if t == snap_t
+        if t <= snap_t          # snapshot slot t (slot t of the batch dim) = the state after t tokens
             for j in 1:K
-                @inbounds snap[c, j, b] = win[j]
+                @inbounds snap[c, j, b + (t - 1) * size(x, 3)] = win[j]
             end
         end
     end
-    if 0 < snap_t && L < snap_t
+    for tt in L+1:snap_t        # fewer tokens consumed than snapshots: those slots hold the final state
         for j in 1:K
-            @inbounds snap[c, j, b] = win[j]
+            @inbounds snap[c, j, b + (tt - 1) * size(x, 3)] = win[j]
         end
     end
     for t in L+1:S
@@ -539,9 +539,11 @@ function execute_op!(out, op::CausalConv, x, state, w, lens, snap = state)
             for t in 1:L
                 win = vcat(win[2:end], Float32(x[c, t, b]))
                 out[c, t, b] = _silu(sum(Float32(w[c, 1, j]) * win[j] for j in 1:K))
-                t == op.snap_t && (snap[c, :, b] .= win)
+                t <= op.snap_t && (snap[c, :, b + (t - 1) * B] .= win)
             end
-            0 < op.snap_t && L < op.snap_t && (snap[c, :, b] .= win)
+            for tt in L+1:op.snap_t
+                snap[c, :, b + (tt - 1) * B] .= win
+            end
             state[c, :, b] .= win
         end
         return out
@@ -596,18 +598,18 @@ const DELTA_MAX_DK = 256
                 @inbounds o += s_ * qs[i]
             end
             @inbounds out[j, h, t, b] = o
-            if t == snap_t
+            if t <= snap_t
                 for i in 1:dk
-                    @inbounds snap[j, i, h, b] = st[j, i, h, b]
+                    @inbounds snap[j, i, h, b + (t - 1) * size(v, 4)] = st[j, i, h, b]
                 end
             end
         end
         @synchronize
     end
     if j <= dv
-        if 0 < snap_t && L < snap_t
+        for tt in L+1:snap_t
             for i in 1:dk
-                @inbounds snap[j, i, h, b] = st[j, i, h, b]
+                @inbounds snap[j, i, h, b + (tt - 1) * size(v, 4)] = st[j, i, h, b]
             end
         end
         for t in L+1:S
@@ -681,9 +683,9 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
                 op = _seq_dot(s, qs, off)
                 o = op + AMDGPU.Device.shfl_xor(op, Cint(1))                                 # S^T q
                 hf == 0 && (@inbounds out[j, h, t, b] = o)
-                if t == snap_t
+                if t <= snap_t
                     for i in 1:HD
-                        @inbounds snap[j, hf * HD + i, h, b] = s[i]
+                        @inbounds snap[j, hf * HD + i, h, b + (t - 1) * size(v, 4)] = s[i]
                     end
                 end
             end
@@ -695,9 +697,9 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
         for i in 1:HD
             @inbounds st[j, hf * HD + i, h, b] = s[i]
         end
-        if 0 < snap_t && L < snap_t
+        for tt in L+1:snap_t
             for i in 1:HD
-                @inbounds snap[j, hf * HD + i, h, b] = s[i]
+                @inbounds snap[j, hf * HD + i, h, b + (tt - 1) * size(v, 4)] = s[i]
             end
         end
         if hf == 0
@@ -725,9 +727,11 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens, snap = st)
                 delta = (Float32.(v[:, h, t, b]) .- M * kt) .* Float32(beta[h, t, b])
                 M .+= delta * kt'
                 out[:, h, t, b] .= M * qt
-                t == op.snap_t && (snap[:, :, h, b] .= M)
+                t <= op.snap_t && (snap[:, :, h, b + (t - 1) * B] .= M)
             end
-            0 < op.snap_t && L < op.snap_t && (snap[:, :, h, b] .= M)
+            for tt in L+1:op.snap_t
+                snap[:, :, h, b + (tt - 1) * B] .= M
+            end
             st[:, :, h, b] .= M
         end
         return out

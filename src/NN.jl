@@ -900,7 +900,7 @@ function build_llama_decode_step!(model,
                                    rope_base::Float32=500000f0,
                                    kv_dtype::Type=Float32,
                                    seq::Int=1,
-                                   snapshots::Bool=false,
+                                   snapshots::Union{Bool,Int}=false,
                                    want_hidden::Bool=false,
                                    want_argmax::Bool=false)
     # ── Inputs ────────────────────────────────────────────────────────────────
@@ -924,15 +924,18 @@ function build_llama_decode_step!(model,
     new_v_tensors = Luminal.GraphTensor[]
     # speculative steps (seq > 1): each recurrent layer also records its state after the first token
     snap_tensors = Tuple{Luminal.GraphTensor,Luminal.GraphTensor}[]
+    nsnap = snapshots === true ? 1 : Int(snapshots)
 
     for (i, layer) in enumerate(model.layers)
         snaps = nothing
-        if snapshots && _is_state_layer(layer)
-            snaps = (Luminal.tensor(graph, shapes[i][1]; dtype=Float32), Luminal.tensor(graph, shapes[i][2]; dtype=Float32))
+        if nsnap > 0 && _is_state_layer(layer)
+            # n snapshots (the state after each of the first n tokens): n times the batch dim
+            scale_b(sh) = [sh[1:end-1]..., sh[end] * nsnap]
+            snaps = (Luminal.tensor(graph, scale_b(shapes[i][1]); dtype=Float32), Luminal.tensor(graph, scale_b(shapes[i][2]); dtype=Float32))
             push!(snap_tensors, snaps)
         end
         x, nk, nv = _decode_block(layer, x, step_pos, pos_tensor, self_k_tensors[i], self_v_tensors[i], rope_base;
-                                  lens=lens, snaps=snaps)
+                                  lens=lens, snaps=snaps, nsnap=nsnap)
         push!(new_k_tensors, nk)
         push!(new_v_tensors, nv)
     end
@@ -971,7 +974,7 @@ _prefill_hidden(model) = false
 _is_state_layer(layer) = false
 _state_shapes(layer, max_seq, batch) =
     (a = layer.attention; ([a.head_dim, max_seq, a.n_kv_heads, batch], [a.head_dim, max_seq, a.n_kv_heads, batch]))
-function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing, snaps=nothing)
+function _decode_block(layer::TransformerBlock, x, step_pos, pos_tensor, pk, pv, rope_base; lens=nothing, snaps=nothing, nsnap=1)
     attn_out, nk, nv = llama_self_attn_cached(layer.attention, layer.attention_norm(x), step_pos, pos_tensor,
                                               pk, pv; rope_base=rope_base)
     x = x + attn_out
@@ -1034,7 +1037,7 @@ export Gemma3, Gemma3Block, gemma3_config, model_template
 
 include("Qwen35.jl")
 export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config, load_qwen35_gguf,
-       Qwen35MTP, load_qwen35_mtp, mtp_prefill, mtp_decode_step
+       Qwen35MTP, load_qwen35_mtp, mtp_prefill, mtp_decode_step, mtp_decode_step_hidden
 
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,

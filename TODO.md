@@ -641,3 +641,12 @@ in the weights' nibble pair order (`_q4d_xprep_kernel!`), each weight word dequa
 (old: 236 / 308), N=4 292 us; same for the 27B's other shapes. Symmetric weights only; N=1 keeps the Float32 kernel.
 Relative error ~2e-4 (Float16 activations). Verify step on the 27B: 2 tokens 88.3 -> 86.5 ms, 3 tokens 111.2 -> 87.1 ms,
 so drafting more than one token per cycle no longer costs a 3-column penalty. Speculative output still identical.
+
+### Two drafts per cycle (done): `generate_ids_speculative(...; ndraft=2)`, bench `--ndraft=2`
+Verify [y, d1, d2] in one 3-token step (3 columns cost about 2 now); DeltaRule/CausalConv `snap_t = n` keeps n snapshots
+(batch slot (t-1)*B+b holds the state after t tokens), rollback to slot 1 or 2, none after a full accept. The MTP head
+drafts d1 from the last accepted pair (3-pair step, dummies padded) and d2 with a 1-pair chain step fed d1 and its own
+pre-head-norm output state. 27B int4, 128 tokens: 23.6 tok/s decode vs 12.3 plain (18.8 with one draft), 2.19 tokens
+per verify step, first drafts 76% accepted, second drafts 57% of those; verify 5350 ms, MTP 295 ms (58 cycles);
+output identical to plain greedy. Not tried: the post-norm hidden for the chain, 3 drafts (4-column GEMV is 25% slower),
+sampling instead of greedy.
