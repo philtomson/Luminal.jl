@@ -650,3 +650,12 @@ pre-head-norm output state. 27B int4, 128 tokens: 23.6 tok/s decode vs 12.3 plai
 per verify step, first drafts 76% accepted, second drafts 57% of those; verify 5350 ms, MTP 295 ms (58 cycles);
 output identical to plain greedy. Not tried: the post-norm hidden for the chain, 3 drafts (4-column GEMV is 25% slower),
 sampling instead of greedy.
+
+### Long-context decode: split-K attention (done) -- `src/DecodeAttn.jl`, `examples/qwen35_context_bench.jl`
+The decode attention kernel was one workgroup per query head scanning the cache serially (and capped at 8192 slots):
+2.6 ms per layer at 8k keys, i.e. +42 ms per 27B step. `decode_attention_split!` cuts the cache into 256-key chunks, one
+workgroup per (chunk, KV head, sequence) sharing each K/V read between the group's heads and the S speculative tokens (WMMA
+for the scores, a coalesced scalar PV pass, an LDS softmax, then a merge kernel); Float16 cache, head dim 128/256, rows
+S*Gq <= 18. Per layer at 32k keys: 0.76 ms (1 token), 1.05 ms (3 tokens), ~170 and ~125 GB/s. No cache-length cap.
+27B int4 decode step by context (random K/V fill): plain 82.6 ms @1k, 83.7 @4k, 88.4 @16k, 93.6 @32k (12.1 -> 10.7 tok/s);
+3-token verify step 91.8 / 93.5 / 100.0 / 107.7 ms (speculative ~24 -> ~20 tok/s at 2.2 tokens per step).

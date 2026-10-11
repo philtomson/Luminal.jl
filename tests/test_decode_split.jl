@@ -1,0 +1,29 @@
+# The split-K decode attention (src/DecodeAttn.jl) against the one-workgroup-per-head kernel and the CPU
+# reference, on a Float16 cache: several KV groups, 1-3 new tokens, batches, positions around chunk edges.
+using Test
+using Luminal
+using AMDGPU
+
+if Luminal.get_device() isa CPUDevice
+    @info "no GPU: skipping the split-K decode attention test"
+else
+    rel(a, b) = maximum(abs.(Array(a) .- Array(b))) / max(maximum(abs.(Array(b))), 1f-9)
+    @testset "split-K decode attention" begin
+        for (D, H, KVH, S, B, T, positions) in ((256, 24, 4, 1, 1, 1024, [100]), (256, 24, 4, 3, 1, 1024, [700]),
+                                                (256, 24, 4, 2, 2, 1024, [253, 900]), (128, 16, 4, 3, 1, 2048, [1500]),
+                                                (256, 8, 2, 2, 1, 600, [0]), (256, 24, 4, 3, 1, 1024, [254]))
+            q = ROCArray(randn(Float32, D, S, H, B)); kn = ROCArray(randn(Float32, D, S, KVH, B)); vn = ROCArray(randn(Float32, D, S, KVH, B))
+            pk = ROCArray(Float16.(randn(Float32, D, T, KVH, B))); pv = ROCArray(Float16.(randn(Float32, D, T, KVH, B)))
+            pk2 = copy(pk); pv2 = copy(pv)
+            posv = ROCArray(Float32.(positions))
+            op = Luminal.DecodeAttention(Float32(1 / sqrt(D)), true, 0)
+            o1 = AMDGPU.zeros(Float32, D, H, S, B); o2 = AMDGPU.zeros(Float32, D, H, S, B)
+            withenv("LUMINAL_DECODE_SPLIT" => "0") do
+                Luminal.execute_op!(o1, op, q, pk, pv, kn, vn, posv)
+            end
+            Luminal.execute_op!(o2, op, q, pk2, pv2, kn, vn, posv)
+            @test rel(o2, o1) < 1e-2
+            @test Array(pk) == Array(pk2) && Array(pv) == Array(pv2)
+        end
+    end
+end

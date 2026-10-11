@@ -43,6 +43,7 @@ export get_device, to_device, from_device, AbstractDevice, CPUDevice, CUDADevice
 # Execution Engine
 include("WMMA.jl")
 include("FlashAttn.jl")
+include("DecodeAttn.jl")
 include("Execution.jl")
 export execute
 
