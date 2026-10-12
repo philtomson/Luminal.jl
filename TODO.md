@@ -774,3 +774,24 @@ prefill); now a tiled LDS transpose kernel (`_vtranspose_kernel!`, test in tests
 chunked logits still identical to one-shot. Remaining ideas: the flash prefill kernel itself is now the main long-context cost (26 ms per call
 at 32k, ~4x that at 128k; it reads K/V from L2 per 32-row query block), the delta-rule kernel (16-25%, serial recurrence), the 231 us
 3-D broadcast kernels late in the prefill (not yet identified), and keeping a persistent transposed V instead of re-transposing the prefix.
+
+### Flash prefill kernel: what was tried (no kernel change kept)
+Standalone microbenchmark (random Float16 cache, D=256, H=24, KVH=4, S=256, chunk attention at cache offset qoff; CPU-reference check;
+script not in the repo): baseline 0.98 ms @1k, 39.7-40 ms @32.5k (5.2 TFLOP/s), 178 ms @130.8k (4.6 TFLOP/s). At 130k a layer-call
+is ~90 ms on average over the prefill x 16 layers x ~500 chunks, i.e. attention is the majority of a 130K-token prefill (1160 s).
+Findings:
+- Ablations (each only timing-valid): no K/V streaming 43.9 ms, no WMMA 35.0, no shuffles 37.7, no exp 40.5, no LDS P store 44.0 (NaN),
+  no QK loop 22.2, no PV loop 19.0. Removing syncs makes it slower (65 ms). Nothing is one bottleneck.
+- Grid sweep: time is a step function of the workgroup count: H=16 (128 WGs) 22 ms, H=20 (160) 26 ms, H=24 (192) 42 ms, H=32 (256) 41 ms,
+  H=40 (320) 40 ms. The kernel uses 178-184 VGPRs (occupancy 8 waves/SIMD = 160 WGs resident); a round takes ~16 ms with 32 WGs and
+  ~26 ms with 160, so each wave is latency-bound, and the 192-WG grid is just over one round (tail). Qwen3.6-27B has exactly H=24.
+- The bounds-checked indexing puts a branch + s_waitcnt vmcnt(0) between every K fragment load and its WMMA; `@inbounds` gives the ideal
+  load/WMMA batching in the ISA but was SLOWER (48 ms), so it is not simply load latency.
+- Tried and not faster: QK split across the wave pair (each wave 2 of 4 key tiles, partial max/sum exchanged through LDS): 39 ms, correct;
+  plus 128-byte-per-lane K loads in blocks of 4 steps: 39 ms; explicit unroll of the 8 softmax rows: 61 ms; PV in two V-fragment groups:
+  type-unstable, spills. Both split variants hit 192 VGPRs with scratch spills.
+Untried, the most promising: (1) a structure with fewer VGPRs (< 128, 12 waves/SIMD) so the whole grid is resident at once; (2) software
+pipelining (issue QK of tile kt+1 before softmax+PV of tile kt; needs the split kernel's smaller score registers); (3) staging the K/V
+tile in LDS cooperatively (coalesced loads, shared by the 4 waves and, with GQA, by several heads) like the int4 GEMM does, which also
+removes the per-chunk V transpose; (4) ISA-level control of registers/occupancy (waves-per-EU), which AMDGPU.jl does not expose here.
+Realistic ceiling from occupancy/tail alone is ~25-30% of attention time; more needs the LDS-staged design.
