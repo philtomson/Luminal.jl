@@ -625,31 +625,60 @@ end
 # The same recurrence with the state held in registers for the whole sequence: the state (dv x dk
 # Float32, 64 KB per head at 128 x 128) is read once and written once, instead of read and written
 # in global memory at every token (~45 us per token step). Column j of S^T (one value dim) is shared
-# by two adjacent lanes, each holding half of the dk key rows (64 registers at dk = 128: one thread
-# holding all 128 plus its temporaries needed more than the 192 VGPRs a kernel may use by default
-# and spilled ~4 KB to scratch, which cost most of the gain). The two partial dot products S^T k and
-# S^T q are added across the lane pair with one shuffle each. q and k are staged in local memory
-# DELTA_REG_CHUNK steps at a time: one pair of barriers per chunk. The sums associate differently
-# from `_delta_rule_kernel!`, so results agree to rounding, not bitwise.
+# by a quad of 4 adjacent lanes, each holding every 4th of the dk key rows (32 registers at dk = 128;
+# with 2 lanes per column the 64-register state plus temporaries spilled to scratch). Keys are
+# interleaved across the quad (lane l holds keys l, l+4, ...), so the quad reads 4 consecutive words
+# of the staged k / q and the reads are free of LDS bank conflicts (with a contiguous split every lane
+# of the quad hit the same bank: 2.4x slower). The three per-step sums needed from the state
+# (S^T k, S^T q, and k.q, which does not depend on the state) are all taken on the state *before*
+# the step's decay and update, so a step is
+#     kv = dec * S^T k,   delta = (v - kv) * beta,   o = dec * S^T q + delta * (k.q),   S = dec * S + k delta^T
+# with one quad reduction (two DPP lane swaps, no LDS round trip) per sum. q and k (and v, decay,
+# beta, k.q) are staged in local memory DELTA_REG_CHUNK steps at a time: a few barriers per chunk.
+# The sums associate differently from `_delta_rule_kernel!`, so results agree to rounding, not bitwise.
 const DELTA_REG_MAX_DK = 128
 const DELTA_REG_CHUNK = 16
-# ((0 + a[1] x[off+1]) + a[2] x[off+2]) + ...: a left-to-right sum as straight-line code (Base's
-# foldl does not unroll a tuple this long).
-@generated function _seq_dot(a::NTuple{N,Float32}, x, off) where {N}
-    ex = :(0f0)
+const DELTA_REG_LANES = 4
+# Dot product of a register tuple with x[off], x[off + ST], ... as straight-line code, with 4 independent accumulators
+@generated function _dot_st(a::NTuple{N,Float32}, x, off, ::Val{ST}) where {N,ST}
+    accs = Any[:(0f0) for _ in 1:4]
     for i in 1:N
-        ex = :($ex + a[$i] * Base.@inbounds(x[off + $i]))
+        r = (i - 1) % 4 + 1
+        accs[r] = :(muladd(a[$i], Base.@inbounds(x[off + $((i - 1) * ST)]), $(accs[r])))
     end
-    return ex
+    return :(($(accs[1]) + $(accs[2])) + ($(accs[3]) + $(accs[4])))
+end
+# The same for two arrays in memory, x[off+1:off+N] . y[off+1:off+N]
+@generated function _dot_mem(x, y, off, ::Val{N}) where {N}
+    accs = Any[:(0f0) for _ in 1:4]
+    for i in 1:N
+        r = (i - 1) % 4 + 1
+        accs[r] = :(muladd(Base.@inbounds(x[off + $i]), Base.@inbounds(y[off + $i]), $(accs[r])))
+    end
+    return :(($(accs[1]) + $(accs[2])) + ($(accs[3]) + $(accs[4])))
+end
+# Swap with the neighbouring lane(s) inside a quad of 4 lanes (DPP quad_perm; control = perm[0] | perm[1] << 2 | ...)
+@inline function _dpp_quad(x::Float32, ::Val{CTRL}) where {CTRL}
+    xi = reinterpret(Int32, x)
+    r = ccall("llvm.amdgcn.update.dpp.i32", llvmcall, Int32, (Int32, Int32, Int32, Int32, Int32, Bool),
+              xi, xi, Int32(CTRL), Int32(0xF), Int32(0xF), false)
+    return reinterpret(Float32, r)
+end
+@inline function _quad_sum(x::Float32)
+    x += _dpp_quad(x, Val(0xB1))            # lanes (1, 0, 3, 2)
+    x += _dpp_quad(x, Val(0x4E))            # lanes (2, 3, 0, 1)
+    return x
 end
 # (A plain AMDGPU kernel, not a KernelAbstractions one: KA's lowering loses the types of the Val
-# parameter here. Grid: one workgroup per (value head, batch), 2 * dv threads.)
-function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, ::Val{HD}) where {HD}
+# parameter here. Grid: one workgroup per (value head, batch), 4 * dv threads. SNAP: whether any
+# per-step state snapshots are wanted (snap_t > 0); compiled out otherwise, which is faster.)
+function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, ::Val{HD}, ::Val{SNAP}) where {HD,SNAP}
+    NL = DELTA_REG_LANES
     tid = workitemIdx().x
     T = workgroupDim().x
-    j = (tid - 1) ÷ 2 + 1                  # value dim of this lane pair
-    hf = (tid - 1) % 2                     # which half of the key rows: hf * HD + 1 : (hf + 1) * HD
-    DK = 2 * HD
+    j = (tid - 1) ÷ NL + 1                 # value dim of this quad
+    hf = (tid - 1) % NL                    # this lane holds key rows hf + 1, hf + 1 + NL, ...
+    DK = NL * HD
     grp = workgroupIdx().x - 1
     dv = size(v, 1); nv = size(v, 2); S = size(v, 3)
     h = grp % nv + 1
@@ -658,8 +687,12 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
     L = min(S, unsafe_trunc(Int, @inbounds lens[b]))
     qs = @ROCStaticLocalArray(Float32, (DELTA_REG_MAX_DK * DELTA_REG_CHUNK,), false)
     ks = @ROCStaticLocalArray(Float32, (DELTA_REG_MAX_DK * DELTA_REG_CHUNK,), false)
+    vsm = @ROCStaticLocalArray(Float32, (128 * DELTA_REG_CHUNK,), false)
+    ds = @ROCStaticLocalArray(Float32, (DELTA_REG_CHUNK,), false)
+    bs = @ROCStaticLocalArray(Float32, (DELTA_REG_CHUNK,), false)
+    kqs = @ROCStaticLocalArray(Float32, (DELTA_REG_CHUNK,), false)
     active = j <= dv
-    s = ntuple(i -> (active && !fresh) ? (@inbounds st[j, hf * HD + i, h, b]) : 0f0, Val(HD))
+    s = ntuple(i -> (active && !fresh) ? (@inbounds st[j, (i - 1) * NL + hf + 1, h, b]) : 0f0, Val(HD))::NTuple{HD,Float32}
     t0 = 1
     while t0 <= L
         n = min(DELTA_REG_CHUNK, L - t0 + 1)
@@ -671,25 +704,45 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
             @inbounds ks[idx] = Float32(k[i, hk, t0 + tt - 1, b])
             idx += T
         end
+        idx = tid
+        while idx <= n * dv                         # v
+            tt = (idx - 1) ÷ dv + 1
+            jj = idx - (tt - 1) * dv
+            @inbounds vsm[idx] = Float32(v[jj, h, t0 + tt - 1, b])
+            idx += T
+        end
+        idx = tid
+        while idx <= n                              # decay and beta
+            @inbounds ds[idx] = exp(Float32(g[h, t0 + idx - 1, b]))
+            @inbounds bs[idx] = Float32(beta[h, t0 + idx - 1, b])
+            idx += T
+        end
+        sync_workgroup()
+        idx = tid
+        while idx <= n                              # k . q of each step (independent of the state)
+            @inbounds kqs[idx] = _dot_mem(ks, qs, (idx - 1) * DK, Val(DK))
+            idx += T
+        end
         sync_workgroup()
         if active
             for tt in 1:n
                 t = t0 + tt - 1
-                off = (tt - 1) * DK + hf * HD
-                @inbounds dec = exp(Float32(g[h, t, b]))
-                @inbounds vj = Float32(v[j, h, t, b])
-                @inbounds bet = Float32(beta[h, t, b])
-                s1 = let s0 = s; ntuple(i -> @inbounds(s0[i] * dec), Val(HD)); end            # decay (s is rebound below, so not captured)
-                kvp = _seq_dot(s1, ks, off)
-                kv = kvp + AMDGPU.Device.shfl_xor(kvp, Cint(1))                              # S^T k
+                off = (tt - 1) * DK + hf + 1
+                @inbounds dec = ds[tt]
+                @inbounds bet = bs[tt]
+                @inbounds vj = vsm[(tt - 1) * dv + j]
+                @inbounds kq = kqs[tt]
+                kv = dec * _quad_sum(_dot_st(s, ks, off, Val(NL))::Float32)                  # S^T k
+                sq = dec * _quad_sum(_dot_st(s, qs, off, Val(NL))::Float32)                  # S^T q
                 delta = (vj - kv) * bet
-                s = ntuple(i -> @inbounds(s1[i] + ks[off + i] * delta), Val(HD))             # rank-1 update
-                op = _seq_dot(s, qs, off)
-                o = op + AMDGPU.Device.shfl_xor(op, Cint(1))                                 # S^T q
+                o = sq + delta * kq
+                s = let s0 = s                                                               # decay and rank-1 update
+                    ntuple(i -> muladd(@inbounds(ks[off + (i - 1) * NL]), delta, @inbounds(s0[i]) * dec), Val(HD))::NTuple{HD,Float32}
+                end
                 hf == 0 && (@inbounds out[j, h, t, b] = o)
-                if t <= snap_t
+                if SNAP && t <= snap_t
                     for i in 1:HD
-                        @inbounds snap[j, hf * HD + i, h, b + (t - 1) * size(v, 4)] = s[i]
+                        @inbounds snap[j, (i - 1) * NL + hf + 1, h, b + (t - 1) * size(v, 4)] = s[i]
                     end
                 end
             end
@@ -699,11 +752,11 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
     end
     if active
         for i in 1:HD
-            @inbounds st[j, hf * HD + i, h, b] = s[i]
+            @inbounds st[j, (i - 1) * NL + hf + 1, h, b] = s[i]
         end
-        for tt in L+1:snap_t
+        for tt in L+1:(SNAP ? snap_t : 0)
             for i in 1:HD
-                @inbounds snap[j, hf * HD + i, h, b + (tt - 1) * size(v, 4)] = s[i]
+                @inbounds snap[j, (i - 1) * NL + hf + 1, h, b + (tt - 1) * size(v, 4)] = s[i]
             end
         end
         if hf == 0
@@ -713,6 +766,22 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
         end
     end
     return
+end
+
+# Launch of the register kernel. On an AMDGPU.jl that has the `flat_work_group_size` / `waves_per_eu` compiler
+# options (the luminal-launch-bounds branch, see TODO.md) the kernel is compiled for exactly this workgroup size
+# and (at dk = 128) a 12-waves-per-SIMD register budget (~120 VGPRs, so that all 48 heads of the 27B model are
+# resident at once; ~1.4x faster than without); stock AMDGPU.jl launches it without either.
+function _launch_delta_reg!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, nv, B, dk, dv)
+    nt = cld(DELTA_REG_LANES * dv, 32) * 32
+    args = (out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, Val(dk ÷ DELTA_REG_LANES), Val(snap_t > 0))
+    @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
+        wpe = dk == 128 ? 12 : 1
+        @roc groupsize=nt gridsize=nv * B flat_work_group_size=nt waves_per_eu=wpe _delta_rule_reg_kernel!(args...)
+    else
+        @roc groupsize=nt gridsize=nv * B _delta_rule_reg_kernel!(args...)
+    end
+    return nothing
 end
 
 function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens, snap = st)
@@ -742,9 +811,8 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens, snap = st)
     end
     (dk <= DELTA_MAX_DK && dv <= 256) || error("DeltaRule: head dims must be <= 256 (key $dk, value $dv)")
     gs = min(256, max(32, nextpow(2, max(dv, dk))))
-    if out isa AMDGPU.ROCArray && dk <= DELTA_REG_MAX_DK && iseven(dk) && dv <= 128 && get(ENV, "LUMINAL_DELTA_REG", "1") != "0"
-        @roc groupsize=cld(2dv, 32) * 32 gridsize=nv * B _delta_rule_reg_kernel!(
-            out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), snap, op.snap_t, op.scale, G, op.fresh, Val(dk ÷ 2))
+    if out isa AMDGPU.ROCArray && dk <= DELTA_REG_MAX_DK && dk % DELTA_REG_LANES == 0 && dv <= 128 && get(ENV, "LUMINAL_DELTA_REG", "1") != "0"
+        _launch_delta_reg!(out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), snap, op.snap_t, op.scale, G, op.fresh, nv, B, dk, dv)
         return out
     end
     _delta_rule_kernel!(KernelAbstractions.get_backend(out), gs)(

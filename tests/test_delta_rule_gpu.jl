@@ -2,7 +2,7 @@ using Test
 using Luminal
 using AMDGPU
 
-# The register-resident DeltaRule kernel (two lanes per state column; AMD GPUs only) against
+# The register-resident DeltaRule kernel (four lanes per state column; AMD GPUs only) against
 # the global-memory kernel it replaces (LUMINAL_DELTA_REG=0), on L2-normalized q/k as in the
 # model: they agree to Float32 rounding. Different head dims, lengths per batch entry
 # (including ones that do not fill the 16-step chunks), fresh and continuing states.

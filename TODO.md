@@ -836,3 +836,15 @@ The earlier "16% in small kernels" figure was wrong: LUMINAL_TRACE_TIME synchron
 at ~225 GB/s, so fusion only removes traffic: the realistic gain from fusing every small op (residual+RMSNorm, SwiGLU into the GEMM
 epilogue, copies) is ~5-7%. Larger: the delta-rule kernel (26%; gufo fuses conv + recurrence + post-norm/gate + int8 quantization in one
 kernel but its recurrence is also token-serial) and the GEMM (gufo ~1.5x faster: int8 WMMA with quantized activations).
+
+## Delta-rule register kernel rewrite (4 lanes per column)
+
+Kernel microbenchmark (27B shape: dk=dv=128, 16 key / 48 value heads, 256 tokens): 4.78 ms -> 0.54 ms per call (8.9x); 8-layer prefill slice 2490 -> 3093 tok/s (+24%).
+What mattered, in order found:
+- Launch bounds (`flat_work_group_size`, fork): 4.78 -> 2.68 ms (the 192-VGPR cap caused 1.7 KB of scratch).
+- Step algebra so only the state tuple is live: kv = dec*S^T k, o = dec*S^T q + delta*(k.q), S = dec*S + k delta^T; k.q is computed once per 16-step chunk in LDS. Explicit `muladd`.
+- 4 lanes per column (32 state registers each, no scratch) instead of 2: 2.0 -> 1.5 ms.
+- Snapshot code compiled out when snap_t == 0 (`Val{SNAP}`): -16%.
+- Interleaved key assignment across the lane quad (lane l holds keys l, l+4, ...): with a contiguous split every lane of a quad hit the same LDS bank (4-way conflict): 1.24 -> 0.54 ms.
+- `waves_per_eu=12` (~120 VGPRs) so all 48 heads are resident: ~1.4x. DPP quad swaps instead of ds_bpermute: no measurable change, kept.
+Counters before the fixes: waves waited ~80% of the time, VALU ~22% busy.
