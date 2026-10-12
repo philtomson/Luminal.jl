@@ -853,3 +853,15 @@ Counters before the fixes: waves waited ~80% of the time, VALU ~22% busy.
 
 Prefill 317 -> 389 tok/s (2.63 s for 1024 tokens). GPU time by kernel: `_wmma_q4_wide_kernel_` 76.8% (1.14 ms/call), broadcasts 7.6%, copies 4.1%, `_delta_rule_reg_kernel_` 3.7% (0.45 ms/call, was 4.4 ms), RMSNorm 1.6%, other int4 matmul 1.5%, fills 1.2%, causal conv 0.9%, flash attention 1.0%.
 The int4 GEMM is now the whole story (gufo's chunk is ~1.5x faster there); fusion of the small kernels is worth ~10% at most.
+
+## int4 GEMM: tile layout experiments (no gain) and where the ceiling is
+
+Measured on ffn gate/up (M=17408, K=5120, N=512), all in one process, best of 15:
+- Pure register WMMA loop (no memory): ~51 TFLOP/s on this chip (gufo quotes 55-59).
+- Current `_wmma_q4_wide_kernel!` (128x256 block, 16 waves of 32x64): 30.5 TFLOP/s (60% of the 51).
+- Ablations of that kernel: LDS fragment reads + WMMA + barrier only (no global loads, no dequant): 39.5; no WMMA: 2.07 ms of the 3.09 ms total; no dequant: 35.7; no weight/activation prefetch: 33.9.
+- Variants (scratch, not kept): software-pipelined loop (dequant of tile t+1 issued with the WMMAs of tile t, one barrier per tile): 30.0; 128x256 block with 8 waves of 64x64 (half the LDS fragment traffic per WMMA, 256 VGPRs): 29.9; both together: 23.4 (spills / worse schedule).
+- Hyperopt sweep (benchmarks/gemm_sweep.jl) over kernel, prefetch depth, waves_per_eu: the default is the best.
+- `flat_work_group_size=512` on the wide kernel is *slower* (25 vs 28-30 TFLOP/s): do not add launch bounds to it.
+- int8 WMMA is no faster than f16 on gfx1151 (gufo: 55 vs 59 TOPS ceilings), so W4A8 only saves dequant work (~0.8 ms of 3.1) at a numerics cost.
+Gufo's dense GEMMs run at 30-34 TFLOP/s (docs/models/qwen3.8-flash-next/EXPERIMENTS.md), i.e. about where ours is. The prefill gap to gufo is therefore not the GEMM; chunk 512 (N=512) is worth +15% by itself (N=256 underfills the 40 CUs).
