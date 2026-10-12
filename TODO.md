@@ -865,3 +865,10 @@ Measured on ffn gate/up (M=17408, K=5120, N=512), all in one process, best of 15
 - `flat_work_group_size=512` on the wide kernel is *slower* (25 vs 28-30 TFLOP/s): do not add launch bounds to it.
 - int8 WMMA is no faster than f16 on gfx1151 (gufo: 55 vs 59 TOPS ceilings), so W4A8 only saves dequant work (~0.8 ms of 3.1) at a numerics cost.
 Gufo's dense GEMMs run at 30-34 TFLOP/s (docs/models/qwen3.8-flash-next/EXPERIMENTS.md), i.e. about where ours is. The prefill gap to gufo is therefore not the GEMM; chunk 512 (N=512) is worth +15% by itself (N=256 underfills the 40 CUs).
+
+## Gufo comparison re-measured on this machine (2026-10-12): there is no 1.4x gap
+
+Earlier I compared our int4 prefill to gufo's *published* Q4_K_XL number (656 tok/s, pp2048, docs/models/qwen3.8-27b/BENCHMARKS.md). On this machine, same prompt length (2048), 27B Q8 weights:
+- gufo `bench -p 2048` on Qwen3.8-27B-UD-Q8_K_XL: **288 tok/s** (its published Q8 figure is 485; not reproduced here), tg16 7.25 tok/s.
+- Luminal `--int8` (chunk 512) on Qwen3.6-27B-Q8_0: **289 tok/s**.
+So for Q8 the two engines are at parity. Gufo cannot run the other 4-bit files here (IQ4_XS: unsupported storage type; no Q4_K_XL file on disk; it also pins the Qwen3.8 chat-template hash, so Qwen3.6 GGUFs are refused), so the Q4 comparison is open. Luminal int4: 467 tok/s (chunk 512); ratio int4/int8 for us 1.62, for gufo's published numbers 1.35 (which would put gufo's Q4 at ~390 tok/s on this machine if the ratio held). The published figures were measured on a different day/configuration; do not use them as a target.
