@@ -15,6 +15,7 @@ using AMDGPU
 const WMMA_V16H = NTuple{16,VecElement{Float16}}
 const WMMA_V8H  = NTuple{8,VecElement{Float16}}
 const WMMA_V8F  = NTuple{8,VecElement{Float32}}
+const WMMA_V4F  = NTuple{4,VecElement{Float32}}
 @inline _wmma16(a::WMMA_V16H, b::WMMA_V16H, c::WMMA_V8F) =
     ccall("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16", llvmcall, WMMA_V8F,
           (WMMA_V16H, WMMA_V16H, WMMA_V8F), a, b, c)
@@ -230,16 +231,34 @@ end
     return (c0, c1, c2, c3, c4, c5, c6, c7)
 end
 
-# R: an optional residual (same size as C, added to the result; HR = whether it is used)
-@inline function _wmma_store_big!(C, acc, m0, n0, r, h, N, R, ::Val{HR}) where {HR}
+# Cv: C viewed as 4-float vectors along its rows, Rv: an optional residual the same way (HR = whether it is used).
+# A lane of a 16x16 result tile holds D[2e + h, r] (e = 0..7): 8 rows of column r, every other row. One shuffle with
+# the partner lane (r, 1 - h) regroups them so that lane h = 0 holds rows 0..7 and lane h = 1 rows 8..15, and each
+# lane then writes its 8 consecutive rows as two 16-byte stores (a column of the tile is a 64-byte run) instead of
+# 8 four-byte stores to 8 different cache lines: the store cost 7-15% of the GEMM time.
+@inline function _wmma_store_big!(Cv, acc, m0, n0, r, h, N, Rv, ::Val{HR}) where {HR}
     for j in 0:3
-        n0 + 16j + r < N || continue
-        for i in 0:1, e in 0:7   # lane l holds D[2e + l÷16, l%16] of each 16x16 tile
-            row = m0 + 16i + 2e + h + 1; col = n0 + 16j + r + 1
-            if row <= size(C, 1)
-                v = acc[4i + j + 1][e + 1].value
-                HR && (v += R[row, col])
-                C[row, col] = v
+        col = n0 + 16j + r
+        for i in 0:1
+            a = acc[4i + j + 1]
+            v1, v2, v3, v4, v5, v6, v7, v8 = a[1].value, a[2].value, a[3].value, a[4].value, a[5].value, a[6].value, a[7].value, a[8].value
+            lo = h == 0
+            q1 = AMDGPU.Device.shfl_xor(ifelse(lo, v5, v1), Cint(16))
+            q2 = AMDGPU.Device.shfl_xor(ifelse(lo, v6, v2), Cint(16))
+            q3 = AMDGPU.Device.shfl_xor(ifelse(lo, v7, v3), Cint(16))
+            q4 = AMDGPU.Device.shfl_xor(ifelse(lo, v8, v4), Cint(16))
+            # h = 0: rows 0..7 = v1 q1 v2 q2 v3 q3 v4 q4;  h = 1: rows 8..15 = q1 v5 q2 v6 q3 v7 q4 v8
+            f1 = ifelse(lo, v1, q1); f2 = ifelse(lo, q1, v5); f3 = ifelse(lo, v2, q2); f4 = ifelse(lo, q2, v6)
+            f5 = ifelse(lo, v3, q3); f6 = ifelse(lo, q3, v7); f7 = ifelse(lo, v4, q4); f8 = ifelse(lo, q4, v8)
+            vr = (m0 + 16i + 8h) ÷ 4 + 1        # first of the two 4-row vectors of this lane
+            if col < N                          # (the shuffles above run for every lane: only the memory accesses are guarded)
+                if HR
+                    r1 = Rv[vr, col + 1]; r2 = Rv[vr + 1, col + 1]
+                    f1 += r1[1].value; f2 += r1[2].value; f3 += r1[3].value; f4 += r1[4].value
+                    f5 += r2[1].value; f6 += r2[2].value; f7 += r2[3].value; f8 += r2[4].value
+                end
+                Cv[vr, col + 1] = (VecElement(f1), VecElement(f2), VecElement(f3), VecElement(f4))
+                Cv[vr + 1, col + 1] = (VecElement(f5), VecElement(f6), VecElement(f7), VecElement(f8))
             end
         end
     end
@@ -267,7 +286,7 @@ function _wmma_q4_big_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{
     Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 128), false)
     acc = ntuple(_ -> _wmma_zero(), Val(8))
     arow = tid ÷ 2; ah = tid % 2                       # A: 128 rows x 2 half-chunks per K tile
-    grow = min(bm + arow, size(C, 1) - 1)              # a ragged last block re-reads the last row
+    grow = min(bm + arow, 4 * size(C, 1) - 1)          # (C is the (M/4, N) vector view) a ragged last block re-reads the last row
     c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 64     # B: 128 columns x 4 chunks
     nk = K ÷ 32
     pipe = ntuple(d -> _wmma_q4_load(Pv, Sc, Mn, Bv, grow, c0, bn + row0, bn + row1, group, Val(SYM), min(d - 1, nk - 1)), Val(PD))
@@ -317,7 +336,7 @@ function _wmma_q4_wide_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val
     Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 256, 2), false)
     acc = ntuple(_ -> _wmma_zero(), Val(8))
     arow = tid ÷ 4; qrt = tid % 4                      # A: 128 rows x 4 words (8 codes) per K tile
-    grow = min(bm + arow, size(C, 1) - 1)
+    grow = min(bm + arow, 4 * size(C, 1) - 1)
     c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 128    # B: 256 columns x 4 chunks, 2 per thread
     nk = K ÷ 32
     pipe = ntuple(d -> _wmma_q4w_load(Pw, Sc, Mn, Bv, grow, qrt, c0, bn + row0, bn + row1, group, Val(SYM), min(d - 1, nk - 1)), Val(PD))
@@ -498,13 +517,17 @@ function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, m
     R = residual isa ROCArray{Float32,2} && size(residual) == (M, N) ? residual : nothing
     residual !== nothing && R === nothing && throw(ArgumentError("wmma_q4_gemm!: the residual must be a Float32 ROCArray of the output's size"))
     hr = Val(R !== nothing)
-    Rarg = R === nothing ? C : R
+    if kind == :wide || kind == :big
+        Cv = reinterpret(WMMA_V4F, C)              # (M/4, N): the 128-row kernels store 16 bytes at a time
+        Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
+    end
     if kind == :wide
         Pw = reinterpret(UInt32, Pv)   # (K/8, M): words of 8 codes
-        _launch_q4(_wmma_q4_wide_kernel!, (C, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd), Rarg, hr),
+        _launch_q4(_wmma_q4_wide_kernel!, (Cv, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd), Rv, hr),
                    512, (Npad ÷ 256, M ÷ 128), wpe)
     elseif kind == :big
-        _launch_q4(_wmma_q4_big_kernel!, (args..., Val(pd), Rarg, hr), 256, (Npad ÷ 128, M ÷ 128), wpe)
+        _launch_q4(_wmma_q4_big_kernel!, (Cv, Pv, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd), Rv, hr),
+                   256, (Npad ÷ 128, M ÷ 128), wpe)
     else
         @roc groupsize=128 gridsize=(Npad ÷ 64, cld(M, 64)) _wmma_q4_kernel!(args...)
         R === nothing || (C .+= R)
