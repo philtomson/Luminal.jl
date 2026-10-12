@@ -848,3 +848,8 @@ What mattered, in order found:
 - Interleaved key assignment across the lane quad (lane l holds keys l, l+4, ...): with a contiguous split every lane of a quad hit the same LDS bank (4-way conflict): 1.24 -> 0.54 ms.
 - `waves_per_eu=12` (~120 VGPRs) so all 48 heads are resident: ~1.4x. DPP quad swaps instead of ds_bpermute: no measurable change, kept.
 Counters before the fixes: waves waited ~80% of the time, VALU ~22% busy.
+
+### Full 64-layer prefill profile after the delta-rule rewrite (chunk 256, 1024 tokens, rocprofv3 kernel trace)
+
+Prefill 317 -> 389 tok/s (2.63 s for 1024 tokens). GPU time by kernel: `_wmma_q4_wide_kernel_` 76.8% (1.14 ms/call), broadcasts 7.6%, copies 4.1%, `_delta_rule_reg_kernel_` 3.7% (0.45 ms/call, was 4.4 ms), RMSNorm 1.6%, other int4 matmul 1.5%, fills 1.2%, causal conv 0.9%, flash attention 1.0%.
+The int4 GEMM is now the whole story (gufo's chunk is ~1.5x faster there); fusion of the small kernels is worth ~10% at most.
