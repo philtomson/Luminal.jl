@@ -889,3 +889,8 @@ Timed-region trace (2048 tokens, 4.4 s): GPU idle 3.7% (67 ms launch gaps over 1
 - compile pass `dty`: RMSNorm outputs, SwiGLU / gated-norm multiplies that feed only matmuls (N >= 384, N % 256 == 0) are computed as Float16, so the Float32->Float16 copy before each GEMM is gone (LUMINAL_F16_GEMM_INPUTS=0 disables). Logits differ by 1.8e-5 relative. +2-3% (472 -> 478-483 tok/s).
 - Remaining copies: the strided V slice of the conv output (6144x512, ~50 ms) and q/k slices (~16 ms); the L2-norm chain of q and k (12 small kernels per layer, ~100 ms); the residual add after each GEMM (~55 ms, could be in the GEMM epilogue); zero-fills (~45 ms).
 - Idea: static buffer planning (lifetime-based offsets into one arena, like gufo's fixed working set of ~0.5 MB/token vs our 32 MB/token) would remove the GC step, the memory growth, and allow capture.
+
+### L2NormOp and the GEMM residual epilogue
+- `L2NormOp` (src/Ops.jl, one wave per column): Gated DeltaNet's q/k normalization is one kernel (15 ms per 2048-token prefill) instead of Mul + SumReduce + Recip + Expand + Mul (~100 ms of broadcasts and reductions).
+- `wmma_q4_gemm!(...; residual = R)`: the residual add is in the 128-row kernels' store (HR is a compile-time flag: no cost without it). Standalone 5120x17408x512 GEMM: 2.80 ms; + residual in the epilogue 2.94 ms; + a separate add 3.05 ms. Each lane reads the residual with the same strided pattern as its stores; a coalesced store through LDS would make both cheaper.
+- Prefill 2048 tokens (Q4_K_XL, chunk 512): 472 -> 483 (Float16 inputs) -> 486-488 tok/s. Per-kernel totals are within ~1.5% run to run; compare wall time, not single-kernel sums.

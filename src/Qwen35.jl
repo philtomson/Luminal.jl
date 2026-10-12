@@ -46,7 +46,8 @@ deltanet_state_shapes(dn::GatedDeltaNet, batch::Int) =
 # x / ||x|| over dim 1, as FLA's l2norm: x * rsqrt(sum(x^2) + eps)
 function _l2norm(x::Luminal.GraphTensor; eps=1f-6)
     n = Luminal.realized_dims(x.shape)[1]
-    return x * Luminal.expand(Luminal.reciprocal(sqrt(Luminal.sum(x * x, 1) + eps)), 1, n)
+    return Luminal.add_op!(x.graph_ref, Luminal.L2NormOp(Float32(eps)), [(x.id, 0, x.shape)],
+                           Luminal.ShapeTracker(Luminal.realized_dims(x.shape)))
 end
 
 """

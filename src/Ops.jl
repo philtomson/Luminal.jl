@@ -262,6 +262,12 @@ struct RMSNormOp <: Op
     epsilon::Float32
 end
 
+# x * rsqrt(sum(x^2) + epsilon) over dim 1 (L2 normalization as FLA's l2norm): one kernel instead of
+# a square, a reduction, a reciprocal, an expand and a product (Gated DeltaNet's q and k).
+struct L2NormOp <: Op
+    epsilon::Float32
+end
+
 # Linear-attention building blocks (Gated DeltaNet: Qwen3.5 / Qwen3.6). Both
 # carry state across calls in a buffer they update in place, like
 # DecodeAttention's cache write; `fresh` starts from zeros (prefill) instead of

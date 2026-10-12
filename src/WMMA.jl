@@ -230,12 +230,17 @@ end
     return (c0, c1, c2, c3, c4, c5, c6, c7)
 end
 
-@inline function _wmma_store_big!(C, acc, m0, n0, r, h, N)
+# R: an optional residual (same size as C, added to the result; HR = whether it is used)
+@inline function _wmma_store_big!(C, acc, m0, n0, r, h, N, R, ::Val{HR}) where {HR}
     for j in 0:3
         n0 + 16j + r < N || continue
         for i in 0:1, e in 0:7   # lane l holds D[2e + l÷16, l%16] of each 16x16 tile
-            m0 + 16i + 2e + h < size(C, 1) &&
-                (C[m0 + 16i + 2e + h + 1, n0 + 16j + r + 1] = acc[4i + j + 1][e + 1].value)
+            row = m0 + 16i + 2e + h + 1; col = n0 + 16j + r + 1
+            if row <= size(C, 1)
+                v = acc[4i + j + 1][e + 1].value
+                HR && (v += R[row, col])
+                C[row, col] = v
+            end
         end
     end
     return
@@ -252,7 +257,7 @@ end
 
 # PD = how many K tiles of global loads are in flight (a register queue): one tile of WMMAs
 # (~0.4 us per block) is shorter than a DRAM load, so a single tile of lookahead stalls.
-function _wmma_q4_big_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{PD}) where {SYM, PD}
+function _wmma_q4_big_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{PD}, R, hr::Val) where {SYM, PD}
     @inbounds begin
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; h = l ÷ 16; w = tid ÷ 32
@@ -280,7 +285,7 @@ function _wmma_q4_big_kernel!(C, Pv, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{
         acc = _wmma_tile_big(acc, As, Bs, wm, wn, r)
         sync_workgroup()
     end
-    _wmma_store_big!(C, acc, bm + wm, bn + wn, r, h, N)
+    _wmma_store_big!(C, acc, bm + wm, bn + wn, r, h, N, R, hr)
     return
     end
 end
@@ -302,7 +307,7 @@ end
             Bv[4t + c0 + 1, bcol0 + 1], Bv[4t + c0 + 1, bcol1 + 1])
 end
 
-function _wmma_q4_wide_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{PD}) where {SYM, PD}
+function _wmma_q4_wide_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{PD}, R, hr::Val) where {SYM, PD}
     @inbounds begin
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; h = l ÷ 16; w = tid ÷ 32
@@ -326,7 +331,7 @@ function _wmma_q4_wide_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val
         pipe = (Base.tail(pipe)..., nxt)
         acc = _wmma_tile_big(acc, view(As, :, :, st), view(Bs, :, :, st), wm, wn, r)
     end
-    _wmma_store_big!(C, acc, bm + wm, bn + wn, r, h, N)
+    _wmma_store_big!(C, acc, bm + wm, bn + wn, r, h, N, R, hr)
     return
     end
 end
@@ -477,7 +482,8 @@ end
 # C (M, N) = dequantize(P, scale, mn)' * B for the 4-bit layout of `Q4Weight`: Pv (K/32, M)
 # of NTuple{16,UInt8}, scale / mn (K/group, M) Float16 (`mn` = nothing when symmetric).
 function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
-                       group::Int, B::ROCArray{Float16,2}, N::Int; kind::Symbol = :auto, pd::Int = WMMA_Q4_PD[], wpe::Int = WMMA_Q4_WPE[])
+                       group::Int, B::ROCArray{Float16,2}, N::Int; kind::Symbol = :auto, pd::Int = WMMA_Q4_PD[], wpe::Int = WMMA_Q4_WPE[],
+                       residual = nothing)
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
     (M % 16 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
@@ -488,14 +494,20 @@ function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, m
         kind = M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ? :wide :
                M % 128 == 0 && Npad % 128 == 0 && get(ENV, "LUMINAL_WMMA_BIG", "1") != "0" ? :big : :small
     end
+    # `residual` (an (M, N) Float32 array) is added to the result: in the 128-row kernels' store, else after the kernel
+    R = residual isa ROCArray{Float32,2} && size(residual) == (M, N) ? residual : nothing
+    residual !== nothing && R === nothing && throw(ArgumentError("wmma_q4_gemm!: the residual must be a Float32 ROCArray of the output's size"))
+    hr = Val(R !== nothing)
+    Rarg = R === nothing ? C : R
     if kind == :wide
         Pw = reinterpret(UInt32, Pv)   # (K/8, M): words of 8 codes
-        _launch_q4(_wmma_q4_wide_kernel!, (C, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd)),
+        _launch_q4(_wmma_q4_wide_kernel!, (C, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd), Rarg, hr),
                    512, (Npad ÷ 256, M ÷ 128), wpe)
     elseif kind == :big
-        _launch_q4(_wmma_q4_big_kernel!, (args..., Val(pd)), 256, (Npad ÷ 128, M ÷ 128), wpe)
+        _launch_q4(_wmma_q4_big_kernel!, (args..., Val(pd), Rarg, hr), 256, (Npad ÷ 128, M ÷ 128), wpe)
     else
         @roc groupsize=128 gridsize=(Npad ÷ 64, cld(M, 64)) _wmma_q4_kernel!(args...)
+        R === nothing || (C .+= R)
     end
     return C
 end

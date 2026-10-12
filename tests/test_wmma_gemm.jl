@@ -105,5 +105,16 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
         out = Luminal.zero_tensor(dev, Float32, Out, N)
         Luminal._q4_matmul!(out, qw, Luminal.to_device(x, dev); residual = Luminal.to_device(r, dev))
         @test relerr(Array(out), Array(Luminal.dequantize(qw)) * Float32.(Float16.(x)) .+ r) < 2e-3
+        # the residual added in the kernels' store (128x128 and 128x256 kernels, a ragged M), with Float32 and Float16 activations
+        for (Out, In, N) in ((256, 256, 200), (256, 128, 400), (384, 96, 512), (176, 128, 200))
+            W = randn(Float32, Out, In); x = randn(Float32, In, N); r = randn(Float32, Out, N)
+            qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = 32)
+            ref = Array(Luminal.dequantize(qw)) * Float32.(Float16.(x)) .+ r
+            for xin in (Luminal.to_device(x, dev), Luminal.to_device(Float16.(x), dev))
+                out = Luminal.zero_tensor(dev, Float32, Out, N)
+                Luminal._q4_matmul!(out, qw, xin; residual = Luminal.to_device(r, dev))
+                @test relerr(Array(out), ref) < 2e-3
+            end
+        end
     end
 end

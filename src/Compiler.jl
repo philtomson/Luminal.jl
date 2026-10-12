@@ -193,7 +193,7 @@ end
 
 # Ops whose `execute_op!` writes every element of the output, so it needs no zero fill.
 _writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa Luminal.Reshape ||
-    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp ||
+    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp || op isa Luminal.L2NormOp ||
     op isa Luminal.RotaryEmbed || op isa Luminal.SoftmaxOp || op isa Luminal.LastToken
 
 # A matmul against a quantized / half weight writes every element of its output when it has more

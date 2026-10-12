@@ -123,6 +123,53 @@ function execute_op!(out, op::RMSNormOp, x, w)
     return out
 end
 
+# --- L2 normalization over dim 1 ---------------------------------------------------
+# One wave (32 lanes) per column: each lane sums the squares of every 32nd element, a shuffle tree adds the
+# lanes, and the normalized values are written in the output's element type.
+function _l2norm_kernel!(out, x, D, ncols, eps)
+    tid = workitemIdx().x - 1
+    lane = tid % 32
+    col = (workgroupIdx().x - 1) * (workgroupDim().x ÷ 32) + tid ÷ 32
+    col < ncols || return
+    base = col * D
+    acc = 0f0
+    i = lane
+    while i < D
+        v = Float32(@inbounds x[base + i + 1])
+        acc += v * v
+        i += 32
+    end
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(16))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(8))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(4))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(2))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(1))
+    r = 1f0 / sqrt(acc + eps)
+    T = eltype(out)
+    i = lane
+    while i < D
+        @inbounds out[base + i + 1] = T(Float32(x[base + i + 1]) * r)
+        i += 32
+    end
+    return
+end
+
+function execute_op!(out, op::L2NormOp, x)
+    D = size(x, 1)
+    xc = x isa DenseArray ? x : copy(x)
+    if !(out isa AMDGPU.ROCArray)
+        x2 = Base.reshape(xc, D, :); o2 = Base.reshape(out, D, :)
+        for c in axes(x2, 2)
+            v = Float32.(view(x2, :, c))
+            o2[:, c] .= v .* (1f0 / sqrt(sum(abs2, v) + op.epsilon))
+        end
+        return out
+    end
+    ncols = length(xc) ÷ D
+    @roc groupsize=256 gridsize=cld(ncols, 8) _l2norm_kernel!(vec(out), vec(xc), D, ncols, op.epsilon)
+    return out
+end
+
 # --- Softmax over dim 1 --------------------------------------------------------
 # One workgroup per column (all dims after the first): the column max and the
 # sum of exponentials with tree reductions, then the normalized write.
@@ -1574,8 +1621,10 @@ function _wmma_q4_gemm!(C, W::Q4Weight, B, residual)
     N = length(B) ÷ K
     x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
-    wmma_q4_gemm!(C2, W.v, W.scale, W.mn, W.group, x16, N)
-    _wmma_add_residual!(C2, residual, M, N)
+    # a dense Float32 residual is added in the kernel's store (no separate pass over C)
+    R = residual isa ROCArray{Float32} && length(residual) == M * N ? Base.reshape(residual, M, N) : nothing
+    wmma_q4_gemm!(C2, W.v, W.scale, W.mn, W.group, x16, N; residual = R)
+    R === nothing && _wmma_add_residual!(C2, residual, M, N)
     Bc === B || _free_now!(Bc)
     return true
 end
