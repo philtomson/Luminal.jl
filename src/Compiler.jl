@@ -579,6 +579,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     allow(key::String) = (push!(sites, key); get(lowering, key, true))
     _opname(op) = op isa Luminal.Function ? op.name : string(nameof(typeof(op)))
     _dimstr(id) = string(Tuple(realized_dims(graph.shapes[id])))
+    dty = copy(graph.dtypes)   # output element types of this compiled graph (some Float32 activations become Float16 below)
     # 0. Consumer count
     consumer_count = zeros(Int, length(graph.nodes))
     for node in graph.nodes
@@ -644,7 +645,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             none = Dict{Symbol,Int}()
             dims = [eval_dim(d) for d in realized_dims(graph.shapes[node_id])]
             args = [realize_view(results[id], evaluate_shapes(st, none)) for (id, _, st) in node.inputs]
-            out = Luminal.zero_tensor(compile_device, graph.dtypes[node_id], dims...)
+            out = Luminal.zero_tensor(compile_device, dty[node_id], dims...)
             execute_op!(out, evaluate_op_shapes(node.op, none), args...)
             # Views made for the inputs hold references to whole input buffers until
             # the GC runs; drop them now (the inputs themselves keep theirs).
@@ -763,6 +764,44 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
+    # GEMM inputs in Float16. The matrix-core GEMMs take their activations as Float16, and converting a
+    # Float32 activation was a copy kernel per GEMM (5% of a 27B prefill chunk). A node whose every consumer
+    # takes it as the right-hand side of a matmul (directly, or through a Reshape view) and that is computed by an
+    # op that can write any element type (RMSNorm, an elementwise group) is computed as Float16 instead. Only
+    # prefill-sized activations (N a multiple of 256, which the 128x256 int4 kernel takes as they are) qualify;
+    # the matmul entry points convert back for any weight storage that cannot use them (`_b_for`).
+    if get(ENV, "LUMINAL_F16_GEMM_INPUTS", "1") != "0" && compile_device isa Luminal.AMDDevice
+        is_mm(op) = op isa Luminal.MatMul || op isa Luminal.MatMulQ4 || op isa Luminal.MatMulQ8 || op isa Luminal.MatMulF16
+        retained = Set(retain)
+        function gemm_input(x, depth=0)
+            (x in retained || isempty(consumers[x]) || depth > 3) && return false
+            return all(consumers[x]) do (cid, _)
+                c = graph.nodes[cid]
+                (is_mm(c.op) && length(c.inputs) == 2 && c.inputs[2][1] == x && c.inputs[1][1] != x) ||
+                    (c.op isa Luminal.Reshape && !(cid in retained) && gemm_input(cid, depth + 1))
+            end
+        end
+        function big_n(x)
+            try
+                d = [eval_dim(v) for v in realized_dims(graph.shapes[x])]
+                return length(d) >= 2 && prod(d[2:end]) >= 384 && prod(d[2:end]) % 256 == 0
+            catch
+                return false
+            end
+        end
+        for x in eachindex(graph.nodes)
+            (persistent[x] || folded[x] || dty[x] !== Float32) && continue
+            nd = graph.nodes[x]
+            (nd.op isa Luminal.RMSNormOp || (is_elementwise(nd.op) && !(nd.op isa Luminal.Constant))) || continue
+            (big_n(x) && gemm_input(x)) || continue
+            dty[x] = Float16
+            get(ENV, "LUMINAL_F16_DEBUG", "") != "" && println("[f16] node ", x, " ", typeof(nd.op).name.name, " dims ", Tuple(realized_dims(graph.shapes[x])))
+            for (cid, _) in consumers[x]     # a Reshape view of it is Float16 too
+                graph.nodes[cid].op isa Luminal.Reshape && (dty[cid] = Float16)
+            end
+        end
+    end
+
     steps = Base.Function[]
     step_nodes = Int[]          # the node each step computes (for LUMINAL_TRACE_MEM)
     processed = folded .| processed_pads .| fused_matmuls   # these nodes need no step of their own
@@ -782,7 +821,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             backing = Ref{Any}(nothing)
             push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
-                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id])
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, dty[node_id])
                 out = res[node_id]
                 for (k, (src, _, lo)) in enumerate(parts)
                     a = realize_view(res[src], src_sts[k])
@@ -810,7 +849,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
                 x = realize_view(res[xid], sts[1])
-                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, graph.dtypes[node_id];
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, dty[node_id];
                                  zero=!_gemm_writes_all(res[wid], x))
                 r = realize_view(res[rid], sts[2])
                 Luminal.matmul_residual!(res[node_id], mop, res[wid], x, r)
@@ -939,7 +978,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         res[node_id] = nothing
                         aliased[] = false
                     end
-                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, graph.dtypes[node_id]; zero=!(_writes_all(op) || ((op isa Luminal.MatMul || op isa Luminal.MatMulF16 || op isa Luminal.MatMulQ8 || op isa Luminal.MatMulQ4) && _gemm_writes_all(step_args[1], step_args[2]))))
+                    alias === nothing && _prepare_output!(res, node_id, sz, dev, backing, owned, free_intermediates, dty[node_id]; zero=!(_writes_all(op) || ((op isa Luminal.MatMul || op isa Luminal.MatMulF16 || op isa Luminal.MatMulQ8 || op isa Luminal.MatMulQ4) && _gemm_writes_all(step_args[1], step_args[2]))))
                 end
 
                 # 3. Execute
@@ -961,8 +1000,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 sym_cache = Dict{Any, Any}()
                 input_syms = [build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st)
                               for (in_id, _, in_st) in node.inputs]
-                node_expr = fix_gpu_ast!(toexpr(op_to_sym(op, input_syms, graph.dtypes[node_id])))
-                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", _fused_kernel(node_expr, length(group_inputs), graph.dtypes[node_id]))
+                node_expr = fix_gpu_ast!(toexpr(op_to_sym(op, input_syms, dty[node_id])))
+                fused_op = Luminal.FusedElementwiseOp("fused_$node_id", _fused_kernel(node_expr, length(group_inputs), dty[node_id]))
 
                 node_shape = graph.shapes[node_id]
                 target_rank = length(realized_dims(node_shape))
@@ -983,7 +1022,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                     in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
                     args = [align_rank(realize_view(res[id], in_sts[k]), target_rank) for (k, (id, _, _)) in enumerate(group_inputs)]
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
-                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates, graph.dtypes[node_id]; zero=false)
+                    _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates, dty[node_id]; zero=false)
 
                     Base.invokelatest(execute_op!, res[node_id], fused_op, args...)
 

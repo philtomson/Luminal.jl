@@ -872,3 +872,20 @@ Earlier I compared our int4 prefill to gufo's *published* Q4_K_XL number (656 to
 - gufo `bench -p 2048` on Qwen3.8-27B-UD-Q8_K_XL: **288 tok/s** (its published Q8 figure is 485; not reproduced here), tg16 7.25 tok/s.
 - Luminal `--int8` (chunk 512) on Qwen3.6-27B-Q8_0: **289 tok/s**.
 So for Q8 the two engines are at parity. Gufo cannot run the other 4-bit files here (IQ4_XS: unsupported storage type; no Q4_K_XL file on disk; it also pins the Qwen3.8 chat-template hash, so Qwen3.6 GGUFs are refused), so the Q4 comparison is open. Luminal int4: 467 tok/s (chunk 512); ratio int4/int8 for us 1.62, for gufo's published numbers 1.35 (which would put gufo's Q4 at ~390 tok/s on this machine if the ratio held). The published figures were measured on a different day/configuration; do not use them as a target.
+
+## Float16 GEMM inputs (compile pass) and where the Qwen3.8-27B Q4_K_XL prefill stands vs gufo (2026-10-12)
+
+Measured here, Qwen3.8-27B UD-Q4_K_XL, depth 0, chunk 512 (Luminal int4 re-quantized from the K/IQ-quants; gufo native):
+| tokens | Luminal | gufo | gufo/Luminal |
+| 512 | 459 | 421 | 0.92 |
+| 2048 | 465 | 690 | 1.48 |
+| 8192 | 416 | 646 | 1.55 |
+| 16384 | 394 | 620 | 1.57 |
+| 32768 | 355 | 584 | 1.65 |
+Gufo's 4-bit decode is 12.1 tok/s here.
+Timed-region trace (2048 tokens, 4.4 s): GPU idle 3.7% (67 ms launch gaps over 12.3k kernels, median 4.9 us; 3 x ~30 ms at the chunk boundaries = the explicit GC.gc(false) + HIP.reclaim). GEMM 73% of kernel time (~32 TFLOP/s; gufo needs ~40), elementwise/copy/fill ~20%.
+- `chunk_attention!` no longer reads the position back from the device (CHUNK_POS_HINT): it synchronized the stream in every full-attention layer. Throughput unchanged.
+- LUMINAL_CHUNK_REUSE=1 (persistent per-node buffers, no per-chunk GC): +3.5%, 18-20 GB instead of ~13 GB; LUMINAL_CHUNK_CAPTURE=1 is still blocked by other host syncs (hipErrorStreamCaptureUnsupported).
+- compile pass `dty`: RMSNorm outputs, SwiGLU / gated-norm multiplies that feed only matmuls (N >= 384, N % 256 == 0) are computed as Float16, so the Float32->Float16 copy before each GEMM is gone (LUMINAL_F16_GEMM_INPUTS=0 disables). Logits differ by 1.8e-5 relative. +2-3% (472 -> 478-483 tok/s).
+- Remaining copies: the strided V slice of the conv output (6144x512, ~50 ms) and q/k slices (~16 ms); the L2-norm chain of q and k (12 small kernels per layer, ~100 ms); the residual add after each GEMM (~55 ms, could be in the GEMM epilogue); zero-fills (~45 ms).
+- Idea: static buffer planning (lifetime-based offsets into one arena, like gufo's fixed working set of ~0.5 MB/token vs our 32 MB/token) would remove the GC step, the memory growth, and allow capture.

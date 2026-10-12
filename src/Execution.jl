@@ -100,7 +100,7 @@ end
     r = 1f0 / sqrt(s / H + eps)
     i = lid
     while i <= H
-        @inbounds out[i, col] = x[i, col] * r * w[i]
+        @inbounds out[i, col] = eltype(out)(x[i, col] * r * w[i])
         i += T
     end
 end
@@ -1018,6 +1018,10 @@ function _q8_matmul!(C, W::QuantWeight, B; group::Int = DEFAULT_Q8_THREADS, cols
                      residual = nothing)
     K, M = size(W.q)
     N = length(B) ÷ K
+    if eltype(B) === Float16          # a Float16 activation (see `dty` in compile)
+        N > QUANT_GEMM_COLS && _wmma_q8_gemm!(C, W, B, residual) && return C
+        B = Float32.(B)
+    end
     N > QUANT_GEMM_COLS && _wmma_q8_gemm!(C, W, B, residual) && return C
     (N > QUANT_GEMM_COLS || !(C isa AnyGPUArray)) && return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
@@ -1423,6 +1427,10 @@ function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::I
                      residual = nothing)
     M, K = size(W)
     N = length(B) ÷ K
+    if eltype(B) === Float16          # a Float16 activation (see `dty` in compile): only the matrix-core GEMM takes it as it is
+        N > QUANT_GEMM_COLS && _wmma_q4_gemm!(C, W, B, residual) && return C
+        B = Float32.(B)
+    end
     SKINNY_MIN_COLS <= N <= SKINNY_MAX_COLS && _wmma_q4_skinny_gemm!(C, W, B, residual) && return C
     Q4_DOT2_MIN_N[] <= N <= Q4_DOT2_MAX_N[] && _q4d_matmul!(C, W, B, residual) && return C
     N > QUANT_GEMM_COLS && _wmma_q4_gemm!(C, W, B, residual) && return C
@@ -1530,6 +1538,8 @@ const _WMMA_WORKSPACE = Dict{Any, Any}()
 function _wmma_activations(B, K, N)
     blk = N >= 384 ? 256 : N >= 192 ? 128 : 64   # the int4 kernels' block widths: 128x256, 128x128, 64x64
     Npad = cld(N, blk) * blk
+    # already Float16 and a whole number of blocks wide (the compiler computed it that way, see `dty` in compile): no copy
+    eltype(B) === Float16 && B isa DenseArray && Npad == N && return Base.reshape(B, K, N), B
     Bc = B isa DenseArray ? B : copy(B)
     x16 = get!(() -> (x = similar(Bc, Float16, K, Npad); fill!(x, Float16(0)); x),
                _WMMA_WORKSPACE, (typeof(Bc), K, Npad))
@@ -1605,6 +1615,7 @@ end
 
 # C (Out, N) = W (Out, In) * B (In, N), with any trailing dims of B/C flattened into N.
 function _half_matmul!(C, W::HalfWeight, B; group::Int = DEFAULT_HALF_GROUP, residual = nothing)
+    eltype(B) === Float16 && (B = Float32.(B))
     K, M = size(W.t)
     N = length(B) ÷ K
     N > QUANT_GEMM_COLS && _wmma_half_gemm!(C, W, B, residual) && return C
@@ -1710,6 +1721,7 @@ function _matmul2d!(C, A, B)
 end
 
 function batch_matmul!(C, A, B)
+    eltype(B) === Float16 && !(A isa Q4Weight) && (B = Float32.(B))   # (Float16 activations: see `dty` in compile)
     A isa HalfWeight && return _half_matmul!(C, A, B)
     A isa QuantWeight && return _q8_matmul!(C, A, B)
     A isa Q4Weight && return _q4_matmul!(C, A, B)
