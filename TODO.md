@@ -813,3 +813,16 @@ What the investigation before it found (kept for reference): the old kernel was 
 loads, unrolling and staging K alone in LDS (-11% at 130k, nothing at 32k) did not help; the gufo structure did. Gufo reports ~20 TFLOP/s
 for its kernel on this chip; ours is at ~11, so there is probably more (its 16-key tile also avoids the cross-wave max exchange; the
 causal-tail exactness fix and `__launch_bounds__(256, 2)` occupancy control are things we do not have).
+
+### Launch bounds from Julia: our AMDGPU.jl branch (`~/devel/AMDGPU.jl`, branch `luminal-launch-bounds`, commit e4fa557)
+AMDGPU.jl never sets `amdgpu-flat-work-group-size` / `amdgpu-waves-per-eu`, so LLVM assumes 1024-thread workgroups and caps every kernel at
+192 VGPRs (wave32). The branch adds compiler options `flat_work_group_size` and `waves_per_eu` (`@roc ... flat_work_group_size=256 k(...)`),
+based on the exact commit Luminal's Manifest used (`simeonschaub/AMDGPU.jl#sds/update_wrappers` @ ba948d9; not pushed anywhere yet).
+Use it: `julia --project=. -e 'using Pkg; Pkg.develop(path=expanduser("~/devel/AMDGPU.jl"))'` (the Manifest is untracked; the old one is in
+`Manifest.toml.bak-before-amdgpu-fork`). Luminal detects the option with `@static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS`
+(`_launch_flash_lds!`), so stock AMDGPU.jl still works. The attribute must be per kernel: applied to all kernels it makes AMDGPU.jl's own
+fill/copy kernels (launched with 1024 threads) fault on the device.
+Measured (LDS flash prefill kernel, 32.5k / 130.8k keys): 18.2 -> 17.1 ms and 76.7 -> 72.5 ms (about -6%); `waves_per_eu` adds nothing. The VGPR cap
+is not the main gap to gufo. The kernel keeps its 64 Q registers in scratch (~290 B) because it needs more than the cap allows; unrolling the
+loop so Q stays in registers made it slower even with 256 VGPRs (more live ranges, still 240 B of scratch), so that needs a different register
+plan (e.g. Q read from LDS per step, or fewer live accumulators), not just a bigger cap.

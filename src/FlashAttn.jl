@@ -251,6 +251,18 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
     return
 end
 
+# Launch of the LDS kernel (256 threads per workgroup; grid = 32-query blocks x (batch, head pair)). On an AMDGPU.jl that has the `flat_work_group_size` compiler option
+# (the luminal-launch-bounds branch, see TODO.md) the kernel is compiled for exactly 256 threads per workgroup, which lifts LLVM's
+# 192-VGPR cap (it assumes 1024 threads otherwise); stock AMDGPU.jl launches it without.
+function _launch_flash_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, nb) where {NT}
+    @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
+        @roc groupsize=256 gridsize=(cld(S, 32), nb) flat_work_group_size=256 _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
+    else
+        @roc groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
+    end
+    return nothing
+end
+
 # The LDS kernel needs D % 128 == 0 (its 8 waves split the output dims in 16-wide tiles) and an even number of query heads per KV head.
 _lds_attn_ok(D, H, KVH) = D % 128 == 0 && H % KVH == 0 && (H ÷ KVH) % 2 == 0
 
@@ -265,8 +277,8 @@ function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
     scale2 = scale * 1.4426950408889634f0
     if _lds_attn_ok(D, H, KVH)
         v16 = similar(out, Float16, D, S, KVH, B); v16 .= v
-        @roc groupsize=256 gridsize=(cld(S, 32), (H ÷ 2) * B) _flash_prefill_lds!(
-            out, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, k16), reinterpret(WMMA_V8H, v16), S, H, KVH, scale2, 0, Val(D ÷ 32))
+        _launch_flash_lds!(out, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, k16), reinterpret(WMMA_V8H, v16), S, H, KVH, scale2, 0,
+                           Val(D ÷ 32), (H ÷ 2) * B)
         AMDGPU.unsafe_free!(v16)
     else
         Spad = cld(S, 64) * 64
@@ -351,8 +363,8 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
                 kt = AMDGPU.zeros(Float16, D, NK, KVH, 1); vd = AMDGPU.zeros(Float16, D, NK, KVH, 1)
                 @roc groupsize=256 gridsize=cld(D * NK * KVH, 256) _kv_dequant_kernel!(kt, vd, pk, pv, ksc, vsc, NK, Val(false))
             end
-            @roc groupsize=256 gridsize=(cld(S, 32), H ÷ 2) _flash_prefill_lds!(
-                ob, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, kt), reinterpret(WMMA_V8H, vd), S, H, KVH, scale2, pos, Val(D ÷ 32))
+            _launch_flash_lds!(ob, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, kt), reinterpret(WMMA_V8H, vd), S, H, KVH, scale2, pos,
+                               Val(D ÷ 32), H ÷ 2)
             q8 && (AMDGPU.unsafe_free!(kt); AMDGPU.unsafe_free!(vd))
         else
             Spad = cld(NK, 64) * 64
