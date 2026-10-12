@@ -22,6 +22,7 @@ const WMMA_V8F  = NTuple{8,VecElement{Float32}}
 @inline _wmma_cat(a::WMMA_V8H, b::WMMA_V8H)::WMMA_V16H = (a..., b...)
 
 const WMMA_SKINNY_WAVES = Ref(4)   # waves (= K splits) per workgroup of the skinny int4 kernel
+const WMMA_Q4_WPE = Ref(0)   # waves_per_eu launch bound of the int4 kernels (0 = default); needs the AMDGPU.jl launch-bounds branch
 const WMMA_Q4_PD = Ref(1)   # prefetch depth of the 128x128 int4 kernel (K tiles in flight)
 const WMMA_PADC = 5   # LDS row = 4 chunks of 16 B + 1 pad chunk, to spread banks
 
@@ -461,22 +462,38 @@ function wmma_q8_gemm!(C::ROCArray{Float32,2}, Q::ROCArray{Int8,2}, scale::ROCAr
     return C
 end
 
+# `wpe` > 0 bounds the registers per thread (waves per SIMD) when AMDGPU.jl has the launch-bounds options
+function _launch_q4(kern, args, nthreads, grid, wpe)
+    @static if :waves_per_eu in AMDGPU.COMPILER_KWARGS
+        if wpe > 0
+            @roc groupsize=nthreads gridsize=grid flat_work_group_size=nthreads waves_per_eu=wpe kern(args...)
+            return nothing
+        end
+    end
+    @roc groupsize=nthreads gridsize=grid kern(args...)
+    return nothing
+end
+
 # C (M, N) = dequantize(P, scale, mn)' * B for the 4-bit layout of `Q4Weight`: Pv (K/32, M)
 # of NTuple{16,UInt8}, scale / mn (K/group, M) Float16 (`mn` = nothing when symmetric).
 function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
-                       group::Int, B::ROCArray{Float16,2}, N::Int)
+                       group::Int, B::ROCArray{Float16,2}, N::Int; kind::Symbol = :auto, pd::Int = WMMA_Q4_PD[], wpe::Int = WMMA_Q4_WPE[])
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
     (M % 16 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
         throw(ArgumentError("wmma_q4_gemm!: need M % 16 == 0, group % 32 == 0, padded N % 64 == 0"))
     Bv = reinterpret(WMMA_V8H, B)
     args = (C, Pv, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing))
-    if M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0"
+    if kind == :auto
+        kind = M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ? :wide :
+               M % 128 == 0 && Npad % 128 == 0 && get(ENV, "LUMINAL_WMMA_BIG", "1") != "0" ? :big : :small
+    end
+    if kind == :wide
         Pw = reinterpret(UInt32, Pv)   # (K/8, M): words of 8 codes
-        @roc groupsize=512 gridsize=(Npad ÷ 256, M ÷ 128) _wmma_q4_wide_kernel!(
-            C, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(WMMA_Q4_PD[]))
-    elseif M % 128 == 0 && Npad % 128 == 0 && get(ENV, "LUMINAL_WMMA_BIG", "1") != "0"
-        @roc groupsize=256 gridsize=(Npad ÷ 128, M ÷ 128) _wmma_q4_big_kernel!(args..., Val(WMMA_Q4_PD[]))
+        _launch_q4(_wmma_q4_wide_kernel!, (C, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd)),
+                   512, (Npad ÷ 256, M ÷ 128), wpe)
+    elseif kind == :big
+        _launch_q4(_wmma_q4_big_kernel!, (args..., Val(pd)), 256, (Npad ÷ 128, M ÷ 128), wpe)
     else
         @roc groupsize=128 gridsize=(Npad ÷ 64, cld(M, 64)) _wmma_q4_kernel!(args...)
     end

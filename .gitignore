@@ -10,3 +10,4 @@
 /llama32_1b_instruct/
 /gemma3_4b/
 /qwen36_27b/
+benchmarks/sweep_env/Manifest.toml
