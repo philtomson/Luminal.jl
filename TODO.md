@@ -826,3 +826,13 @@ Measured (LDS flash prefill kernel, 32.5k / 130.8k keys): 18.2 -> 17.1 ms and 76
 is not the main gap to gufo. The kernel keeps its 64 Q registers in scratch (~290 B) because it needs more than the cap allows; unrolling the
 loop so Q stays in registers made it slower even with 256 VGPRs (more live ranges, still 240 B of scratch), so that needs a different register
 plan (e.g. Q read from LDS per step, or fewer live accumulators), not just a bigger cap.
+
+### Where a prefill chunk's GPU time goes (27B slice, 8 layers, chunk 256, short context; rocprofv3, GPU 94% busy) and what fusion can buy
+`_wmma_q4_wide_kernel_` (int4 GEMM) 56.4% (1.14 ms avg per call), `_delta_rule_reg_kernel_` 26.0% (4.37 ms per call, 48 recurrent layers x 256
+tokens), the other int4 matmuls 4.2% (lm_head etc.), then elementwise broadcasts ~6%, copies ~3%, fills ~1%, RMSNorm ~1%. A full 64-layer
+chunk is ~800 ms (317 tok/s); gufo's whole chunk is ~390 ms (656 tok/s), so our GEMMs alone (~450 ms) are slower than their entire chunk.
+The earlier "16% in small kernels" figure was wrong: LUMINAL_TRACE_TIME synchronizes and charges allocation to each op (an 8-layer slice shows
+`Add (5120,256)` at 2.7 ms each; the kernel is 48 us). The biggest elementwise kernel (SwiGLU multiply, 4.4M elements, 235 us) already runs
+at ~225 GB/s, so fusion only removes traffic: the realistic gain from fusing every small op (residual+RMSNorm, SwiGLU into the GEMM
+epilogue, copies) is ~5-7%. Larger: the delta-rule kernel (26%; gufo fuses conv + recurrence + post-norm/gate + int8 quantization in one
+kernel but its recurrence is also token-serial) and the GEMM (gufo ~1.5x faster: int8 WMMA with quantized activations).
