@@ -83,6 +83,7 @@ function (cg::CompiledGraph)(inputs::Dict; sym_vals::Dict{Symbol, Int} = Dict{Sy
             _run_timed(cg, device, sym_vals, live_counts)
             return
         end
+        _scope_hold()
         for step in cg.steps
             step(cg.results, device, sym_vals, live_counts)
         end
@@ -105,11 +106,16 @@ function _run_traced(cg, device, sym_vals, live_counts)
     pool = AMDGPU.HIP.memory_pool(AMDGPU.device())
     nodes = get(cg.cache, :step_nodes, Int[])
     rows = Tuple{Int, Float64, Float64}[]            # (node, bytes before, bytes after)
+    hidden = Tuple{Int, Float64}[]
     for (i, step) in enumerate(cg.steps)
-        AMDGPU.synchronize(); b = AMDGPU.HIP.used_memory(pool)
+        AMDGPU.synchronize(); b = AMDGPU.HIP.used_memory(pool); _CUR_STEP[] = i; r0 = _REL_BYTES[]
         step(cg.results, device, sym_vals, live_counts)
         AMDGPU.synchronize(); a = AMDGPU.HIP.used_memory(pool)
         push!(rows, (get(nodes, i, 0), b, a))
+        n = get(nodes, i, 0)
+        outb = n != 0 && isassigned(cg.results, n) && cg.results[n] isa AnyGPUArray && !(cg.results[n] isa SubArray) ? length(cg.results[n]) * sizeof(eltype(cg.results[n])) : 0
+        hid = (a - b) + (_REL_BYTES[] - r0) - outb      # allocated by this step beyond its output and not returned to the pool
+        n != 0 && push!(hidden, (n, hid))
     end
     by = Dict{String, Vector{Float64}}()
     for (n, b, a) in rows
@@ -122,6 +128,45 @@ function _run_traced(cg, device, sym_vals, live_counts)
     println("[trace] results still assigned: ", length(left), " GPU arrays, ",
             round(sum(length(x) * sizeof(eltype(x)) for (_, x) in left; init = 0) / 2^30, digits = 2), " GB logical;  nodes with live count > 0: ",
             count(>(0), live_counts))
+    let h = Dict{String, Vector{Float64}}()
+        for id in eachindex(cg.results)
+            (isassigned(cg.results, id) && cg.results[id] isa AnyGPUArray && !haskey(cg.graph.tensors, (id, 1))) || continue
+            k = string(typeof(cg.graph.nodes[id].op).name.name, " ",haskey(cg.graph.tensors, (id, 1)) ? "weight" : "")
+            v = get!(h, k, zeros(2)); v[1] += 1; v[2] += length(cg.results[id]) * sizeof(eltype(cg.results[id]))
+        end
+        for (k, v) in sort(collect(h); by = x -> -x[2][2])[1:min(10, end)]
+            println("[trace]   still assigned (non-weight): ", rpad(k, 22), Int(v[1]), " arrays ", round(v[2] / 2^30, digits = 2), " GB")
+        end
+    end
+    for (n, hb) in first(sort(filter(x -> x[2] > 1e6 && x[2] < 1e12, hidden); by = x -> -x[2]), 10)
+        nd = cg.graph.nodes[n]
+        println("[trace]   hidden ", round(hb / 2^20), " MB  node ", n, " ", typeof(nd.op).name.name, "  inputs ",
+                join((try string(Tuple(realized_dims(x[3]))) catch; "?" end for x in nd.inputs), " "), "  out dims ",
+                try string(size(cg.results[n])) catch; "?" end)
+    end
+    let h = Dict{String, Vector{Float64}}()
+        for (n, hb) in hidden
+            hb > 1e6 || continue
+            v = get!(h, string(typeof(cg.graph.nodes[n].op).name.name), zeros(2)); v[1] += hb; v[2] += 1
+        end
+        for (k, v) in sort(collect(h); by = x -> -x[2][1])[1:min(8, end)]
+            println("[trace]   hidden allocation: ", rpad(k, 16), Int(v[2]), " steps, ", round(v[1] / 2^20), " MB")
+        end
+    end
+    let rel = Dict(id => s for (id, s) in _REL_LOG)
+        println("[trace] long-lived allocations (>4 MB, released >6 steps later): step node op  MB  released-at-step")
+        for (i, (n, b, a)) in enumerate(rows)
+            (a - b > 4 * 2^20 && n != 0 && (get(rel, n, typemax(Int)) - i > 6)) || continue
+            println("[trace]   ", lpad(i, 4), " ", lpad(n, 5), " ", rpad(string(typeof(cg.graph.nodes[n].op).name.name), 12), lpad(round((a - b) / 2^20, digits = 0), 6), "  ", get(rel, n, "never"))
+        end
+    end
+    let pk = argmax([r[3] for r in rows])
+        println("[trace] peak ", round(rows[pk][3] / 2^30, digits = 2), " GB live at step ", pk, " of ", length(rows), " (node ", rows[pk][1], ")")
+        for q in (0.25, 0.5, 0.75)
+            i = max(1, round(Int, q * length(rows)))
+            println("[trace]   live after step ", i, ": ", round(rows[i][3] / 2^30, digits = 2), " GB")
+        end
+    end
     println("[trace] start ", round(rows[1][2] / 2^30, digits = 2), " GB live, end ", round(rows[end][3] / 2^30, digits = 2),
             " GB live (", length(rows), " steps)")
     for (k, v) in sort(collect(by); by = x -> -x[2][2])[1:min(10, end)]
@@ -155,15 +200,41 @@ function _run_timed(cg, device, sym_vals, live_counts)
     end
 end
 
+# Derived arrays (reshape / reinterpret / views realized for an op's arguments) each hold a reference to the device
+# buffer until they are finalized, so a buffer the executor frees explicitly stayed allocated until the GC ran: a
+# 512-token chunk of the 27B peaked at +12 GB. With the AMDGPU.jl launch-bounds branch (`DERIVE_SCOPE`) the arrays
+# an op's step derives are recorded and their references dropped as soon as the step is done.
+@static if isdefined(AMDGPU, :DERIVE_SCOPE)
+    _scope_begin() = (v = Any[]; AMDGPU.DERIVE_SCOPE[] = v; v)
+    _scope_hold() = (AMDGPU.DERIVE_SCOPE[] = nothing; nothing)       # arrays derived now are kept (aliases stored in `res`)
+    _scope_resume(v) = (AMDGPU.DERIVE_SCOPE[] = v; nothing)
+    function _scope_end!(v)
+        AMDGPU.DERIVE_SCOPE[] = nothing
+        for a in v
+            GPUArrays.unsafe_free!(a)
+        end
+        return nothing
+    end
+else
+    _scope_begin() = nothing
+    _scope_hold() = nothing
+    _scope_resume(v) = nothing
+    _scope_end!(v) = nothing
+end
+
 # Drop a dead intermediate. Buffers the graph allocated itself (`owned`) are
 # returned to the GPU pool right away instead of waiting for a GC finalizer.
+const _CUR_STEP = Ref(0)
+const _REL_BYTES = Ref(0)            # bytes released through _release! (LUMINAL_TRACE_MEM)
+const _REL_LOG = Tuple{Int,Int}[]    # (node, step) of each release (LUMINAL_TRACE_MEM)
 const _RELEASE_STATS = zeros(Int, 4)    # calls, owned GPU buffers freed, bytes freed, not owned (left to the GC)
 function _release!(res, id, owned)
     buf = res[id]
     res[id] = nothing
+    push!(_REL_LOG, (id, _CUR_STEP[]))
     _RELEASE_STATS[1] += 1
     if owned[id] && buf isa AnyGPUArray
-        _RELEASE_STATS[2] += 1; _RELEASE_STATS[3] += length(buf) * sizeof(eltype(buf))
+        _RELEASE_STATS[2] += 1; _RELEASE_STATS[3] += length(buf) * sizeof(eltype(buf)); _REL_BYTES[] += length(buf) * sizeof(eltype(buf))
         GPUArrays.unsafe_free!(buf)
     else
         _RELEASE_STATS[4] += 1
@@ -377,13 +448,14 @@ function op_to_sym(op, inputs, T=Float32)
 end
 
 # Helper to build a symbolic expression for a fusion group recursively
-function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, current_st)
+function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, current_st, uses=nothing)
     node = graph.nodes[node_id]
     op = node.op
     op isa Luminal.Constant && return op.value  # inline as a literal (of its dtype)
 
     # If this node is NOT a fusible intermediate, it's a leaf for THIS fusion group
     if !(node_id in fusible_intermediates)
+        uses === nothing || (uses[node_id] = get(uses, node_id, 0) + 1)   # one use of this buffer by the group (it may read it several times)
         input_key = (node_id, current_st)
         if haskey(sym_cache, input_key)
             return sym_cache[input_key]
@@ -396,7 +468,7 @@ function build_fused_expr!(graph, node_id, consumer_count, group_inputs, fusible
 
     input_syms = []
     for (in_id, _, in_st) in node.inputs
-        push!(input_syms, build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st))
+        push!(input_syms, build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st, uses))
     end
 
     return op_to_sym(op, input_syms, graph.dtypes[node_id])
@@ -848,10 +920,13 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             backing = Ref{Any}(nothing)
             push!(step_nodes, node_id)
             push!(steps, (res, dev, sym_vals, live) -> begin
+                scope = _scope_begin()
                 x = realize_view(res[xid], sts[1])
+                r = realize_view(res[rid], sts[2])
+                _scope_hold()
                 _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, dty[node_id];
                                  zero=!_gemm_writes_all(res[wid], x))
-                r = realize_view(res[rid], sts[2])
+                _scope_resume(scope)
                 Luminal.matmul_residual!(res[node_id], mop, res[wid], x, r)
                 for id in (wid, xid, rid)
                     live[id] -= 1
@@ -859,6 +934,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         _release!(res, id, owned)
                     end
                 end
+                _scope_end!(scope)
             end)
             processed[node_id] = true
             continue
@@ -956,7 +1032,9 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 run_op = static === nothing ? evaluate_op_shapes(op, sym_vals) : static.op
 
                 # 1. Realize input views
+                scope = _scope_begin()
                 step_args = [realize_view(res[id], in_sts[k]) for (k, (id, _, _)) in enumerate(input_specs)]
+                _scope_hold()
 
                 # 2. Alias or allocate the output
                 alias = nothing
@@ -982,6 +1060,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 end
 
                 # 3. Execute
+                _scope_resume(scope)
                 alias === nothing && execute_op!(res[node_id], run_op, step_args...)
 
                 # 4. Free dead inputs
@@ -991,6 +1070,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         _release!(res, id, owned)
                     end
                 end
+                _scope_end!(scope)
             end)
             processed[node_id] = true
         else
@@ -998,7 +1078,8 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 # Terminal of a fusion group: one broadcast kernel for the whole group
                 group_inputs = [] # (id, st, sym)
                 sym_cache = Dict{Any, Any}()
-                input_syms = [build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st)
+                leaf_uses = Dict{Int, Int}()   # buffer id => how many times the group reads it (each is one consumer of it)
+                input_syms = [build_fused_expr!(graph, in_id, consumer_count, group_inputs, fusible_intermediates, sym_cache, in_st, leaf_uses)
                               for (in_id, _, in_st) in node.inputs]
                 node_expr = fix_gpu_ast!(toexpr(op_to_sym(op, input_syms, dty[node_id])))
                 fused_op = Luminal.FusedElementwiseOp("fused_$node_id", _fused_kernel(node_expr, length(group_inputs), dty[node_id]))
@@ -1020,18 +1101,22 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 push!(step_nodes, node_id)
                 push!(steps, (res, dev, sym_vals, live) -> begin
                     in_sts = static === nothing ? [evaluate_shapes(st, sym_vals) for (_, st, _) in group_inputs] : static.in_sts
+                    scope = _scope_begin()
                     args = [align_rank(realize_view(res[id], in_sts[k]), target_rank) for (k, (id, _, _)) in enumerate(group_inputs)]
+                    _scope_hold()
                     dims_int = static === nothing ? map(d -> eval_dim(d, sym_vals), realized_dims(node_shape)) : static.dims
                     _prepare_output!(res, node_id, Tuple(dims_int), dev, backing, owned, free_intermediates, dty[node_id]; zero=false)
 
+                    _scope_resume(scope)
                     Base.invokelatest(execute_op!, res[node_id], fused_op, args...)
 
-                    for (id, _, _) in group_inputs
-                        live[id] -= 1
+                    for (id, nuse) in leaf_uses
+                        live[id] -= nuse
                         if free_intermediates && live[id] == 0 && !persistent[id]
                             _release!(res, id, owned)
                         end
                     end
+                    _scope_end!(scope)
                 end)
                 processed[node_id] = true
             end

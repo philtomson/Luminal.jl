@@ -294,8 +294,17 @@ end
 # to all of it (`chunk_attention!`). Memory stays at one chunk's intermediates (~32 MB per token) whatever
 # the prompt length, and the cost stays linear in the recurrent layers. Float16 cache, batch 1, Qwen3.5.
 # (a young-generation GC is enough and ~10x cheaper than a full one; LUMINAL_CHUNK_GC=full for the full collection)
-_chunk_reclaim!(device) = get(ENV, "LUMINAL_CHUNK_GC", "") == "full" ? Luminal.reclaim!(device) :
-                          (GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim(); nothing)
+# With the launch-bounds AMDGPU.jl branch (`DERIVE_SCOPE`) the graph drops every dead intermediate and the
+# derived arrays of each step itself, so a chunk leaves ~0.05 GB behind and no collection is needed between
+# chunks. Otherwise (stock AMDGPU.jl) a young-generation GC is enough and ~10x cheaper than a full one.
+# LUMINAL_CHUNK_GC=none|young|full overrides.
+function _chunk_reclaim!(device)
+    mode = get(ENV, "LUMINAL_CHUNK_GC", isdefined(AMDGPU, :DERIVE_SCOPE) ? "none" : "young")
+    mode == "full" && return Luminal.reclaim!(device)
+    mode == "none" && return nothing
+    GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim()
+    return nothing
+end
 _chunk_capture() = get(ENV, "LUMINAL_CHUNK_CAPTURE", "0") == "1"
 _chunk_reuse() = _chunk_capture() || get(ENV, "LUMINAL_CHUNK_REUSE", "0") == "1"
 prefill_chunk() = parse(Int, get(ENV, "LUMINAL_PREFILL_CHUNK", "512"))
