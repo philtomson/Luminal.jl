@@ -795,3 +795,21 @@ pipelining (issue QK of tile kt+1 before softmax+PV of tile kt; needs the split 
 tile in LDS cooperatively (coalesced loads, shared by the 4 waves and, with GQA, by several heads) like the int4 GEMM does, which also
 removes the per-chunk V transpose; (4) ISA-level control of registers/occupancy (waves-per-EU), which AMDGPU.jl does not expose here.
 Realistic ceiling from occupancy/tail alone is ~25-30% of attention time; more needs the LDS-staged design.
+
+### Flash prefill attention through LDS (done) -- `_flash_prefill_lds!` in `src/FlashAttn.jl`
+Port of the design in gufo's `WmmaCausalAttention` (`~/devel/AI/gufo/src/models/qwen/hip/kernels/attention_wmma.hip`; its header
+comments are worth reading: each choice was found by ablation). 256 threads = 8 waves, 64 rows per block (2 query heads of the same
+KV head x 32 queries), one 16-key tile per iteration: wave w computes the 16x16 score tile of row block w%4 over dim half w/4 (Q in
+registers), the two halves are summed in the softmax (4 threads per row, from LDS), O += P V with wave w owning dim tiles w and w+8.
+K tile coalesced into padded LDS, V tile one key per lane and written TRANSPOSED to LDS, the next tile's K/V prefetched into registers
+right after the K staging barrier. 16-byte LDS fragment reads from Float16 arrays go through `unsafe_load` on an `LLVMPtr{WMMA_V8H,3}`
+(`_lds_frag`). It reads the KV cache directly (no V transpose pass: `_vtranspose_kernel!` stays only for the fallback), also for
+`flash_prefill!`; the Int8 cache path dequantizes V in the K layout. Needs D % 128 == 0 and an even number of query heads per KV head;
+otherwise the old kernel runs.
+Microbenchmark (D=256, H=24, KVH=4, S=256): 32.5k keys 39.7 -> 19.2 ms (10.7 TFLOP/s), 130.8k keys 178 -> 77 ms; rel err vs CPU
+2e-4..5e-4. 27B 32k prefill 234.9 -> 256.3 tok/s (136 -> 125 s), chunked logits still identical to one-shot.
+What the investigation before it found (kept for reference): the old kernel was latency-bound with 184 VGPRs, tail round of 32 workgroups
+(192 > 160 resident), every K/V fragment read from global memory by every wave; splitting QK across the wave pair, `@inbounds`, 128-byte
+loads, unrolling and staging K alone in LDS (-11% at 130k, nothing at 32k) did not help; the gufo structure did. Gufo reports ~20 TFLOP/s
+for its kernel on this chip; ours is at ~11, so there is probably more (its 16-key tile also avoids the cross-wave max exchange; the
+causal-tail exactness fix and `__launch_bounds__(256, 2)` occupancy control are things we do not have).

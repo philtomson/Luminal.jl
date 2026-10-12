@@ -106,14 +106,16 @@ function quantize_kv!(dst::ROCArray{Int8,4}, src, n::Int, b::Int)
     return dst
 end
 
-# The int8 cache's first NK slots as Float16: kt (D, NKpad, KVH) and V transposed vt (NKpad, D, KVH)
-function _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK)
+# The int8 cache's first NK slots as Float16: kt (D, NKpad, KVH) and V as vt, transposed (NKpad, D, KVH) when `::Val{true}`,
+# else (D, NKpad, KVH) like kt
+function _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK, ::Val{TR}) where {TR}
     i = (workgroupIdx().x - 1) * workgroupDim().x + workitemIdx().x - 1
     D = size(kt, 1); KVH = size(kt, 3)
     i < D * NK * KVH || return
     d = i % D; key = (i ÷ D) % NK; kvh = i ÷ (D * NK)
     @inbounds kt[d + 1, key + 1, kvh + 1, 1] = Float16(Float32(pk[d + 1, key + 1, kvh + 1, 1]) * ksc[D ÷ 4 + 1, key + 1, kvh + 1, 1])
-    @inbounds vt[key + 1, d + 1, kvh + 1, 1] = Float16(Float32(pv[d + 1, key + 1, kvh + 1, 1]) * vsc[D ÷ 4 + 1, key + 1, kvh + 1, 1])
+    vv = Float16(Float32(pv[d + 1, key + 1, kvh + 1, 1]) * vsc[D ÷ 4 + 1, key + 1, kvh + 1, 1])
+    TR ? (@inbounds vt[key + 1, d + 1, kvh + 1, 1] = vv) : (@inbounds vt[d + 1, key + 1, kvh + 1, 1] = vv)
     return
 end
 

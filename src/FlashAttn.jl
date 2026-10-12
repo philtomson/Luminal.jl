@@ -103,6 +103,157 @@ function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, qoff, ::Val{NT
     return
 end
 
+# Flash prefill attention with K and V staged in LDS (design after gufo's WmmaCausalAttention, ported to Julia).
+# Block = 256 threads = 8 waves, 64 rows = 2 query heads (sharing a KV head) x 32 queries, one 16-key tile per iteration:
+#   S = Q K^T: wave w computes the 16x16 score tile of row block rb = w % 4 over the dim half w ÷ 4 (Q fragments stay in registers);
+#   the two halves are summed by the softmax reader (LDS); softmax: 4 threads per row; O += P V: wave w owns dim tiles w and w + 8
+#   for all 4 row blocks. K tile: coalesced into padded LDS; V tile: one key per lane, written TRANSPOSED to LDS (V^T[d][key]).
+#   The next tile's K/V are loaded into registers right after the K staging barrier.
+@inline function _lds_frag(arr, i)           # 16 contiguous Float16 starting at 1-based element i (a multiple of 8) -> WMMA fragment
+    p = reinterpret(Core.LLVMPtr{WMMA_V8H,3}, pointer(arr))
+    a = unsafe_load(p, (i - 1) ÷ 8 + 1, Val(16)); b = unsafe_load(p, (i - 1) ÷ 8 + 2, Val(16))
+    return _wmma_cat(a, b)
+end
+
+function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
+    D = 32 * NT; NC = D ÷ 8                   # 16-byte chunks per key row
+    KS = NT                                   # k steps (16 dims) per wave of the S phase: half of D / 16
+    DT = NT ÷ 4                               # output dim tiles per wave (D / 16 / 8) = V chunks per thread
+    KR = NC ÷ 16                              # K chunks per thread: 16 keys x NC chunks / 256 threads
+    tid = workitemIdx().x - 1
+    lane = tid % 32; sub = lane % 16; half_id = lane ÷ 16; wave = tid ÷ 32
+    qblk = workgroupIdx().x - 1; hp = workgroupIdx().y - 1
+    npair = H ÷ 2
+    b = hp ÷ npair; pair = hp % npair
+    first_head = 2 * pair; kvh = first_head ÷ (H ÷ KVH)
+    query_start = qblk * 32
+    NK = qoff + S
+    max_visible = min(NK, qoff + query_start + 32)
+    ntile = cld(max_visible, 16)
+    s_tile = wave % 4; s_kh = wave ÷ 4         # this wave's score tile (row block) and dim half
+    s_head = first_head + s_tile % 2; s_qoff = (s_tile ÷ 2) * 16
+
+    Ks = @ROCStaticLocalArray(WMMA_V8H, (NC + 1, 16), false)
+    Vt = @ROCStaticLocalArray(Float16, (24, D), false)
+    s_lds = @ROCStaticLocalArray(Float32, (17, 16, 4, 2), false)
+    p_lds = @ROCStaticLocalArray(Float16, (24, 64), false)
+    row_scale = @ROCStaticLocalArray(Float32, (64,), false)
+    row_sum = @ROCStaticLocalArray(Float32, (64,), false)
+
+    @inbounds begin
+    qrow = min(query_start + s_qoff + sub, S - 1)
+    qf = ntuple(Val(KS)) do ks
+        c = 2 * (s_kh * KS + ks - 1)
+        _wmma_cat(Qv[c + 1, qrow + 1, s_head + 1, b + 1], Qv[c + 2, qrow + 1, s_head + 1, b + 1])
+    end
+    oacc = ntuple(_ -> _wmma_zero(), Val(4 * DT))
+    running_max = -Inf32; running_sum = 0f0
+    zero8 = ntuple(_ -> VecElement(Float16(0)), Val(8))
+
+    v_key = lane % 16; v_slice = (tid ÷ 16) * DT                 # V: lane's key, and the first of its DT chunks
+    # first tile's K and V
+    kcur = ntuple(n -> (idx = tid + 256 * (n - 1); Kc[idx % NC + 1, min(idx ÷ NC, NK - 1) + 1, kvh + 1, b + 1]), Val(KR))
+    vlive = v_key < NK
+    vcur = ntuple(j -> vlive ? Vc[v_slice + j, v_key + 1, kvh + 1, b + 1] : zero8, Val(DT))
+
+    for kt in 0:ntile - 1
+        key_start = kt * 16
+        sync_workgroup()
+        for n in 1:KR
+            idx = tid + 256 * (n - 1)
+            Ks[idx % NC + 1, idx ÷ NC + 1] = kcur[n]
+        end
+        sync_workgroup()
+        # prefetch the next tile (clamped, harmless past the end)
+        nstart = key_start + 16
+        kpre = ntuple(n -> (idx = tid + 256 * (n - 1); Kc[idx % NC + 1, min(nstart + idx ÷ NC, NK - 1) + 1, kvh + 1, b + 1]), Val(KR))
+        nkey = nstart + v_key; nlive = nkey < NK
+        vpre = ntuple(j -> nlive ? Vc[v_slice + j, nkey + 1, kvh + 1, b + 1] : zero8, Val(DT))
+        # S = Q K^T over this wave's half of the dims
+        s_acc = _wmma_zero()
+        for ks in 0:KS - 1
+            c = 2 * (s_kh * KS + ks)
+            kf = _wmma_cat(Ks[c + 1, sub + 1], Ks[c + 2, sub + 1])
+            s_acc = _wmma16(qf[ks + 1], kf, s_acc)
+        end
+        for i in 0:7
+            s_lds[sub + 1, 2i + half_id + 1, s_tile + 1, s_kh + 1] = s_acc[i + 1].value
+        end
+        sync_workgroup()
+        # online softmax: 4 threads per row, 4 keys each
+        rg = tid ÷ 4; seg = tid % 4
+        rb = rg ÷ 16; row = rg % 16
+        lq = query_start + (rb ÷ 2) * 16 + row
+        v0 = -Inf32; v1 = -Inf32; v2 = -Inf32; v3 = -Inf32
+        col = seg * 4
+        t4 = col ÷ 16; cc = col % 16
+        base_valid = lq < S
+        kpos = key_start + col
+        qabs = qoff + lq
+        sv(m) = (base_valid && kpos + m <= qabs) ? (s_lds[cc + m + 1, row + 1, rb + 1, 1] + s_lds[cc + m + 1, row + 1, rb + 1, 2]) * scale2 : -Inf32
+        v0 = sv(0); v1 = sv(1); v2 = sv(2); v3 = sv(3)
+        pmax = max(max(v0, v1), max(v2, v3))
+        pmax = max(pmax, AMDGPU.Device.shfl_xor(pmax, Cint(1)))
+        pmax = max(pmax, AMDGPU.Device.shfl_xor(pmax, Cint(2)))
+        nmax = max(running_max, pmax)
+        prior = isfinite(running_max) ? exp2(running_max - nmax) : 0f0
+        w0 = isfinite(v0) ? exp2(v0 - nmax) : 0f0; w1 = isfinite(v1) ? exp2(v1 - nmax) : 0f0
+        w2 = isfinite(v2) ? exp2(v2 - nmax) : 0f0; w3 = isfinite(v3) ? exp2(v3 - nmax) : 0f0
+        p_lds[col + 1, rg + 1] = Float16(w0); p_lds[col + 2, rg + 1] = Float16(w1)
+        p_lds[col + 3, rg + 1] = Float16(w2); p_lds[col + 4, rg + 1] = Float16(w3)
+        psum = (w0 + w1) + (w2 + w3)
+        psum += AMDGPU.Device.shfl_xor(psum, Cint(1)); psum += AMDGPU.Device.shfl_xor(psum, Cint(2))
+        running_max = nmax
+        running_sum = running_sum * prior + psum
+        seg == 0 && (row_scale[rg + 1] = prior)
+        sync_workgroup()
+        # rescale the output accumulators
+        oacc = let o = oacc
+            ntuple(Val(4 * DT)) do n
+                rbn = (n - 1) ÷ DT
+                _fa_scale8(o[n], ntuple(i -> row_scale[rbn * 16 + 2 * (i - 1) + half_id + 1], Val(8)))
+            end
+        end
+        # stage V transposed: V^T[d][key], this thread's key and its 16 dims
+        for j in 1:DT, i in 0:7
+            Vt[v_key + 1, (v_slice + j - 1) * 8 + i + 1] = vcur[j][i + 1].value
+        end
+        sync_workgroup()
+        # O += P V: dim tiles wave + 8t for all 4 row blocks
+        for t in 0:DT - 1
+            dim = (wave + 8t) * 16 + sub
+            vf = _lds_frag(Vt, dim * 24 + 1)
+            oacc = let o = oacc
+                ntuple(Val(4 * DT)) do n
+                    rbn = (n - 1) ÷ DT; tn = (n - 1) % DT
+                    tn == t ? _wmma16(_lds_frag(p_lds, (rbn * 16 + sub) * 24 + 1), vf, o[n]) : o[n]
+                end
+            end
+        end
+        kcur = kpre; vcur = vpre
+    end
+    tid % 4 == 0 && (row_sum[tid ÷ 4 + 1] = running_sum)
+    sync_workgroup()
+    for n in 1:4 * DT
+        rbn = (n - 1) ÷ DT; tn = (n - 1) % DT
+        head = first_head + rbn % 2
+        for i in 0:7
+            row = 2i + half_id
+            lq = query_start + (rbn ÷ 2) * 16 + row
+            if lq < S
+                den = row_sum[rbn * 16 + row + 1]
+                d = (wave + 8tn) * 16 + sub
+                O[d + 1, lq + 1, head + 1, b + 1] = den > 0f0 ? oacc[n][i + 1].value / den : 0f0
+            end
+        end
+    end
+    end # inbounds
+    return
+end
+
+# The LDS kernel needs D % 128 == 0 (its 8 waves split the output dims in 16-wide tiles) and an even number of query heads per KV head.
+_lds_attn_ok(D, H, KVH) = D % 128 == 0 && H % KVH == 0 && (H ÷ KVH) % 2 == 0
+
 # out (D, S, H, B) Float32 <- attention over q (D, S, H, B), k, v (D, S, KVH, B) (any real eltype,
 # arrays or views); D % 32 == 0, S >= 1.
 function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
@@ -111,13 +262,21 @@ function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
         throw(ArgumentError("flash_prefill!: need D % 32 == 0 and H % KVH == 0"))
     q16 = similar(out, Float16); q16 .= q
     k16 = similar(out, Float16, D, S, KVH, B); k16 .= k
-    Spad = cld(S, 64) * 64
-    vt = AMDGPU.zeros(Float16, Spad, D, KVH, B)
-    view(vt, 1:S, :, :, :) .= PermutedDimsArray(v, (2, 1, 3, 4))
-    Qv = reinterpret(WMMA_V8H, q16); Kv = reinterpret(WMMA_V8H, k16); Vv = reinterpret(WMMA_V8H, vt)
-    @roc groupsize=128 gridsize=(cld(S, 32), H * B) _flash_prefill_kernel!(
-        out, Qv, Kv, Vv, S, H, KVH, scale * 1.4426950408889634f0, 0, Val(D ÷ 32))
-    AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(k16); AMDGPU.unsafe_free!(vt)
+    scale2 = scale * 1.4426950408889634f0
+    if _lds_attn_ok(D, H, KVH)
+        v16 = similar(out, Float16, D, S, KVH, B); v16 .= v
+        @roc groupsize=256 gridsize=(cld(S, 32), (H ÷ 2) * B) _flash_prefill_lds!(
+            out, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, k16), reinterpret(WMMA_V8H, v16), S, H, KVH, scale2, 0, Val(D ÷ 32))
+        AMDGPU.unsafe_free!(v16)
+    else
+        Spad = cld(S, 64) * 64
+        vt = AMDGPU.zeros(Float16, Spad, D, KVH, B)
+        view(vt, 1:S, :, :, :) .= PermutedDimsArray(v, (2, 1, 3, 4))
+        Qv = reinterpret(WMMA_V8H, q16); Kv = reinterpret(WMMA_V8H, k16); Vv = reinterpret(WMMA_V8H, vt)
+        @roc groupsize=128 gridsize=(cld(S, 32), H * B) _flash_prefill_kernel!(out, Qv, Kv, Vv, S, H, KVH, scale2, 0, Val(D ÷ 32))
+        AMDGPU.unsafe_free!(vt)
+    end
+    AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(k16)
     return out
 end
 
@@ -184,22 +343,34 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
         pos = posh[length(posh) == 1 ? 1 : b]
         NK = pos + S
         q16 = AMDGPU.zeros(Float16, D, S, H, 1); q16 .= q
-        Spad = cld(NK, 64) * 64
-        vt = AMDGPU.zeros(Float16, Spad, D, KVH, 1)
-        kt = pk
-        if q8                                   # attend to the dequantized cache (the same values the decode kernel uses)
-            kt = AMDGPU.zeros(Float16, D, Spad, KVH, 1)
-            @roc groupsize=256 gridsize=cld(D * NK * KVH, 256) _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK)
-        else
-            @roc groupsize=(32, 8) gridsize=(cld(NK, 32), cld(D, 32), KVH) _vtranspose_kernel!(vt, pv, NK)
-        end
-        Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, kt); Vv = reinterpret(WMMA_V8H, vt)
         ob = AMDGPU.zeros(Float32, D, S, H, 1)
-        @roc groupsize=128 gridsize=(cld(S, 32), H) _flash_prefill_kernel!(
-            ob, Qv, Kb, Vv, S, H, KVH, scale * 1.4426950408889634f0, pos, Val(D ÷ 32))
+        scale2 = scale * 1.4426950408889634f0
+        if _lds_attn_ok(D, H, KVH)
+            kt, vd = pk, pv                        # the cache itself: the kernel stages K and V tiles through LDS
+            if q8                                   # attend to the dequantized cache (the same values the decode kernel uses)
+                kt = AMDGPU.zeros(Float16, D, NK, KVH, 1); vd = AMDGPU.zeros(Float16, D, NK, KVH, 1)
+                @roc groupsize=256 gridsize=cld(D * NK * KVH, 256) _kv_dequant_kernel!(kt, vd, pk, pv, ksc, vsc, NK, Val(false))
+            end
+            @roc groupsize=256 gridsize=(cld(S, 32), H ÷ 2) _flash_prefill_lds!(
+                ob, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, kt), reinterpret(WMMA_V8H, vd), S, H, KVH, scale2, pos, Val(D ÷ 32))
+            q8 && (AMDGPU.unsafe_free!(kt); AMDGPU.unsafe_free!(vd))
+        else
+            Spad = cld(NK, 64) * 64
+            vt = AMDGPU.zeros(Float16, Spad, D, KVH, 1)
+            kt = pk
+            if q8
+                kt = AMDGPU.zeros(Float16, D, Spad, KVH, 1)
+                @roc groupsize=256 gridsize=cld(D * NK * KVH, 256) _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK, Val(true))
+            else
+                @roc groupsize=(32, 8) gridsize=(cld(NK, 32), cld(D, 32), KVH) _vtranspose_kernel!(vt, pv, NK)
+            end
+            Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, kt); Vv = reinterpret(WMMA_V8H, vt)
+            @roc groupsize=128 gridsize=(cld(S, 32), H) _flash_prefill_kernel!(
+                ob, Qv, Kb, Vv, S, H, KVH, scale2, pos, Val(D ÷ 32))
+            AMDGPU.unsafe_free!(vt); q8 && AMDGPU.unsafe_free!(kt)
+        end
         o4 .= PermutedDimsArray(ob, (1, 3, 2, 4))
-        AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(vt); AMDGPU.unsafe_free!(ob)
-        q8 && AMDGPU.unsafe_free!(kt)
+        AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(ob)
     end
     return true
 end
