@@ -62,4 +62,16 @@ else
             end
         end
     end
+
+    @testset "V prefix transpose (chunk attention)" begin
+        for (D, T, KVH, NK) in ((256, 700, 4, 600), (128, 300, 2, 257), (64, 129, 1, 1), (32, 64, 3, 64))
+            pv = ROCArray(Float16.(randn(Float32, D, T, KVH, 1)))
+            Spad = cld(NK, 64) * 64
+            vt = AMDGPU.zeros(Float16, Spad, D, KVH, 1)
+            @roc groupsize=(32, 8) gridsize=(cld(NK, 32), cld(D, 32), KVH) Luminal._vtranspose_kernel!(vt, pv, NK)
+            ref = zeros(Float16, Spad, D, KVH, 1)
+            ref[1:NK, :, :, :] .= PermutedDimsArray(Array(pv)[:, 1:NK, :, :], (2, 1, 3, 4))
+            @test Array(vt) == ref
+        end
+    end
 end

@@ -140,6 +140,29 @@ function causal_attention_ref(q, k, v, scale::Float32)
 end
 
 
+# vt[s, d, h] = pv[d, s, h] for s <= NK: the V prefix transposed to (keys, D) for `_flash_prefill_kernel!`, through a 32x32 LDS tile
+# (reads contiguous along d, writes contiguous along s). Groups of 32x8 threads; grid (key tiles, D tiles, KV heads).
+function _vtranspose_kernel!(vt, pv, NK)
+    D = size(pv, 1)
+    tx = workitemIdx().x - 1; ty = workitemIdx().y - 1
+    s0 = (workgroupIdx().x - 1) * 32; d0 = (workgroupIdx().y - 1) * 32; h = workgroupIdx().z
+    tile = @ROCStaticLocalArray(Float16, (33, 32), false)
+    for j in 0:8:24
+        d = d0 + tx + 1; s = s0 + ty + j + 1
+        if d <= D && s <= NK
+            @inbounds tile[tx + 1, ty + j + 1] = pv[d, s, h, 1]
+        end
+    end
+    sync_workgroup()
+    for j in 0:8:24
+        s = s0 + tx + 1; d = d0 + ty + j + 1
+        if d <= D && s <= NK
+            @inbounds vt[s, d, h, 1] = tile[ty + j + 1, tx + 1]
+        end
+    end
+    return
+end
+
 # Attention of a chunk of S new tokens (a prefill chunk) over the cache: the chunk's K/V are written to
 # slots pos + 1.. of the Float16 cache pk/pv (D, T, KVH, B) first, then query i attends to slots 1..pos + i.
 # q (D, S, H, B) Float32; writes out (D, H, S, B). Sequence b's pos is read from posv on the host (a chunk is
@@ -168,7 +191,7 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
             kt = AMDGPU.zeros(Float16, D, Spad, KVH, 1)
             @roc groupsize=256 gridsize=cld(D * NK * KVH, 256) _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK)
         else
-            view(vt, 1:NK, :, :, :) .= PermutedDimsArray(view(pv, :, 1:NK, :, :), (2, 1, 3, 4))
+            @roc groupsize=(32, 8) gridsize=(cld(NK, 32), cld(D, 32), KVH) _vtranspose_kernel!(vt, pv, NK)
         end
         Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, kt); Vv = reinterpret(WMMA_V8H, vt)
         ob = AMDGPU.zeros(Float32, D, S, H, 1)

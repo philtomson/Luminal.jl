@@ -756,3 +756,21 @@ both). But the gain is small: MTP time over 54 cycles 915 -> 852 ms (about 1.2 m
 was not what the chain costs; each step is dominated by the work itself (the vocabulary head, 248k rows, is the biggest weight).
 Next for a cheaper chain: `draft_vocab` (restricted head, already an option; its acceptance cost is untested at 3 drafts), or
 a smaller/int4 head for the draft only.
+
+### 128K context on the 27B (int4, chunk 256) and a prefill profile
+Decode step by context, random K/V fill (examples/qwen35_context_bench.jl), plain / verify-3 step in ms, Float16 -> Int8 KV:
+1k 100/109 -> 99/107; 32k 94/106 -> 90/102; 65k 105/119 -> 99/113; 100k 116/133 -> 107/126; 131k 126/146 -> 116/137 (7.9 -> 8.7 tok/s plain).
+Real 130K-token prompt (repo sources + notes, then "Create a recursive descent parser in C ...", chat format, 384 new tokens, ndraft=0):
+Int8 KV: prefill 1160 s = 112 tok/s, decode 15.7 tok/s (144 ms verify + 26 ms MTP per cycle, 2.68 tokens/cycle, first drafts 79% accepted),
+min MemAvailable 83.6 GB. Float16 KV: prefill 1224 s = 106 tok/s, decode 15.2 tok/s (156 + 25 ms, 2.76 tokens/cycle), min avail 79.7 GB.
+The two outputs diverge at character 37 ("C89/C90/C99" vs "C89/C99") and both stay coherent; a real quality comparison (perplexity or
+logit error over many positions) is still not done.
+Prefill profile (rocprofv3 --kernel-trace, 32k, Float16 KV): the GPU is 91-94% busy throughout (rocm-smi agrees), so there is no
+launch-gap headroom worth chasing. At 2k context: int4 WMMA GEMM (`_wmma_q4_wide_kernel_`, 1.12 ms avg, ~37 TFLOP/s while running) 57%,
+delta rule 27% (4.3 ms per linear layer per chunk, flat in context), flash prefill 2%. Early -> late in a 32k prefill: GEMM 55% -> 34%,
+flash prefill 6% -> 31% (3 -> 26 ms per call), delta rule 25% -> 16%, broadcast kernels 6% -> 14%.
+Found: `chunk_attention!` rebuilt the transposed V prefix per layer and chunk with a strided broadcast (9 ms at 32k keys, ~10% of the late
+prefill); now a tiled LDS transpose kernel (`_vtranspose_kernel!`, test in tests/test_decode_split.jl). 32k prefill 222 -> 234.9 tok/s,
+chunked logits still identical to one-shot. Remaining ideas: the flash prefill kernel itself is now the main long-context cost (26 ms per call
+at 32k, ~4x that at 128k; it reads K/V from L2 per 32-row query block), the delta-rule kernel (16-25%, serial recurrence), the 231 us
+3-D broadcast kernels late in the prefill (not yet identified), and keeping a persistent transposed V instead of re-transposing the prefix.
