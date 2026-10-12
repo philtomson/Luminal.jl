@@ -305,8 +305,7 @@ function _chunk_reclaim!(device)
     GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim()
     return nothing
 end
-_chunk_capture() = get(ENV, "LUMINAL_CHUNK_CAPTURE", "0") == "1"
-_chunk_reuse() = _chunk_capture() || get(ENV, "LUMINAL_CHUNK_REUSE", "0") == "1"
+_chunk_reuse() = get(ENV, "LUMINAL_CHUNK_REUSE", "0") == "1"
 prefill_chunk() = parse(Int, get(ENV, "LUMINAL_PREFILL_CHUNK", "512"))
 
 function _chunk_graph(s::LlamaSession, C::Int)
@@ -326,9 +325,8 @@ function _chunk_graph(s::LlamaSession, C::Int)
         end
         @info "Compiling prefill chunk graph ($C tokens)..."
         # LUMINAL_CHUNK_REUSE=1: keep every node's buffer between chunks (more memory, no per-op allocation or per-chunk GC)
-        # LUMINAL_CHUNK_CAPTURE=1 (implies reuse): also record the chunk as a HIP graph and replay it
-        capture = _chunk_capture() && s.device isa Luminal.AMDDevice
-        exec = compile(g; device=s.device, retain=retain, weight_dtype=wd, free_intermediates=!(_chunk_reuse() || capture), capture=capture)
+        # (HIP graph capture of the chunk was tried and removed: no faster, see TODO.md)
+        exec = compile(g; device=s.device, retain=retain, weight_dtype=wd, free_intermediates=!_chunk_reuse())
         (exec=exec, idg=idg, cache=dc.cache)
     end
 end
