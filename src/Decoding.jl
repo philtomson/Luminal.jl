@@ -296,6 +296,8 @@ end
 # (a young-generation GC is enough and ~10x cheaper than a full one; LUMINAL_CHUNK_GC=full for the full collection)
 _chunk_reclaim!(device) = get(ENV, "LUMINAL_CHUNK_GC", "") == "full" ? Luminal.reclaim!(device) :
                           (GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim(); nothing)
+_chunk_capture() = get(ENV, "LUMINAL_CHUNK_CAPTURE", "0") == "1"
+_chunk_reuse() = _chunk_capture() || get(ENV, "LUMINAL_CHUNK_REUSE", "0") == "1"
 prefill_chunk() = parse(Int, get(ENV, "LUMINAL_PREFILL_CHUNK", "512"))
 
 function _chunk_graph(s::LlamaSession, C::Int)
@@ -314,7 +316,10 @@ function _chunk_graph(s::LlamaSession, C::Int)
             wd = id -> get(by_id, id, Float32)
         end
         @info "Compiling prefill chunk graph ($C tokens)..."
-        exec = compile(g; device=s.device, retain=retain, weight_dtype=wd)
+        # LUMINAL_CHUNK_REUSE=1: keep every node's buffer between chunks (more memory, no per-op allocation or per-chunk GC)
+        # LUMINAL_CHUNK_CAPTURE=1 (implies reuse): also record the chunk as a HIP graph and replay it
+        capture = _chunk_capture() && s.device isa Luminal.AMDDevice
+        exec = compile(g; device=s.device, retain=retain, weight_dtype=wd, free_intermediates=!(_chunk_reuse() || capture), capture=capture)
         (exec=exec, idg=idg, cache=dc.cache)
     end
 end
@@ -347,14 +352,15 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
             inputs[k_id] = cache.self_cache[i][1]; inputs[v_id] = cache.self_cache[i][2]
         end
-        res = gr.exec(inputs; device=s.device)
+        Luminal.CHUNK_POS_HINT[] = a                    # (see chunk_attention!)
+        res = try gr.exec(inputs; device=s.device) finally Luminal.CHUNK_POS_HINT[] = -1 end
         view(Hall, :, a+1:a+m, :) .= view(res[idg.hidden_id], :, 1:m, :)
         a + m == n && (logits = Array{Float32}(res[idg.logits_id]))
         a += m
         # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per
         # token they would pile up (24 GB per 1024 tokens on the 27B) until it ran
         res = nothing
-        _chunk_reclaim!(s.device)
+        _chunk_reuse() || _chunk_reclaim!(s.device)
     end
     cache.positions .= n
     return logits, Hall

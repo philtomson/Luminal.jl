@@ -338,6 +338,11 @@ end
 # slots pos + 1.. of the Float16 cache pk/pv (D, T, KVH, B) first, then query i attends to slots 1..pos + i.
 # q (D, S, H, B) Float32; writes out (D, H, S, B). Sequence b's pos is read from posv on the host (a chunk is
 # a big step, and this is not captured in a graph).
+# The chunked prefill sets this to the chunk's start position (a host value it already has): `chunk_attention!` then
+# does not read the position back from the device, which synchronized the stream in every full-attention layer
+# (16 pipeline drains per 512-token chunk on the 27B). -1 = not set: read it from `posv`.
+const CHUNK_POS_HINT = Ref(-1)
+
 function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
     D, S, H, B = size(q); KVH = size(pk, 3)
     q8 = pk isa ROCArray{Int8,4} && pv isa ROCArray{Int8,4}
@@ -350,7 +355,7 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
         @roc groupsize=256 gridsize=cld(D * S * KVH * B, 256) _da_write_kernel!(pk, pv, kn, vn, posv, S)
     end
     o4 = Base.reshape(out, D, H, S, B)
-    posh = Int.(round.(Array(posv)))
+    posh = CHUNK_POS_HINT[] >= 0 && length(posv) == 1 ? [CHUNK_POS_HINT[]] : Int.(round.(Array(posv)))
     for b in 1:B
         pos = posh[length(posh) == 1 ? 1 : b]
         NK = pos + S
