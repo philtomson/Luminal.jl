@@ -355,6 +355,75 @@ function _wmma_q4_wide_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val
     end
 end
 
+# Warp-specialized variant of the 128x256 int4 kernel: 512 + 32 NP threads. 16 consumer waves (a 32 x 64 tile each) only run the
+# MMAs of tile t from one LDS stage, while NP producer waves load, dequantize and stage tile t + 1 into the other stage (PD tiles
+# of global loads in flight in registers); one barrier per K tile. In the plain kernel every wave staged its share and then
+# computed, all in lockstep around the barrier, so the matrix unit idled while the VALU / LDS work ran; here the two overlap
+# (measured: 30 -> 32-34 TFLOP/s, interleaved best-of-40 on the 27B's shapes). The NP = 16 producers (1024 threads in all) hold
+# 1/16 of a tile's rows and chunks each; 4 producer waves were slower (one wave per SIMD cannot keep the stage fed).
+@inline function _ws_load(Pw, Sc, Mn, Bv, p, bm, bn, t, group, ::Val{SYM}, M4, ::Val{NP}) where {SYM, NP}
+    gi = (32 * t) ÷ group + 1
+    qrt = p % 4; r0 = p ÷ 4
+    a = ntuple(Val(16 ÷ NP)) do k
+        grow = min(bm + r0 + 8NP * (k - 1), M4 - 1)
+        sa = Float32(Sc[gi, grow + 1])
+        (Pw[4t + qrt + 1, grow + 1], sa, SYM ? -8f0 * sa : Float32(Mn[gi, grow + 1]))
+    end
+    b = ntuple(k -> Bv[4t + qrt + 1, bn + r0 + 8NP * (k - 1) + 1], Val(32 ÷ NP))
+    return (a, b)
+end
+@inline function _ws_stage(As, Bs, p, ab, st, ::Val{NP}) where {NP}
+    a, b = ab
+    qrt = p % 4; r0 = p ÷ 4
+    ntuple(Val(16 ÷ NP)) do k
+        w, sa, ma = a[k]
+        As[qrt + 1, r0 + 8NP * (k - 1) + 1, st] = _wmma_dq4w(w, sa, ma)
+        nothing
+    end
+    ntuple(Val(32 ÷ NP)) do k
+        Bs[qrt + 1, r0 + 8NP * (k - 1) + 1, st] = b[k]
+        nothing
+    end
+    return nothing
+end
+function _wmma_q4_ws_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{PD}, R, hr::Val, ::Val{NP}) where {SYM, PD, NP}
+    @inbounds begin
+    tid = workitemIdx().x - 1
+    wv = tid ÷ 32
+    l = tid % 32; r = l % 16; h = l ÷ 16
+    bm = (workgroupIdx().y - 1) * 128; bn = (workgroupIdx().x - 1) * 256
+    As = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 128, 2), false)
+    Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 256, 2), false)
+    nk = K ÷ 32
+    if wv < 16
+        wm = (wv % 4) * 32; wn = (wv ÷ 4) * 64
+        acc = ntuple(_ -> _wmma_zero(), Val(8))
+        sync_workgroup()                                       # tile 0 is staged
+        for t in 0:nk-1
+            st = t & 1 + 1
+            acc = _wmma_tile_big(acc, view(As, :, :, st), view(Bs, :, :, st), wm, wn, r)
+            sync_workgroup()                                   # tile t + 1 is staged, tile t's stage is free
+        end
+        _wmma_store_big!(C, acc, bm + wm, bn + wn, r, h, N, R, hr)
+    else
+        p = tid - 512
+        M4 = 4 * size(C, 1)
+        pipe = ntuple(d -> _ws_load(Pw, Sc, Mn, Bv, p, bm, bn, min(d - 1, nk - 1), group, Val(SYM), M4, Val(NP)), Val(PD))
+        _ws_stage(As, Bs, p, pipe[1], 1, Val(NP))
+        pipe = (Base.tail(pipe)..., _ws_load(Pw, Sc, Mn, Bv, p, bm, bn, min(PD, nk - 1), group, Val(SYM), M4, Val(NP)))
+        sync_workgroup()
+        for t in 0:nk-1
+            if t + 1 < nk
+                _ws_stage(As, Bs, p, pipe[1], (t + 1) & 1 + 1, Val(NP))
+                pipe = (Base.tail(pipe)..., _ws_load(Pw, Sc, Mn, Bv, p, bm, bn, min(t + 1 + PD, nk - 1), group, Val(SYM), M4, Val(NP)))
+            end
+            sync_workgroup()
+        end
+    end
+    return
+    end
+end
+
 # Skinny GEMM for N <= 16 columns (prefill of a short prompt, a few decode streams, speculative
 # verification): the weights are streamed once at memory speed. No LDS and no barriers: each
 # wave owns 16 weight rows, dequantizes its 16-byte chunk per K tile straight into the two WMMA
@@ -510,18 +579,23 @@ function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, m
     Bv = reinterpret(WMMA_V8H, B)
     args = (C, Pv, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing))
     if kind == :auto
-        kind = M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ? :wide :
+        kind = M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ?
+                   (get(ENV, "LUMINAL_WMMA_WS", "1") != "0" ? :ws : :wide) :
                M % 128 == 0 && Npad % 128 == 0 && get(ENV, "LUMINAL_WMMA_BIG", "1") != "0" ? :big : :small
     end
     # `residual` (an (M, N) Float32 array) is added to the result: in the 128-row kernels' store, else after the kernel
     R = residual isa ROCArray{Float32,2} && size(residual) == (M, N) ? residual : nothing
     residual !== nothing && R === nothing && throw(ArgumentError("wmma_q4_gemm!: the residual must be a Float32 ROCArray of the output's size"))
     hr = Val(R !== nothing)
-    if kind == :wide || kind == :big
+    if kind == :wide || kind == :big || kind == :ws
         Cv = reinterpret(WMMA_V4F, C)              # (M/4, N): the 128-row kernels store 16 bytes at a time
         Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
     end
-    if kind == :wide
+    if kind == :ws
+        Pw = reinterpret(UInt32, Pv)
+        _launch_q4(_wmma_q4_ws_kernel!, (Cv, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(2), Rv, hr, Val(16)),
+                   1024, (Npad ÷ 256, M ÷ 128), wpe)
+    elseif kind == :wide
         Pw = reinterpret(UInt32, Pv)   # (K/8, M): words of 8 codes
         _launch_q4(_wmma_q4_wide_kernel!, (Cv, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Val(pd), Rv, hr),
                    512, (Npad ÷ 256, M ÷ 128), wpe)
