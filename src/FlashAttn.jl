@@ -115,6 +115,18 @@ end
     return _wmma_cat(a, b)
 end
 
+# S = sum over the wave's KS 16-wide dim steps of Q fragment x K fragment, as straight-line code: a loop that indexes the tuple
+# of Q fragments with its counter keeps them in scratch memory instead of registers (and so do the loops over the K / V
+# prefetch tuples and the output accumulators below: they are unrolled with `ntuple(Val(n))`; the loop-carried tuples they read
+# are rebound with `let` first, since a closure over a variable that is reassigned boxes it).
+@generated function _qk_dot(qf::NTuple{KS,WMMA_V16H}, Ks, c0, sub) where {KS}
+    ex = :(_wmma_zero())
+    for k in 1:KS
+        ex = :(_wmma16(qf[$k], _wmma_cat(Ks[c0 + $(2k - 1), sub + 1], Ks[c0 + $(2k), sub + 1]), $ex))
+    end
+    return ex
+end
+
 function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
     D = 32 * NT; NC = D ÷ 8                   # 16-byte chunks per key row
     KS = NT                                   # k steps (16 dims) per wave of the S phase: half of D / 16
@@ -159,9 +171,12 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
     for kt in 0:ntile - 1
         key_start = kt * 16
         sync_workgroup()
-        for n in 1:KR
-            idx = tid + 256 * (n - 1)
-            Ks[idx % NC + 1, idx ÷ NC + 1] = kcur[n]
+        let kc = kcur
+            ntuple(Val(KR)) do n
+                idx = tid + 256 * (n - 1)
+                Ks[idx % NC + 1, idx ÷ NC + 1] = kc[n]
+                nothing
+            end
         end
         sync_workgroup()
         # prefetch the next tile (clamped, harmless past the end)
@@ -170,12 +185,7 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
         nkey = nstart + v_key; nlive = nkey < NK
         vpre = ntuple(j -> nlive ? Vc[v_slice + j, nkey + 1, kvh + 1, b + 1] : zero8, Val(DT))
         # S = Q K^T over this wave's half of the dims
-        s_acc = _wmma_zero()
-        for ks in 0:KS - 1
-            c = 2 * (s_kh * KS + ks)
-            kf = _wmma_cat(Ks[c + 1, sub + 1], Ks[c + 2, sub + 1])
-            s_acc = _wmma16(qf[ks + 1], kf, s_acc)
-        end
+        s_acc = _qk_dot(qf, Ks, 2 * s_kh * KS, sub)
         for i in 0:7
             s_lds[sub + 1, 2i + half_id + 1, s_tile + 1, s_kh + 1] = s_acc[i + 1].value
         end
@@ -215,8 +225,13 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
             end
         end
         # stage V transposed: V^T[d][key], this thread's key and its 16 dims
-        for j in 1:DT, i in 0:7
-            Vt[v_key + 1, (v_slice + j - 1) * 8 + i + 1] = vcur[j][i + 1].value
+        let vc = vcur
+            ntuple(Val(DT)) do j
+                for i in 0:7
+                    Vt[v_key + 1, (v_slice + j - 1) * 8 + i + 1] = vc[j][i + 1].value
+                end
+                nothing
+            end
         end
         sync_workgroup()
         # O += P V: dim tiles wave + 8t for all 4 row blocks
@@ -234,17 +249,20 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
     end
     tid % 4 == 0 && (row_sum[tid ÷ 4 + 1] = running_sum)
     sync_workgroup()
-    for n in 1:4 * DT
-        rbn = (n - 1) ÷ DT; tn = (n - 1) % DT
-        head = first_head + rbn % 2
-        for i in 0:7
-            row = 2i + half_id
-            lq = query_start + (rbn ÷ 2) * 16 + row
-            if lq < S
-                den = row_sum[rbn * 16 + row + 1]
-                d = (wave + 8tn) * 16 + sub
-                O[d + 1, lq + 1, head + 1, b + 1] = den > 0f0 ? oacc[n][i + 1].value / den : 0f0
+    let oa = oacc
+        ntuple(Val(4 * DT)) do n
+            rbn = (n - 1) ÷ DT; tn = (n - 1) % DT
+            head = first_head + rbn % 2
+            for i in 0:7
+                row = 2i + half_id
+                lq = query_start + (rbn ÷ 2) * 16 + row
+                if lq < S
+                    den = row_sum[rbn * 16 + row + 1]
+                    d = (wave + 8tn) * 16 + sub
+                    O[d + 1, lq + 1, head + 1, b + 1] = den > 0f0 ? oa[n][i + 1].value / den : 0f0
+                end
             end
+            nothing
         end
     end
     end # inbounds
