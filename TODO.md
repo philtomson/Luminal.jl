@@ -747,3 +747,12 @@ fixed 1 draft 18.0 (same 69% first-draft acceptance; adaptive spent 805 ms in MT
 and never loses to it; the case where fixed 3 loses (low acceptance) was not hit by this prompt, and the starting estimate (0.7) and
 EMA rate are untuned.
 Cheaper MTP chain: not started.
+
+### Fused MTP draft chain (done, small win) -- `_mtp_chain_graph` / `_mtp_chain!` in `src/Speculative.jl`
+Drafts 2..ND now run as ONE graph (n single-pair steps; each step's token is the previous step's device-side argmax, the position
+tensor is `pos + j`), instead of n launches with a host readback between them. Used when there is no `draft_hook`
+(`LUMINAL_MTP_UNFUSED=1` switches back). Same drafts as before (27B, lighthouse prompt, ndraft=3: 37/22/14 accepted of 54 cycles in
+both). But the gain is small: MTP time over 54 cycles 915 -> 852 ms (about 1.2 ms per cycle of ~16.9), so launch and readback overhead
+was not what the chain costs; each step is dominated by the work itself (the vocabulary head, 248k rows, is the biggest weight).
+Next for a cheaper chain: `draft_vocab` (restricted head, already an option; its acceptance cost is untested at 3 drafts), or
+a smaller/int4 head for the draft only.

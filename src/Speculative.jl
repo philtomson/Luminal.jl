@@ -23,6 +23,7 @@ mutable struct MTPDrafter
     v::Any
     pos::Int                  # next MTP position
     steps::Dict{Int,Any}      # pairs per step => compiled draft step, built on first use
+    chains::Dict{Int,Any}     # chain length => compiled fused chain of single-pair steps
     prefill::Dict{Int,Any}    # padded length => compiled prefill
     draft_vocab::Int          # 0 = full vocabulary, else the head scores only token ids 0..draft_vocab-1
 end
@@ -36,7 +37,7 @@ function MTPDrafter(s::LlamaSession; draft_vocab::Int=0)
     shape = (c.head_dim, s.max_seq, c.n_kv_heads, 1)
     dt = _mtp_kv_dtype(s)
     MTPDrafter(s, Luminal.zero_tensor(s.device, dt, shape...), Luminal.zero_tensor(s.device, dt, shape...),
-               0, Dict{Int,Any}(), Dict{Int,Any}(), draft_vocab)
+               0, Dict{Int,Any}(), Dict{Int,Any}(), Dict{Int,Any}(), draft_vocab)
 end
 
 function _weight_dtype_for(s::LlamaSession, reg)
@@ -84,6 +85,48 @@ function _mtp_step_graph(d::MTPDrafter, np::Int=2)
                    weight_dtype=_weight_dtype_for(s, reg), capture=s.device isa Luminal.AMDDevice && np <= 16)
     d.steps[np] = (exec=exec, tok=tok.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id, logits=logits.id, argmax=am.id, xpre=xpre.id)
     return d.steps[np]
+end
+
+# The chain of draft steps 2..ND as ONE graph: `n` single-pair steps whose token comes from the previous step's device-side argmax
+# (inputs: the first draft token, the hidden state of its pair, the position of its slot). Replaces n launches + host round trips.
+# Not usable with a draft_hook (it replaces the intermediate drafts). Returns all n argmax tokens in one (n,) read.
+function _mtp_chain_graph(d::MTPDrafter, n::Int)
+    haskey(d.chains, n) && return d.chains[n]
+    s = d.session; c = s.model.config
+    g = Base.invokelatest(Graph); reg = WeightRegistry()
+    m = Qwen35MTP(g, reg; c..., draft_vocab=d.draft_vocab)
+    tok0 = Luminal.tensor(g, [1, 1]); hid = Luminal.tensor(g, [c.hidden, 1, 1]); pos = Luminal.tensor(g, [1])
+    pk = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=_mtp_kv_dtype(s))
+    pv = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=_mtp_kv_dtype(s))
+    tok, x, ams, keep = tok0, hid, Int[], Int[]
+    for j in 1:n
+        pj = j == 1 ? pos : pos + Float32(j - 1)
+        logits, nk, nv, xpre = mtp_decode_step_hidden(m, tok, x, 0, pj, pk, pv)
+        am = Luminal.add_op!(g, Luminal.ArgMax(), [(logits.id, 0, logits.shape)], Luminal.ShapeTracker([1, 1]))
+        push!(ams, am.id); push!(keep, nk.id, nv.id)
+        tok, x = am, xpre
+    end
+    W = s.weights
+    if d.draft_vocab > 0
+        W = copy(W)
+        W["mtp.draft_head.weight"] = _first_rows(W["lm_head.weight"], d.draft_vocab)
+    end
+    load_weights!(g, reg, W; device=s.device)
+    retain = [ams; keep; tok0.id; hid.id; pos.id; pk.id; pv.id]
+    @info "Compiling MTP draft chain ($n steps)..."
+    exec = compile(g; device=s.device, retain=retain, free_intermediates=false,
+                   weight_dtype=_weight_dtype_for(s, reg), capture=s.device isa Luminal.AMDDevice)
+    d.chains[n] = (exec=exec, tok=tok0.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id, ams=ams)
+    return d.chains[n]
+end
+
+# Drafts 2..n+1 after the first draft token t1 (hidden state x of its pair, 1 column) from the position d.pos; the MTP position
+# is left where it was.
+function _mtp_chain!(d::MTPDrafter, t1::Int, x, n::Int)
+    gr = _mtp_chain_graph(d, n)
+    res = gr.exec(Dict{Int,Any}(gr.tok => Float32[t1;;], gr.hid => x, gr.pos => Float32[d.pos],
+                                gr.pk => d.k, gr.pv => d.v); device=d.session.device)
+    return [Int(only(Array(res[a]))) for a in gr.ams]
 end
 
 function _mtp_prefill_graph(d::MTPDrafter, slen::Int)
@@ -167,7 +210,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
-    ndraft != 1 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? 3 : ndraft; adaptive=ndraft == 0)
+    ndraft != 1 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? 3 : ndraft; adaptive=ndraft == 0, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -235,7 +278,7 @@ function _best_ndraft(q, ND)
     bn
 end
 
-function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false)
+function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false)
     K = ND + 1
     q = fill(0.7, ND)                                                 # conditional acceptance of draft j given 1..j-1 were
     sel = zeros(Int, ND)                                              # cycles run with each draft count
@@ -243,6 +286,10 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         am, xp = _mtp_step!(d, toks, hid, nreal; with_hidden=true)
         ds = Int[hook(am[nreal], 0)]
         x = xp[:, nreal:nreal, :]
+        if fused && ND >= 2
+            append!(ds, _mtp_chain!(d, ds[1], x, ND - 1))
+            return ds
+        end
         for j in 2:ND
             am, x = _mtp_step!(d, [ds[end]], x, 1; with_hidden=true)   # position d.pos + j - 2: the slot after the previous draft's
             push!(ds, hook(am[1], j - 1))

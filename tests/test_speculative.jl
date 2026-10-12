@@ -96,6 +96,7 @@ end
         @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3, draft_hook=wrongs) == plain
     end
     @test generate_ids_speculative(s, d4, prompt2; max_new_tokens=10, ndraft=3) == plain2
+    @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, ndraft=0) == plain
 
     # 5. a restricted draft vocabulary only changes which tokens get drafted, never the output
     d2 = MTPDrafter(s; draft_vocab=model.config.vocab_size ÷ 2)
