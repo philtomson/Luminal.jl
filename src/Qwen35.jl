@@ -69,16 +69,25 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
 
     # projections, then the causal convolution over q, k and v together
     qkv = dn.in_proj_qkv(x)                                                   # (C, S, B)
-    conv_ins = [(t.id, 0, t.shape) for t in (qkv, conv_state, dn.conv_w, lens)]
-    snaps === nothing || push!(conv_ins, (snaps[1].id, 0, snaps[1].shape))   # state after `snap_t` tokens lands here
-    qkv = Luminal.add_op!(g_, Luminal.CausalConv(fresh, snaps === nothing ? 0 : snap_t), conv_ins, Luminal.ShapeTracker([C, S, B]))
+    fused = get(ENV, "LUMINAL_CONV_FUSED", "1") != "0" && get(ENV, "LUMINAL_DELTA_QKV", "1") != "0"
+    if !fused
+        conv_ins = [(t.id, 0, t.shape) for t in (qkv, conv_state, dn.conv_w, lens)]
+        snaps === nothing || push!(conv_ins, (snaps[1].id, 0, snaps[1].shape))   # state after `snap_t` tokens lands here
+        qkv = Luminal.add_op!(g_, Luminal.CausalConv(fresh, snaps === nothing ? 0 : snap_t), conv_ins, Luminal.ShapeTracker([C, S, B]))
+    end
 
     # gates: beta = sigmoid(b), g = -exp(A_log) softplus(a + dt_bias), per value head
     beta = Luminal.sigmoid(dn.in_proj_b(x))                                   # (nv, S, B)
     a = dn.in_proj_a(x) + Luminal.expand(Luminal.expand(dn.dt_bias, 2, S), 3, B)
     g = Luminal.expand(Luminal.expand(-exp(dn.A_log), 2, S), 3, B) * Luminal.softplus(a)
 
-    if get(ENV, "LUMINAL_DELTA_QKV", "1") != "0"
+    if fused
+        # convolution + SiLU + L2 norm of q and k, then the recurrence on the normalized q, k and v: one op
+        ins = [(t.id, 0, t.shape) for t in (qkv, conv_state, dn.conv_w, g, beta, rec_state, lens)]
+        snaps === nothing || (push!(ins, (snaps[1].id, 0, snaps[1].shape)); push!(ins, (snaps[2].id, 0, snaps[2].shape)))
+        o = Luminal.add_op!(g_, Luminal.ConvDeltaRule(Float32(1 / sqrt(dk)), fresh, snaps === nothing ? 0 : snap_t, nk, dk, 1f-6), ins,
+                            Luminal.ShapeTracker([dv, nv, S, B]))
+    elseif get(ENV, "LUMINAL_DELTA_QKV", "1") != "0"
         # q, k (L2-normalized) and v are read from the convolution's output in place by the one op
         ins = [(t.id, 0, t.shape) for t in (qkv, g, beta, rec_state, lens)]
         snaps === nothing || push!(ins, (snaps[2].id, 0, snaps[2].shape))

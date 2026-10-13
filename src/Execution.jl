@@ -1115,6 +1115,126 @@ function execute_op!(out, op::DeltaRuleQKV, qkv, g, beta, st, lens, snap = st)
     return out
 end
 
+# --- ConvDeltaRule: convolution + SiLU + L2 norm of q and k in one kernel ---------------------------
+# One wave per (head of the stacked q / k / v rows, chunk of TC tokens, batch); a lane owns 4 channels of the head's 128 (coalesced).
+# Every output depends only on the previous K - 1 inputs, so the tokens of a chunk are independent of the other chunks (the LDS-free
+# sliding window starts from x, or from the conv state for the first K - 1 tokens). q / k heads are normalized by their norm over the
+# 128 channels (the same summation order as `_l2norm_kernel!`) and written dense; v heads are written as they are.
+const CONV_TC = 16
+# One token of the sliding window for the four channels of a lane: the SiLU of the dot product with the weights, and the shifted window.
+@inline function _conv_token(win, wk, xp, t, C, ::Val{K}) where {K}
+    xs = ntuple(i -> unsafe_load(xp, (t - 1) * C + 32 * (i - 1) + 1), Val(4))
+    nw = ntuple(i -> (Base.tail(win[i])..., xs[i]), Val(4))
+    ys = ntuple(Val(4)) do i
+        acc = 0f0
+        for j in 1:K
+            acc += wk[i][j] * nw[i][j]
+        end
+        _silu(acc)
+    end
+    return ys, nw
+end
+function _conv_norm_kernel!(qn, kn, vo, x, state, w, lens, nk, nv, S, C, eps, fresh, ::Val{K}, ::Val{TC}) where {K,TC}
+    lane = workitemIdx().x - 1
+    hidx = workgroupIdx().x - 1; tc = workgroupIdx().y - 1; b = workgroupIdx().z - 1
+    L = min(S, unsafe_trunc(Int, @inbounds lens[b + 1]))
+    t0 = tc * TC + 1
+    t0 <= L || return
+    c0 = hidx * 128 + lane                                       # 0-based channel of lane slot i: c0 + 32 i
+    xp = pointer(x) + 4 * (b * S * C + c0)                       # x[c, t, b] at (t - 1) * C + c
+    sp = pointer(state) + 4 * (b * C * K + c0)                   # state[c, j, b] at (j - 1) * C + c
+    wp = pointer(w) + 4 * c0                                     # w[c, 1, j] at (j - 1) * C + c
+    wk = ntuple(Val(4)) do i
+        ntuple(j -> unsafe_load(wp, (j - 1) * C + 32 * (i - 1) + 1), Val(K))
+    end
+    # window of the K inputs before token t0 (oldest first, K - 1 of them are used: the last slot is shifted in)
+    win = ntuple(Val(4)) do i
+        ntuple(Val(K)) do j
+            pos = t0 - K + j - 1                                 # input position of slot j before shifting: t0 - K + j - 1 (<= t0 - 1 for j <= K)
+            if pos >= 1
+                unsafe_load(xp, (pos - 1) * C + 32 * (i - 1) + 1)
+            elseif fresh
+                0f0
+            else
+                unsafe_load(sp, (K + pos - 1) * C + 32 * (i - 1) + 1)   # state slot K + pos (pos <= 0)
+            end
+        end
+    end
+    isq = hidx < 2 * nk
+    nkd = nk * 128; nvd = nv * 128
+    tend = min(t0 + TC - 1, L)
+    for t in t0:tend
+        ys, win = _conv_token(win, wk, xp, t, C, Val(K))
+        if isq
+            ss = 0f0
+            for i in 1:4
+                ss += ys[i] * ys[i]
+            end
+            ss += AMDGPU.Device.shfl_xor(ss, Cint(16)); ss += AMDGPU.Device.shfl_xor(ss, Cint(8)); ss += AMDGPU.Device.shfl_xor(ss, Cint(4))
+            ss += AMDGPU.Device.shfl_xor(ss, Cint(2)); ss += AMDGPU.Device.shfl_xor(ss, Cint(1))
+            r = 1f0 / sqrt(ss + eps)
+            dst = hidx < nk ? pointer(qn) : pointer(kn)
+            hk = hidx < nk ? hidx : hidx - nk
+            base = ((b * S + t - 1) * nk + hk) * 128 + lane
+            for i in 1:4
+                unsafe_store!(dst, ys[i] * r, base + 32 * (i - 1) + 1)
+            end
+        else
+            vh = hidx - 2 * nk
+            base = ((b * S + t - 1) * nv + vh) * 128 + lane
+            vp = pointer(vo)
+            for i in 1:4
+                unsafe_store!(vp, ys[i], base + 32 * (i - 1) + 1)
+            end
+        end
+    end
+    return
+end
+
+# The conv state after the tokens consumed: the last K inputs (those before the first token come from the old state, or zeros when fresh).
+function _conv_state_kernel!(state, x, lens, S, C, fresh, ::Val{K}) where {K}
+    i = (workgroupIdx().x - 1) * workgroupDim().x + workitemIdx().x
+    nth = size(state, 1) * size(state, 3)
+    i <= nth || return
+    c = (i - 1) % C + 1; b = (i - 1) ÷ C + 1
+    L = min(S, unsafe_trunc(Int, @inbounds lens[b]))
+    vals = ntuple(Val(K)) do j
+        p = L - K + j
+        p >= 1 ? @inbounds(x[c, p, b]) : (fresh ? 0f0 : @inbounds(state[c, K + p, b]))
+    end
+    for j in 1:K
+        @inbounds state[c, j, b] = vals[j]
+    end
+    return
+end
+
+function execute_op!(out, op::ConvDeltaRule, x, cstate, cw, g, beta, st, lens, snaps...)
+    C, S, B = size(x, 1), size(x, 2), size(x, 3)
+    nk, dk = op.nk, op.dk
+    dv, nv = size(out, 1), size(out, 2)
+    K = size(cw, 3)
+    if out isa AMDGPU.ROCArray{Float32} && x isa AMDGPU.ROCArray{Float32} && x isa DenseArray && cw isa AMDGPU.ROCArray{Float32} && cw isa DenseArray &&
+       cstate isa AMDGPU.ROCArray{Float32} && g isa AMDGPU.ROCArray{Float32} && beta isa AMDGPU.ROCArray{Float32} && st isa AMDGPU.ROCArray{Float32} &&
+       op.snap_t == 0 && dk == 128 && dv == 128 && C == (2nk + nv) * 128 && S >= 16 && K <= 8 && get(ENV, "LUMINAL_CONV_FUSED", "1") != "0" &&
+       get(ENV, "LUMINAL_DELTA_RS", "1") != "0"
+        qn = similar(x, Float32, dk, nk, S, B); kn = similar(x, Float32, dk, nk, S, B); vo = similar(x, Float32, dv, nv, S, B)
+        ld = _dense(lens)
+        @roc groupsize=32 gridsize=(2nk + nv, cld(S, CONV_TC), B) _conv_norm_kernel!(qn, kn, vo, x, cstate, cw, ld, nk, nv, S, C, op.epsilon, op.fresh, Val(K), Val(CONV_TC))
+        @roc groupsize=256 gridsize=cld(C * B, 256) _conv_state_kernel!(cstate, x, ld, S, C, op.fresh, Val(K))
+        _launch_delta_rows!(out, qn, kn, vo, _dense(g), _dense(beta), st, ld, op.scale, nv ÷ nk, op.fresh, nv, B, dv)
+        foreach(_free_now!, (qn, kn, vo))
+        return out
+    end
+    # anything else: the two separate ops
+    cs = isempty(snaps) ? cstate : snaps[1]
+    rs = isempty(snaps) ? st : snaps[2]
+    conv = similar(x, Float32, C, S, B)
+    execute_op!(conv, CausalConv(op.fresh, op.snap_t), x, cstate, cw, lens, cs)
+    execute_op!(out, DeltaRuleQKV(op.scale, op.fresh, op.snap_t, nk, dk, op.epsilon), conv, g, beta, st, lens, rs)
+    _free_now!(conv)
+    return out
+end
+
 # --- Float16 matmul weights ---------------------------------------------------
 # A matmul weight stored as Float16, transposed to (In, Out) so that each output
 # row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps

@@ -323,6 +323,18 @@ struct DeltaRuleQKV <: Op
     epsilon::Float32
 end
 
+# ConvDeltaRule: CausalConv followed by DeltaRuleQKV as one op, so that the prefill can fuse the convolution, its SiLU and the L2 norm of q and
+#   k into one kernel that runs in parallel over tokens. Inputs x (C, S, B) (the in-projection's output), conv state (C, K, B), conv weights
+#   (C, 1, K), g, beta, recurrent state, lens [, conv snapshots, recurrent snapshots]; the output is DeltaRuleQKV's.
+struct ConvDeltaRule <: Op
+    scale::Float32
+    fresh::Bool
+    snap_t::Int
+    nk::Int
+    dk::Int
+    epsilon::Float32
+end
+
 # ArgMax: out (S, B) = the 0-based index of the first maximum along dim 1 of x (V, S, B), as Float32.
 #   Greedy decoding picks tokens on the device instead of reading the logits back.
 struct ArgMax <: Op end
