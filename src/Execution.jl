@@ -943,12 +943,12 @@ const _DR_P4 = Core.LLVMPtr{NTuple{4,VecElement{Float32}},1}
         @inbounds v[(i - 1) % 4 + 1].value
     end
 end
-function _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh)
+function _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh, voff, vts, vbs)
     tid = workitemIdx().x - 1
     wave = tid >> 5; lane = tid & 31; seg = lane & 3; grp = lane >> 2
     j = (workgroupIdx().x - 1) * 64 + wave * 8 + grp + 1
     h = workgroupIdx().y; b = workgroupIdx().z
-    dk = size(q, 1); nk = size(q, 2); dv = size(v, 1); nv = size(v, 2); S = size(v, 3)
+    dk = size(q, 1); nk = size(q, 2); dv = size(out, 1); nv = size(out, 2); S = size(out, 3)
     hk = (h - 1) ÷ G + 1
     L = min(S, unsafe_trunc(Int, @inbounds lens[b]))
     kq_stride = nk * dk
@@ -957,13 +957,13 @@ function _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fre
     end
     kp = pointer(k) + 4 * (((b - 1) * S) * kq_stride + (hk - 1) * dk + seg * 32)
     qp = pointer(q) + 4 * (((b - 1) * S) * kq_stride + (hk - 1) * dk + seg * 32)
-    vp = pointer(v) + 4 * ((j - 1) + dv * ((h - 1) + nv * S * (b - 1)))
+    vp = pointer(v) + 4 * (voff + (j - 1) + dv * (h - 1) + vbs * (b - 1))        # v: element (j, h, t, b) at voff + j - 1 + dv (h - 1) + vts t + vbs (b - 1)
     gp = pointer(g) + 4 * ((h - 1) + nv * S * (b - 1))
     bp = pointer(beta) + 4 * ((h - 1) + nv * S * (b - 1))
     op = pointer(out) + 4 * ((j - 1) + dv * ((h - 1) + nv * S * (b - 1)))
     for t in 0:L-1
         kv = _dr_load32(kp + 4 * kq_stride * t); qv = _dr_load32(qp + 4 * kq_stride * t)
-        dec = exp(unsafe_load(gp, t * nv + 1)); bet = unsafe_load(bp, t * nv + 1); vj = unsafe_load(vp, t * nv * dv + 1)
+        dec = exp(unsafe_load(gp, t * nv + 1)); bet = unsafe_load(bp, t * nv + 1); vj = unsafe_load(vp, t * vts + 1)
         kq = _quad_sum(_dot_tt32(kv, qv))
         kvs = dec * _quad_sum(_dot_tt32(s, kv))
         sq = dec * _quad_sum(_dot_tt32(s, qv))
@@ -984,8 +984,8 @@ function _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fre
     return
 end
 
-function _launch_delta_rows!(out, q, k, v, g, beta, st, lens, scale, G, fresh, nv, B, dv)
-    @roc groupsize=256 gridsize=(dv ÷ 64, nv, B) _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh)
+function _launch_delta_rows!(out, q, k, v, g, beta, st, lens, scale, G, fresh, nv, B, dv; voff = 0, vts = nv * dv, vbs = nv * dv * size(out, 3))
+    @roc groupsize=256 gridsize=(dv ÷ 64, nv, B) _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh, voff, vts, vbs)
     return nothing
 end
 function _delta_rows_ok(out, q, k, v, g, beta, st, snap_t)
@@ -1051,6 +1051,67 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens, snap = st)
     _delta_rule_kernel!(KernelAbstractions.get_backend(out), gs)(
         out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), snap, op.snap_t, op.scale, G, op.fresh;
         ndrange = nv * B * gs)
+    return out
+end
+
+# --- DeltaRuleQKV: the recurrence straight from the convolution's output ---------------------------
+# q and k (rows 0:nk*dk and nk*dk:2*nk*dk of every token's column) are L2-normalized into dense scratch arrays by one kernel (one
+# wave per head and token, the same summation order as `_l2norm_kernel!`); v is read in place by the row-split kernel (token stride C).
+function _l2norm_qk_kernel!(qn, kn, qkv, C, nk, dk, S, B, eps)
+    tid = workitemIdx().x - 1
+    lane = tid % 32
+    w = (workgroupIdx().x - 1) * (workgroupDim().x ÷ 32) + tid ÷ 32       # (which, head, token, batch), which fastest
+    w < 2 * nk * S * B || return
+    which = w % 2; r = w ÷ 2
+    hd = r % nk; r = r ÷ nk
+    t = r % S; b = r ÷ S
+    src = (b * S + t) * C + which * nk * dk + hd * dk                      # 0-based element offset of the head's first key
+    acc = 0f0
+    i = lane
+    while i < dk
+        v = @inbounds qkv[src + i + 1]
+        acc += v * v
+        i += 32
+    end
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(16))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(8))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(4))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(2))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(1))
+    r = 1f0 / sqrt(acc + eps)
+    dst = ((b * S + t) * nk + hd) * dk
+    dstarr = which == 0 ? qn : kn
+    i = lane
+    while i < dk
+        @inbounds dstarr[dst + i + 1] = qkv[src + i + 1] * r
+        i += 32
+    end
+    return
+end
+
+function execute_op!(out, op::DeltaRuleQKV, qkv, g, beta, st, lens, snap = st)
+    C, S, B = size(qkv, 1), size(qkv, 2), size(qkv, 3)
+    nk, dk = op.nk, op.dk
+    dv, nv = size(out, 1), size(out, 2)
+    G = nv ÷ nk
+    if out isa AMDGPU.ROCArray{Float32} && qkv isa AMDGPU.ROCArray{Float32} && qkv isa DenseArray && dk == 128 && dv == 128 &&
+       g isa AMDGPU.ROCArray{Float32} && beta isa AMDGPU.ROCArray{Float32} && st isa AMDGPU.ROCArray{Float32} && op.snap_t == 0 &&
+       get(ENV, "LUMINAL_DELTA_RS", "1") != "0" && UInt(pointer(qkv)) % 16 == 0
+        qn = similar(qkv, Float32, dk, nk, S, B); kn = similar(qkv, Float32, dk, nk, S, B)
+        @roc groupsize=256 gridsize=cld(2 * nk * S * B, 8) _l2norm_qk_kernel!(vec(qn), vec(kn), vec(qkv), C, nk, dk, S, B, op.epsilon)
+        gd, bd, ld = _dense(g), _dense(beta), _dense(lens)
+        _launch_delta_rows!(out, qn, kn, qkv, gd, bd, st, ld, op.scale, G, op.fresh, nv, B, dv; voff = 2 * nk * dk, vts = C, vbs = C * S)
+        _free_now!(qn); _free_now!(kn)
+        return out
+    end
+    # anything else: slice, normalize and run the separate ops
+    qkvd = qkv isa DenseArray ? qkv : copy(qkv)
+    cut(lo, hi, d1, d2) = copy(Base.reshape(view(qkvd, lo+1:hi, :, :), d1, d2, S, B))
+    q = cut(0, nk * dk, dk, nk); k = cut(nk * dk, 2nk * dk, dk, nk); v = cut(2nk * dk, C, dv, nv)
+    qn = similar(q, Float32); kn = similar(k, Float32)
+    execute_op!(qn, L2NormOp(op.epsilon), q); execute_op!(kn, L2NormOp(op.epsilon), k)
+    execute_op!(out, DeltaRule(op.scale, op.fresh, op.snap_t), qn, kn, v, g, beta, st, lens, snap)
+    foreach(_free_now!, (q, k, v, qn, kn))
     return out
 end
 

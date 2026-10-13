@@ -267,7 +267,7 @@ _writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa L
     op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp || op isa Luminal.L2NormOp || op isa Luminal.GatedRMSNormOp || op isa Luminal.SwiGLUOp ||
     op isa Luminal.RotaryEmbed || op isa Luminal.SoftmaxOp || op isa Luminal.LastToken ||
     # (their kernels write every element of the output, zeros past a sequence's length included)
-    op isa Luminal.CausalConv || op isa Luminal.DeltaRule || op isa Luminal.Slice || op isa Luminal.SumReduce || op isa Luminal.MaxReduce
+    op isa Luminal.CausalConv || op isa Luminal.DeltaRule || op isa Luminal.DeltaRuleQKV || op isa Luminal.Slice || op isa Luminal.SumReduce || op isa Luminal.MaxReduce
 
 # A matmul against a quantized / half weight writes every element of its output when it has more
 # than QUANT_GEMM_COLS columns (matrix-core or dequantize + GEMM path; the GEMV path for fewer

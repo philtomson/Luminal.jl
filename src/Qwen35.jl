@@ -73,20 +73,27 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
     snaps === nothing || push!(conv_ins, (snaps[1].id, 0, snaps[1].shape))   # state after `snap_t` tokens lands here
     qkv = Luminal.add_op!(g_, Luminal.CausalConv(fresh, snaps === nothing ? 0 : snap_t), conv_ins, Luminal.ShapeTracker([C, S, B]))
 
-    q = Luminal.reshape(Luminal.slice_along(qkv, 1, 0, nk * dk), [dk, nk, S, B])
-    k = Luminal.reshape(Luminal.slice_along(qkv, 1, nk * dk, 2nk * dk), [dk, nk, S, B])
-    v = Luminal.reshape(Luminal.slice_along(qkv, 1, 2nk * dk, C), [dv, nv, S, B])
-    q, k = _l2norm(q), _l2norm(k)
-
     # gates: beta = sigmoid(b), g = -exp(A_log) softplus(a + dt_bias), per value head
     beta = Luminal.sigmoid(dn.in_proj_b(x))                                   # (nv, S, B)
     a = dn.in_proj_a(x) + Luminal.expand(Luminal.expand(dn.dt_bias, 2, S), 3, B)
     g = Luminal.expand(Luminal.expand(-exp(dn.A_log), 2, S), 3, B) * Luminal.softplus(a)
 
-    ins = [(t.id, 0, t.shape) for t in (q, k, v, g, beta, rec_state, lens)]
-    snaps === nothing || push!(ins, (snaps[2].id, 0, snaps[2].shape))
-    o = Luminal.add_op!(g_, Luminal.DeltaRule(Float32(1 / sqrt(dk)), fresh, snaps === nothing ? 0 : snap_t), ins,
-                        Luminal.ShapeTracker([dv, nv, S, B]))
+    if get(ENV, "LUMINAL_DELTA_QKV", "1") != "0"
+        # q, k (L2-normalized) and v are read from the convolution's output in place by the one op
+        ins = [(t.id, 0, t.shape) for t in (qkv, g, beta, rec_state, lens)]
+        snaps === nothing || push!(ins, (snaps[2].id, 0, snaps[2].shape))
+        o = Luminal.add_op!(g_, Luminal.DeltaRuleQKV(Float32(1 / sqrt(dk)), fresh, snaps === nothing ? 0 : snap_t, nk, dk, 1f-6), ins,
+                            Luminal.ShapeTracker([dv, nv, S, B]))
+    else
+        q = Luminal.reshape(Luminal.slice_along(qkv, 1, 0, nk * dk), [dk, nk, S, B])
+        k = Luminal.reshape(Luminal.slice_along(qkv, 1, nk * dk, 2nk * dk), [dk, nk, S, B])
+        v = Luminal.reshape(Luminal.slice_along(qkv, 1, 2nk * dk, C), [dv, nv, S, B])
+        q, k = _l2norm(q), _l2norm(k)
+        ins = [(t.id, 0, t.shape) for t in (q, k, v, g, beta, rec_state, lens)]
+        snaps === nothing || push!(ins, (snaps[2].id, 0, snaps[2].shape))
+        o = Luminal.add_op!(g_, Luminal.DeltaRule(Float32(1 / sqrt(dk)), fresh, snaps === nothing ? 0 : snap_t), ins,
+                            Luminal.ShapeTracker([dv, nv, S, B]))
+    end
 
     # gated RMSNorm per value head: norm(o) * w * silu(z)
     z = Luminal.reshape(dn.in_proj_z(x), [dv, nv, S, B])

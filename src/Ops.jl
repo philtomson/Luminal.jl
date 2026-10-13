@@ -311,6 +311,18 @@ struct DeltaRule <: Op
 end
 DeltaRule(scale::Float32, fresh::Bool) = DeltaRule(scale, fresh, 0)
 
+# DeltaRuleQKV: the Gated DeltaNet recurrence straight from the convolution's output. Inputs qkv (C, S, B) with C = 2 nk dk + nv dv
+#   (q, k and v stacked along dim 1), g, beta (nv, S, B), state, lens [, snapshots]. Equal to slicing q, k and v out of qkv, L2-normalizing
+#   q and k (`epsilon`) and running `DeltaRule(scale, fresh, snap_t)`, without the three slice copies and the two separate norm kernels.
+struct DeltaRuleQKV <: Op
+    scale::Float32
+    fresh::Bool
+    snap_t::Int
+    nk::Int
+    dk::Int
+    epsilon::Float32
+end
+
 # ArgMax: out (S, B) = the 0-based index of the first maximum along dim 1 of x (V, S, B), as Float32.
 #   Greedy decoding picks tokens on the device instead of reading the logits back.
 struct ArgMax <: Op end
