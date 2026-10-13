@@ -1058,3 +1058,14 @@ Where the remaining 8-12% gap sits (2048 tokens, per-prompt GPU time, gufo 2.96 
 
 ### chunk_attention!: Float32 query in, (D, H, S, B) output out (2026-10-13)
 For the 128-row flash kernel (D = 256, the Qwen3.5 layers) `chunk_attention!` no longer makes a Float16 copy of q (allocation, zero fill, conversion broadcast), zero-fills an output scratch or permutes it afterwards: `_flash_prefill_lds2!` takes a Float32 query (`_q8` converts two 16-byte loads to the Float16 chunk in registers) and writes the output straight into the (D, H, S, B) layout the output projection reads (`Val(HS)`). The 64-row kernel and the Int8 cache keep the old path. `tests/test_flash_prefill.jl` has a chunk_attention! test against a host reference for both kernels (rel err < 3e-3). End to end (idle machine, 2 runs): 2048 tokens 639.0 -> 643.5 / 640.2, 8192 597.1 -> 598.5 / 601.6 tok/s (+0.5..0.6%).
+
+## What does re-quantizing the GGUF to int4 cost? (2026-10-13, `examples/qwen35_quant_quality.jl`)
+Qwen3.8-27B, 100 prompts of 256 real English tokens (this repo's README + gufo's docs, random windows, fixed seed), last-position logits of three builds on identical prompts:
+- reference: the Q8_K_XL file, weights as int8 (~near-lossless: int8 error is ~1/250 of a group's range)
+- "native Q4_K_XL": the Q4_K_XL file's own values (dequantized, kept as int8: this is what gufo's native-format kernels compute, to int8 noise)
+- ours: the same Q4_K_XL file re-quantized to uniform int4, group 32 (what Luminal runs now)
+| build (against the Q8_K_XL reference) | top-1 agreement | same top-5 set | mean KL(ref ‖ test) | median KL | max KL |
+| native Q4_K_XL values | 97 % | 74 % | 0.0056 nats | 0.0040 | 0.026 |
+| Luminal int4 g32 | 85 % | 41 % | 0.0613 nats | 0.0485 | 0.341 |
+(int4 against the native Q4_K_XL values: 86 %, KL 0.056.) The int4 re-quantization adds ~11x the KL divergence of the file's own quantization and flips the top-1 token in 15 % of positions instead of 3 %. The log-probability of the true next token moves by -0.037 +- 0.042 (perplexity +3.7 %, not significant with 100 positions; the KL and the agreement are). The Q4_K_XL file is mostly Q5_K (42 % of the parameters), IQ4_XS (21 %), Q4_K (20 %) and Q6_K (13 %); int4 g32 (16 levels, f16 scale + min = 5.0 bits per weight) drops 1-1.5 bits on the 55 % that are Q5_K / Q6_K. Reading the file's formats directly (as gufo does) would also cut the load from 137 s (dequantize + re-quantize) to a few seconds (mmap + upload).
+Memory traffic is within 3 % (5.0 vs the file's 5.12 bits per weight), so decode speed is not the argument: quality and load time are.
