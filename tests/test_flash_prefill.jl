@@ -50,3 +50,30 @@ end
     res = exec(Dict{Int,Any}(q.id => qa, k.id => ka, v.id => va); device = dev)
     @test relerr(Array(res[o.id]), naive(qa, ka, va, 0.2f0)) < 2e-3
 end
+
+# chunk_attention! (the prefill-chunk attention over the KV cache): the 128-row kernel reads the Float32 query and writes the (D, H, S, B)
+# output itself (direct path); the 64-row kernel goes through a Float16 copy of q and a permute. Both against a host reference.
+if Luminal.wmma_supported()
+    @testset "chunk_attention! against the host reference" begin
+        D, H, KVH, S, pos, maxs = 256, 8, 2, 40, 100, 192
+        scale = Float32(1 / sqrt(D))
+        qh = randn(Float32, D, S, H, 1); knh = Float16.(randn(Float32, D, S, KVH, 1)); vnh = Float16.(randn(Float32, D, S, KVH, 1))
+        pkh = Float16.(randn(Float32, D, maxs, KVH, 1)); pvh = Float16.(randn(Float32, D, maxs, KVH, 1))
+        kfull = copy(pkh); vfull = copy(pvh); kfull[:, pos+1:pos+S, :, :] = knh; vfull[:, pos+1:pos+S, :, :] = vnh
+        ref = zeros(Float32, D, H, S, 1)
+        for h in 1:H, i in 1:S
+            kv = (h - 1) ÷ (H ÷ KVH) + 1; nk = pos + i
+            s = [Float64(scale) * sum(Float64.(qh[:, i, h, 1]) .* Float64.(kfull[:, j, kv, 1])) for j in 1:nk]
+            p = exp.(s .- maximum(s)); p ./= sum(p)
+            ref[:, h, i, 1] = sum(p[j] * Float64.(vfull[:, j, kv, 1]) for j in 1:nk)
+        end
+        for rows in ("128", "64")
+            withenv("LUMINAL_FLASH_ROWS" => rows) do
+                out = AMDGPU.zeros(Float32, D * H, S, 1)
+                ok = Luminal.chunk_attention!(out, ROCArray(qh), ROCArray(copy(pkh)), ROCArray(copy(pvh)), ROCArray(knh), ROCArray(vnh), ROCArray(Float32[pos]), scale)
+                @test ok
+                @test relerr(Base.reshape(Array(out), D, H, S, 1), ref) < 3e-3
+            end
+        end
+    end
+end

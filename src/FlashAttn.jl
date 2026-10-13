@@ -271,6 +271,15 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
 end
 
 
+# 8 query dims (one 16-byte chunk of a Float16 query) at chunk index c of (chunk, row, head, batch): read as is from a Float16 query, or
+# converted from two 16-byte loads of a Float32 query (so that the caller need not convert the whole query to Float16 first).
+@inline _q8(Q::AbstractArray{WMMA_V8H}, c, r, h, b) = @inbounds Q[c, r, h, b]
+@inline function _q8(Q::AbstractArray{WMMA_V4F}, c, r, h, b)
+    a = @inbounds Q[2c - 1, r, h, b]; d = @inbounds Q[2c, r, h, b]
+    return (VecElement(Float16(a[1].value)), VecElement(Float16(a[2].value)), VecElement(Float16(a[3].value)), VecElement(Float16(a[4].value)),
+            VecElement(Float16(d[1].value)), VecElement(Float16(d[2].value)), VecElement(Float16(d[3].value)), VecElement(Float16(d[4].value)))
+end
+
 # Flash prefill attention, D = 256, with a 128-row block: 512 threads = 16 waves, 2 query heads (sharing a KV head) x 64 queries.
 # The same pipeline as `_flash_prefill_lds!` (S = Q K^T by dim halves in registers, 4-threads-per-row softmax, V^T in LDS, three barriers
 # per 16-key tile) but every K / V tile is used by twice as many rows: half the global (L2) traffic per FLOP and half the barriers.
@@ -280,7 +289,7 @@ end
 #   keys and writes them as 8 packed dwords of V^T (row = dim, the 16 keys contiguous, 12 dwords per row) instead of 16 two-byte stores, with
 #   16 dwords of padding after every 8 dims so the 32 lanes of a store hit 32 different banks. 16.5 -> 17.4 TFLOP/s at 2048 tokens from an
 #   empty context, 18.6 -> 19.8 at depth 8192, 19.1 -> 20.3 at 32256 (S = 512, D = 256, 24 / 4 heads).
-function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
+function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, ::Val{HS} = Val(false)) where {NT,HS}
     SW = 16                                   # padding of the transposed V tile (dwords per 8 dims; see below)
     D = 32 * NT; NC = D ÷ 8                   # NT = 8: D = 256, 32 16-byte chunks per key row
     KS = NT                                   # k steps (16 dims) per wave of the S phase: half of D / 16
@@ -308,7 +317,7 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT})
     qrow = min(query_start + s_qoff + sub, S - 1)
     qf = ntuple(Val(KS)) do ks
         c = 2 * (s_kh * KS + ks - 1)
-        _wmma_cat(Qv[c + 1, qrow + 1, s_head + 1, b + 1], Qv[c + 2, qrow + 1, s_head + 1, b + 1])
+        _wmma_cat(_q8(Qv, c + 1, qrow + 1, s_head + 1, b + 1), _q8(Qv, c + 2, qrow + 1, s_head + 1, b + 1))
     end
     oacc = ntuple(_ -> _wmma_zero(), Val(8))
     running_max = -Inf32; running_sum = 0f0
@@ -394,7 +403,12 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT})
                 if lq < S
                     den = row_sum[rbn * 16 + row + 1]
                     d = wave * 16 + sub
-                    O[d + 1, lq + 1, head + 1, b + 1] = den > 0f0 ? oa[n][i + 1].value / den : 0f0
+                    ov = den > 0f0 ? oa[n][i + 1].value / den : 0f0
+                    if HS
+                        O[d + 1, head + 1, lq + 1, b + 1] = ov      # (D, H, S, B): the layout the output projection reads
+                    else
+                        O[d + 1, lq + 1, head + 1, b + 1] = ov
+                    end
                 end
             end
             nothing
@@ -407,11 +421,14 @@ end
 # Launch of the LDS kernel (256 threads per workgroup; grid = 32-query blocks x (batch, head pair)). On an AMDGPU.jl that has the `flat_work_group_size` compiler option
 # (the luminal-launch-bounds branch, see TODO.md) the kernel is compiled for exactly 256 threads per workgroup, which lifts LLVM's
 # 192-VGPR cap (it assumes 1024 threads otherwise); stock AMDGPU.jl launches it without.
-function _launch_flash_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, nb) where {NT}
+# True when `_launch_flash_lds!` takes the 128-row kernel, which also reads a Float32 query and can write the (D, H, S, B) output layout.
+_flash_rows128(NT) = NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64" && :flat_work_group_size in AMDGPU.COMPILER_KWARGS
+
+function _launch_flash_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, nb; hs::Bool = false) where {NT}
     @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
         if NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64"
             # D = 256: the 128-row, 512-thread block (needs the launch bounds: 252 VGPRs)
-            @roc groupsize=512 gridsize=(cld(S, 64), nb) flat_work_group_size=512 _flash_prefill_lds2!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
+            @roc groupsize=512 gridsize=(cld(S, 64), nb) flat_work_group_size=512 _flash_prefill_lds2!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT), Val(hs))
             return nothing
         end
         @roc groupsize=256 gridsize=(cld(S, 32), nb) flat_work_group_size=256 _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
@@ -517,9 +534,15 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
     for b in 1:B
         pos = posh[length(posh) == 1 ? 1 : b]
         NK = pos + S
+        scale2 = scale * 1.4426950408889634f0
+        if _lds_attn_ok(D, H, KVH) && _flash_rows128(D ÷ 32) && !q8 && q isa ROCArray{Float32,4} && out isa ROCArray{Float32} && length(out) == D * H * S
+            # the 128-row kernel reads the Float32 query and writes the (D, H, S, B) output itself: no Float16 copy of q, no zero fill, no permute
+            _launch_flash_lds!(Base.reshape(out, D, H, S, B), reinterpret(WMMA_V4F, q), reinterpret(WMMA_V8H, pk), reinterpret(WMMA_V8H, pv), S, H, KVH, scale2, pos,
+                               Val(D ÷ 32), H ÷ 2; hs = true)
+            continue
+        end
         q16 = AMDGPU.zeros(Float16, D, S, H, 1); q16 .= q
         ob = AMDGPU.zeros(Float32, D, S, H, 1)
-        scale2 = scale * 1.4426950408889634f0
         if _lds_attn_ok(D, H, KVH)
             kt, vd = pk, pv                        # the cache itself: the kernel stages K and V tiles through LDS
             if q8                                   # attend to the dequantized cache (the same values the decode kernel uses)
