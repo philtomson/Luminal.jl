@@ -539,6 +539,11 @@ function wmma_q4_swiglu!(H::ROCArray{Float16,2}, Pg, scale_g, mn_g, Pu, scale_u,
         throw(ArgumentError("wmma_q4_swiglu!: need M % 64 == 0, padded N % 256 == 0 and two weights of the same size and kind"))
     Bv = reinterpret(WMMA_V8H, B); Hv = reinterpret(WMMA_V8H, H)
     Pwg = reinterpret(UInt32, Pg); Pwu = reinterpret(UInt32, Pu)
+    if M % 128 == 0 && K % 64 == 0 && ispow2(group) && get(ENV, "LUMINAL_WMMA_G", "1") != "0"
+        _launch_q4(_wmma_q4_gpair_kernel!, (Hv, Pwg, scale_g, mn_g === nothing ? scale_g : mn_g, Pwu, scale_u, mn_u === nothing ? scale_u : mn_u, Bv, K, N, group,
+                                            Val(mn_g === nothing)), 1024, (Npad ÷ 256, M ÷ 128), 0)
+        return H
+    end
     _launch_q4(_wmma_q4_swiglu_kernel!, (Hv, Pwg, scale_g, mn_g === nothing ? scale_g : mn_g, Pwu, scale_u, mn_u === nothing ? scale_u : mn_u, Bv, K, N, group,
                                          Val(mn_g === nothing), Val(2)), 1024, (Npad ÷ 256, M ÷ 64), 0)
     return H
@@ -607,6 +612,78 @@ function _wmma_q4_g_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, R, hr::V
         sync_workgroup()
     end
     _wmma_store_big!(C, acc, bm + wr * 32, bn + wt * 64, sl, h, N, R, hr)
+    return
+    end
+end
+
+# --- the paired gate/up GEMM with the SwiGLU in the epilogue, in the structure of the 256 x 256 kernel ---------------
+# H (M, N) Float16 = silu(Wg B) * (Wu B): a 256-row block holds 128 gate rows and the 128 up rows of the same output rows, interleaved in
+# 16-row tiles (tile 2p = gate rows 16p..16p+15 of the block, tile 2p + 1 = the up rows), so a wave's two A tiles (2 wr, 2 wr + 1) are
+# the gate and the up fragments of the same 16 output rows against the same activation fragments: in the epilogue every lane holds g
+# and u of the same elements. Same requirements as the plain kernel on the paired weights (M % 128 == 0 output rows).
+@inline function _gp_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, grow, up, tok, kk, q, group, ::Val{SYM}) where {SYM}
+    gi = (64 * q + 16 * kk) >> trailing_zeros(group) + 1
+    sa = Float32(up ? Scu[gi, grow + 1] : Scg[gi, grow + 1])
+    ma = SYM ? -8f0 * sa : Float32(up ? Mnu[gi, grow + 1] : Mng[gi, grow + 1])
+    w1 = up ? Pwu[8q + 2kk + 1, grow + 1] : Pwg[8q + 2kk + 1, grow + 1]
+    w2 = up ? Pwu[8q + 2kk + 2, grow + 1] : Pwg[8q + 2kk + 2, grow + 1]
+    return (w1, w2, sa, ma, Bv[8q + 2kk + 1, tok + 1], Bv[8q + 2kk + 2, tok + 1])
+end
+
+@inline function _wmma_store_gpair!(Hv, acc, m0, n0, r, h, N)
+    for j in 0:3
+        col = n0 + 16j + r
+        g = acc[j + 1]; u = acc[4 + j + 1]                       # (A tile 0 = gate, A tile 1 = up) x token tile j
+        v1, v2, v3, v4, v5, v6, v7, v8 = ntuple(e -> _swiglu_f(g[e].value, u[e].value), Val(8))
+        lo = h == 0
+        q1 = AMDGPU.Device.shfl_xor(ifelse(lo, v5, v1), Cint(16))
+        q2 = AMDGPU.Device.shfl_xor(ifelse(lo, v6, v2), Cint(16))
+        q3 = AMDGPU.Device.shfl_xor(ifelse(lo, v7, v3), Cint(16))
+        q4 = AMDGPU.Device.shfl_xor(ifelse(lo, v8, v4), Cint(16))
+        f1 = ifelse(lo, v1, q1); f2 = ifelse(lo, q1, v5); f3 = ifelse(lo, v2, q2); f4 = ifelse(lo, q2, v6)
+        f5 = ifelse(lo, v3, q3); f6 = ifelse(lo, q3, v7); f7 = ifelse(lo, v4, q4); f8 = ifelse(lo, q4, v8)
+        if col < N
+            Hv[(m0 + 8h) ÷ 8 + 1, col + 1] = (VecElement(Float16(f1)), VecElement(Float16(f2)), VecElement(Float16(f3)), VecElement(Float16(f4)),
+                                               VecElement(Float16(f5)), VecElement(Float16(f6)), VecElement(Float16(f7)), VecElement(Float16(f8)))
+        end
+    end
+    return
+end
+
+function _wmma_q4_gpair_kernel!(Hv, Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, K, N, group, ::Val{SYM}) where {SYM}
+    @inbounds begin
+    tid = workitemIdx().x - 1
+    wave = tid ÷ 32; lane = tid % 32; sl = lane % 16; h = lane ÷ 16
+    wr = wave ÷ 4; wt = wave % 4
+    bm = (workgroupIdx().y - 1) * 128; bn = (workgroupIdx().x - 1) * 256          # bm: first output row of the block
+    As = @ROCStaticLocalArray(WMMA_V8H, (16, 16, 4, 2), false)
+    Bs = @ROCStaticLocalArray(WMMA_V8H, (16, 16, 4, 2), false)
+    acc = ntuple(_ -> _wmma_zero(), Val(8))
+    row = tid ÷ 4; kk = tid % 4
+    tile = row ÷ 16; inr = row % 16
+    up = (tile & 1) == 1                                          # odd tiles hold the up rows (a whole wave: 64 threads per tile)
+    grow = min(bm + (tile >> 1) * 16 + inr, 8 * size(Hv, 1) - 1)  # the output row this weight row belongs to
+    tok = bn + row
+    pos = ((inr + 2 * kk) & 15) + 1
+    nk = K ÷ 64
+    ld = _gp_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, grow, up, tok, kk, 0, group, Val(SYM))
+    dec = _g_decode(ld)
+    for q in 0:nk-1
+        a1, a2, b1, b2 = dec
+        As[pos, tile + 1, kk + 1, 1] = a1
+        As[pos, tile + 1, kk + 1, 2] = a2
+        Bs[pos, tile + 1, kk + 1, 1] = b1
+        Bs[pos, tile + 1, kk + 1, 2] = b2
+        sync_workgroup()
+        q + 1 < nk && (ld = _gp_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, grow, up, tok, kk, q + 1, group, Val(SYM)))
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 0)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 1)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 2)
+        dec = _g_decode(ld)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 3)
+        sync_workgroup()
+    end
+    _wmma_store_gpair!(Hv, acc, bm + wr * 16, bn + wt * 64, sl, h, N)
     return
     end
 end

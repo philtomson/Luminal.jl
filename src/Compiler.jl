@@ -879,7 +879,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
     # Gate / up GEMMs with the SwiGLU in the epilogue: a `SwiGLUOp` (computed as Float16, see above) whose two inputs are int4 matmuls of
     # the same activations that nothing else reads becomes one step (`wmma_q4_swiglu!`): no Float32 gate / up results, no elementwise kernel.
     swiglu_fused = Dict{Int, Any}()   # SwiGLUOp node => (gate weight id, up weight id, activation id, activation view)
-    if get(ENV, "LUMINAL_FUSED_SWIGLU", "1") != "0" && fuse && compile_device isa Luminal.AMDDevice && Luminal.wmma_enabled()
+    if get(ENV, "LUMINAL_FUSED_SWIGLU", "0") == "1" && fuse && compile_device isa Luminal.AMDDevice && Luminal.wmma_enabled()
         is_mmq(op) = op isa Luminal.MatMul || op isa Luminal.MatMulQ4
         for (nid, nd) in enumerate(graph.nodes)
             (nd.op isa Luminal.SwiGLUOp && length(nd.inputs) == 2 && dty[nid] === Float16 && !persistent[nid] && !(nid in retain)) || continue

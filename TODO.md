@@ -954,3 +954,6 @@ Qwen3.8-27B UD-Q4_K_XL, pp2048 on this machine: gufo 689 tok/s (2.97 s), us 549 
 
 ### The 256 x 256 GEMM is the default (`LUMINAL_WMMA_G=0` for the warp-specialized one)
 `_wmma_q4_g_kernel!` (gufo's structure, see "What gufo's prefill does") is used when M % 256 == 0, K % 64 == 0, padded N % 256 == 0 and the group is a power of two. End to end (Q4_K_XL, chunk 512, three alternating runs): 8192 tokens 530.5 / 529.3 vs 518.4 tok/s (+2%); 2048 tokens 568.9 / 551.2 vs 556.8 (+0-2%, noisy).
+
+### Paired gate/up kernel in the 256 x 256 structure: no gain, fusion off by default
+`_wmma_q4_gpair_kernel!` (a 256-row block = 128 gate + 128 up rows in interleaved 16-row tiles, so each wave's two A tiles are the gate and up fragments of the same output rows; epilogue silu(g) * u -> Float16) is correct, but against two plain 256x256 GEMMs + the elementwise SwiGLU kernel it is 3% slower in isolation (interleaved best-of-40, 17408x5120x512: 6.16 vs 5.97 ms; the 64-row kernel's apparent 3.6% win was against the older, slower GEMMs) and identical end to end (4 alternating runs, 2048 / 8192 tokens: fused 553-555 / 533-534, unfused 549-555 / 534 tok/s). `LUMINAL_FUSED_SWIGLU=1` turns the fused step on (default off). State at this commit: 554 tok/s at 2048 tokens, 533 at 8192 (gufo 689 / 646).
