@@ -1028,3 +1028,9 @@ The 480 `linear_copy` launches (43.7 ms per 2048-token prompt) all came from the
 - Used by `llama_self_attn_cached` for prefill-sized steps (S >= 16) of a gated layer with QK-norm, 0 < rotary_dim < head_dim, rotary_dim % 64 == 0 (`LUMINAL_ATTN_PREP=0` disables); decode / verify steps keep the composite form. CPU and other shapes run a reference loop inside the op. `tests/test_attn_prep.jl`.
 - Chunk-64 vs one-shot logits on 8 real layers: rel err 4.4e-5 (was 0: the one-shot path uses the composite ops), first 16 tokens identical (different RMSNorm summation order).
 - End to end, interleaved pairs on a quiet machine: 2048 tokens 637.3 / 638.2 vs 624.1 / 620.4 tok/s (+2.1..2.9%), 8192 tokens 593.1 / 594.5 vs 576.2 / 579.4 (+2.6..2.9%). Gufo: 689 / 646.
+
+### GEMM main loop: LDS / WMMA interleaving experiments (2026-10-13)
+gufo's loop interleaves ds_loads with WMMAs finely (`L2 w W2 L2 w W2`); ours had the reads of a K16 step in one cluster. Two ways to ask for gufo's order:
+- `llvm.amdgcn.sched.group.barrier` patterns (3 LDS reads : 2 WMMA, 2:1, 1:1, 6:4; `benchmarks/gemm_sched_group.jl`): WRONG RESULTS on LLVM 18 at the production K (rel diff 0.10-0.30 vs the unscheduled kernel; small K = 1024 happened to be exact for two of them). Do not use.
+- source-level software pipelining of the fragments (read step ks + 1's A / B fragments before issuing step ks's MMAs; `benchmarks/gemm_frag_prefetch.jl`): identical speed (36.1 vs 36.0, 37.6 vs 37.5, 36.5 vs 36.5, 37.0 vs 37.1 TFLOP/s; the compiler already schedules the reads that way).
+The kernel stays at 36-37.5 TFLOP/s on the quiet machine (gufo in-model 38.5). Tried and exhausted on the structure side: unconditional prefetch (+3%), split decode, depth-2 load pipeline, bounds-check removal, workgroup swizzle, f16 output store (gate/up only), ROCm's LLVM 24 backend (+1.4% with max-ilp), fragment prefetch, sched.group.barrier.
