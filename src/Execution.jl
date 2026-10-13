@@ -773,7 +773,7 @@ end
 # (A plain AMDGPU kernel, not a KernelAbstractions one: KA's lowering loses the types of the Val
 # parameter here. Grid: one workgroup per (value head, batch), 4 * dv threads. SNAP: whether any
 # per-step state snapshots are wanted (snap_t > 0); compiled out otherwise, which is faster.)
-function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, ::Val{HD}, ::Val{SNAP}) where {HD,SNAP}
+function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, ::Val{HD}, ::Val{SNAP}, ::Val{NUQ}, ::Val{NUV}) where {HD,SNAP,NUQ,NUV}
     NL = DELTA_REG_LANES
     tid = workitemIdx().x
     T = workgroupDim().x
@@ -797,32 +797,61 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
     t0 = 1
     while t0 <= L
         n = min(DELTA_REG_CHUNK, L - t0 + 1)
-        idx = tid
-        while idx <= n * DK                         # stage this chunk's q (scaled) and k
-            tt = (idx - 1) ÷ DK + 1
-            i = idx - (tt - 1) * DK
-            @inbounds qs[idx] = Float32(q[i, hk, t0 + tt - 1, b]) * scale
-            @inbounds ks[idx] = Float32(k[i, hk, t0 + tt - 1, b])
-            idx += T
+        # Stage this chunk's q (scaled), k and v: all of a thread's loads are issued together and only then stored (a loop that
+        # loaded and stored one element at a time paid a memory latency per iteration: ~8 per chunk, a third of the kernel's time).
+        qk, vv = let n = n, t0 = t0       # (rebound: closures over variables reassigned in this loop would box them)
+            qk = ntuple(Val(NUQ)) do u
+                lidx = tid + T * (u - 1)
+                lok = lidx <= n * DK
+                ltt = lok ? (lidx - 1) ÷ DK + 1 : 1
+                li = lok ? lidx - (ltt - 1) * DK : 1
+                (lok, @inbounds(Float32(q[li, hk, t0 + ltt - 1, b])) * scale, @inbounds(Float32(k[li, hk, t0 + ltt - 1, b])))
+            end
+            vv = ntuple(Val(NUV)) do u
+                lidx = tid + T * (u - 1)
+                lok = lidx <= n * dv
+                ltt = lok ? (lidx - 1) ÷ dv + 1 : 1
+                ljj = lok ? lidx - (ltt - 1) * dv : 1
+                (lok, @inbounds(Float32(v[ljj, h, t0 + ltt - 1, b])))
+            end
+            (qk, vv)
         end
-        idx = tid
-        while idx <= n * dv                         # v
-            tt = (idx - 1) ÷ dv + 1
-            jj = idx - (tt - 1) * dv
-            @inbounds vsm[idx] = Float32(v[jj, h, t0 + tt - 1, b])
-            idx += T
+        dd = tid <= n ? exp(@inbounds(Float32(g[h, t0 + tid - 1, b]))) : 0f0
+        bb = tid <= n ? @inbounds(Float32(beta[h, t0 + tid - 1, b])) : 0f0
+        let qk = qk, vv = vv
+            ntuple(Val(NUQ)) do u
+                sok, sqv, skv = qk[u]
+                if sok
+                    sidx = tid + T * (u - 1)
+                    @inbounds qs[sidx] = sqv
+                    @inbounds ks[sidx] = skv
+                end
+                nothing
+            end
+            ntuple(Val(NUV)) do u
+                vok, vx = vv[u]
+                vok && (@inbounds vsm[tid + T * (u - 1)] = vx)
+                nothing
+            end
         end
-        idx = tid
-        while idx <= n                              # decay and beta
-            @inbounds ds[idx] = exp(Float32(g[h, t0 + idx - 1, b]))
-            @inbounds bs[idx] = Float32(beta[h, t0 + idx - 1, b])
-            idx += T
+        if tid <= n
+            @inbounds ds[tid] = dd
+            @inbounds bs[tid] = bb
         end
         sync_workgroup()
-        idx = tid
-        while idx <= n                              # k . q of each step (independent of the state)
-            @inbounds kqs[idx] = _dot_mem(ks, qs, (idx - 1) * DK, Val(DK))
-            idx += T
+        wv = (tid - 1) ÷ 32 + 1; ln = (tid - 1) % 32      # k . q of each step (independent of the state): one wave per step
+        while wv <= n
+            part = 0f0
+            for m in 0:cld(DK, 32)-1
+                if ln + 32m < DK
+                    @inbounds part = muladd(ks[(wv - 1) * DK + ln + 32m + 1], qs[(wv - 1) * DK + ln + 32m + 1], part)
+                end
+            end
+            part += AMDGPU.Device.shfl_xor(part, Cint(16)); part += AMDGPU.Device.shfl_xor(part, Cint(8))
+            part += AMDGPU.Device.shfl_xor(part, Cint(4)); part += AMDGPU.Device.shfl_xor(part, Cint(2))
+            part += AMDGPU.Device.shfl_xor(part, Cint(1))
+            ln == 0 && (@inbounds kqs[wv] = part)
+            wv += T ÷ 32
         end
         sync_workgroup()
         if active
@@ -875,7 +904,8 @@ end
 # resident at once; ~1.4x faster than without); stock AMDGPU.jl launches it without either.
 function _launch_delta_reg!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, nv, B, dk, dv)
     nt = cld(DELTA_REG_LANES * dv, 32) * 32
-    args = (out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, Val(dk ÷ DELTA_REG_LANES), Val(snap_t > 0))
+    args = (out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, Val(dk ÷ DELTA_REG_LANES), Val(snap_t > 0),
+            Val(cld(DELTA_REG_CHUNK * dk, nt)), Val(cld(DELTA_REG_CHUNK * dv, nt)))   # loads per thread of a chunk's q / k and v
     @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
         wpe = dk == 128 ? 12 : 1
         @roc groupsize=nt gridsize=nv * B flat_work_group_size=nt waves_per_eu=wpe _delta_rule_reg_kernel!(args...)
