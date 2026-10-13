@@ -1235,6 +1235,107 @@ function execute_op!(out, op::ConvDeltaRule, x, cstate, cw, g, beta, st, lens, s
     return out
 end
 
+# --- AttnPrep / GatedAttnOut: the gated attention layer's query / key preparation and output gate ---------------
+# One wave per (head, token, batch); a lane owns head_dim / 32 elements of the head (e = lane + 32 i), so the two elements a RoPE rotation
+# pairs (e and e + rotary_dim / 2) sit in the same lane when rotary_dim % 64 == 0.
+function _attn_prep_kernel!(out, x, w, cs, sn, D, H, S, rd, rowstride, ncs3, eps, ::Val{NS}) where {NS}
+    tid = workitemIdx().x - 1
+    lane = tid % 32
+    wv = (workgroupIdx().x - 1) * (workgroupDim().x ÷ 32) + tid ÷ 32
+    wv < H * S * (length(out) ÷ (D * H * S)) || return
+    h = wv % H; s = (wv ÷ H) % S; b = wv ÷ (H * S)
+    src = ((b * S + s) * H + h) * rowstride
+    xp = pointer(x) + 4 * src; wp = pointer(w)
+    vals = ntuple(i -> unsafe_load(xp, lane + 32 * (i - 1) + 1), Val(NS))
+    ss = 0f0
+    for i in 1:NS
+        ss += vals[i] * vals[i]
+    end
+    ss += AMDGPU.Device.shfl_xor(ss, Cint(16)); ss += AMDGPU.Device.shfl_xor(ss, Cint(8)); ss += AMDGPU.Device.shfl_xor(ss, Cint(4))
+    ss += AMDGPU.Device.shfl_xor(ss, Cint(2)); ss += AMDGPU.Device.shfl_xor(ss, Cint(1))
+    r = 1f0 / sqrt(ss / D + eps)
+    ys = ntuple(i -> vals[i] * r * unsafe_load(wp, lane + 32 * (i - 1) + 1), Val(NS))
+    half = rd ÷ 2; hs = half ÷ 32                              # the partner of slot i (< hs) is slot i + hs
+    cb = ncs3 == 1 ? 0 : b
+    cp = pointer(cs) + 4 * (half * (s + S * cb)); sp = pointer(sn) + 4 * (half * (s + S * cb))
+    op = pointer(out) + 4 * (((b * H + h) * S + s) * D)
+    T = eltype(out)
+    for i in 1:NS
+        e = lane + 32 * (i - 1)
+        y = ys[i]
+        if i <= hs                                             # first half of the rotated dims
+            c = unsafe_load(cp, e + 1); sv = unsafe_load(sp, e + 1)
+            y = ys[i] * c - ys[i + hs] * sv
+        elseif i <= 2hs                                        # second half
+            e0 = e - half
+            c = unsafe_load(cp, e0 + 1); sv = unsafe_load(sp, e0 + 1)
+            y = ys[i] * c + ys[i - hs] * sv
+        end
+        unsafe_store!(op, T(y), e + 1)
+    end
+    return
+end
+
+function execute_op!(out, op::AttnPrep, x, w, cs, sn)
+    D, H, rd = op.head_dim, op.heads, op.rotary_dim
+    S = size(out, 2); B = size(out, 4)
+    if out isa AMDGPU.ROCArray && x isa AMDGPU.ROCArray{Float32} && w isa AMDGPU.ROCArray{Float32} && cs isa AMDGPU.ROCArray{Float32} &&
+       sn isa AMDGPU.ROCArray{Float32} && D % 32 == 0 && rd % 64 == 0 && 0 < rd <= D && D <= 256
+        xd, wd, cd, sd = _dense(x), _dense(w), _dense(cs), _dense(sn)
+        ncs3 = length(cd) ÷ ((rd ÷ 2) * S)
+        @roc groupsize=256 gridsize=cld(H * S * B, 8) _attn_prep_kernel!(out, xd, wd, cd, sd, D, H, S, rd, op.rowstride, ncs3, op.epsilon, Val(D ÷ 32))
+        return out
+    end
+    # reference path (CPU, other shapes): per head, RMSNorm then rotate-half on the first rd dims
+    xa = Array(x); wa = vec(Array(w)); ca = Base.reshape(Array(cs), rd ÷ 2, S, :); sa = Base.reshape(Array(sn), rd ÷ 2, S, :)
+    xr = Base.reshape(xa, op.rowstride * H, S, B)
+    res = zeros(Float32, D, S, H, B)
+    for b in 1:B, h in 1:H, s in 1:S
+        v = Float32.(xr[(h-1)*op.rowstride+1:(h-1)*op.rowstride+D, s, b])
+        y = v .* (1f0 / sqrt(sum(abs2, v) / D + op.epsilon)) .* wa
+        cb = size(ca, 3) == 1 ? 1 : b
+        half = rd ÷ 2
+        z = copy(y)
+        for i in 1:half
+            z[i] = y[i] * ca[i, s, cb] - y[i+half] * sa[i, s, cb]
+            z[i+half] = y[i+half] * ca[i, s, cb] + y[i] * sa[i, s, cb]
+        end
+        res[:, s, h, b] = z
+    end
+    copyto!(out, res)
+    return out
+end
+
+function _gated_attn_out_kernel!(out, a, qp, D, H, n)
+    i = (workgroupIdx().x - 1) * workgroupDim().x + workitemIdx().x - 1
+    i < n || return
+    r = i % (D * H); col = i ÷ (D * H)
+    h = r ÷ D; d = r % D
+    g = @inbounds qp[col * (2 * D * H) + h * 2 * D + D + d + 1]
+    @inbounds out[i + 1] = eltype(out)(a[i + 1] * (1f0 / (1f0 + exp(-g))))
+    return
+end
+
+function execute_op!(out, op::GatedAttnOut, a, qp)
+    D = op.head_dim
+    H = size(a, 1) ÷ D
+    if out isa AMDGPU.ROCArray && a isa AMDGPU.ROCArray{Float32} && qp isa AMDGPU.ROCArray{Float32}
+        ad, qd = _dense(a), _dense(qp)
+        n = length(out)
+        @roc groupsize=256 gridsize=cld(n, 256) _gated_attn_out_kernel!(vec(out), vec(ad), vec(qd), D, H, n)
+        return out
+    end
+    aa = Array(a); qa = Base.reshape(Array(qp), 2D * H, :)
+    ar = Base.reshape(aa, D * H, :)
+    res = similar(ar, Float32)
+    for col in axes(ar, 2), h in 0:H-1, d in 1:D
+        g = qa[h * 2D + D + d, col]
+        res[h * D + d, col] = ar[h * D + d, col] / (1f0 + exp(-g))
+    end
+    copyto!(out, Base.reshape(res, size(out)))
+    return out
+end
+
 # --- Float16 matmul weights ---------------------------------------------------
 # A matmul weight stored as Float16, transposed to (In, Out) so that each output
 # row is contiguous, and read through 16-byte (8 x Float16) vector loads. It keeps

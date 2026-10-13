@@ -276,14 +276,8 @@ function rope_inv_freqs(head_dim::Int, base, scaling=nothing)
     return Float32.(inv)
 end
 
-function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=10000.0f0, scaling=nothing)
-    # input: D, S, H, B
-    dims = Luminal.realized_dims(input.shape)
-    head_dim, seq, n_heads, batch = dims[1], dims[2], dims[3], dims[4]
-    
-    graph = input.graph_ref
-    
-    # Get freqs
+# The cos / sin tables of RoPE over `head_dim` dims: (head_dim / 2, seq), or (head_dim / 2, seq, batch) with one start position per sequence.
+function _rope_cos_sin(graph, head_dim::Int, seq::Int, batch, prev_seq, base, scaling)
     half_dim = div(head_dim, 2)
     inv_freqs = if scaling === nothing
         freqs = Luminal.arange(graph, half_dim) * 2.0f0 / Float32(head_dim)
@@ -295,16 +289,13 @@ function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=1000
         Luminal.add_op!(graph, Luminal.Constant(rope_inv_freqs(head_dim, base, scaling)),
                         Tuple{Int, Int, Luminal.ShapeTracker}[], Luminal.ShapeTracker([half_dim]))
     end
-    
+
     if prev_seq isa Luminal.GraphTensor && batch isa Int && batch > 1 &&
        Luminal.realized_dims(prev_seq.shape) == [batch]
         # One start position per sequence (batched decode): tables (half, seq, batch)
         pos = Luminal.expand(Luminal.arange(graph, seq), 2, batch) + Luminal.expand(prev_seq, 1, seq)
         emb = Luminal.expand(Luminal.expand(inv_freqs, 2, seq), 3, batch) * Luminal.expand(pos, 1, half_dim)
-        cos_b, sin_b = Luminal.cos(emb), Luminal.sin(emb)
-        return Luminal.add_op!(graph, Luminal.RotaryEmbed(),
-                               [(input.id, 0, input.shape), (cos_b.id, 0, cos_b.shape), (sin_b.id, 0, sin_b.shape)],
-                               Luminal.ShapeTracker(collect(dims)))
+        return Luminal.cos(emb), Luminal.sin(emb)
     end
 
     pos_seq = Luminal.arange(graph, seq) # shape (seq)
@@ -313,22 +304,28 @@ function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=1000
     else
         pos = pos_seq + prev_seq
     end
-    
+
     # emb = pos @ inv_freqs
     # pos: (seq), inv_freqs: (half_dim)
     # emb: (seq, half_dim)
     emb = Luminal.matmul(Luminal.expand(pos, 2, 1), Luminal.expand(inv_freqs, 1, 1))
-    
+
     # Tables (half_dim, seq); identical for q and k and across layers, so they are
     # computed once per graph (common-subexpression elimination)
     emb_t = Luminal.permute(emb, [2, 1])
-    cos_t = Luminal.cos(emb_t)
-    sin_t = Luminal.sin(emb_t)
+    return Luminal.cos(emb_t), Luminal.sin(emb_t)
+end
 
+function apply_rotary_embeddings(input::Luminal.GraphTensor, prev_seq; base=10000.0f0, scaling=nothing)
+    # input: D, S, H, B
+    dims = Luminal.realized_dims(input.shape)
+    head_dim, seq, n_heads, batch = dims[1], dims[2], dims[3], dims[4]
+    graph = input.graph_ref
+    cos_b, sin_b = _rope_cos_sin(graph, head_dim, seq, batch, prev_seq, base, scaling)
     # Standard Llama RoPE, rotate-half form, as one kernel (see Luminal.RotaryEmbed):
     #   out_0 = x0 * cos - x1 * sin,  out_1 = x1 * cos + x0 * sin
     return Luminal.add_op!(graph, Luminal.RotaryEmbed(),
-                           [(input.id, 0, input.shape), (cos_t.id, 0, cos_t.shape), (sin_t.id, 0, sin_t.shape)],
+                           [(input.id, 0, input.shape), (cos_b.id, 0, cos_b.shape), (sin_b.id, 0, sin_b.shape)],
                            Luminal.ShapeTracker(collect(dims)))
 end
 
@@ -818,6 +815,14 @@ end
 
 
 
+# The fused query / key preparation applies to a gated attention layer with QK-norm and a partial rotary dim that is a multiple of 64, on
+# prefill-sized steps (the decode and verify steps keep the composite form).
+_fused_attn_prep(sa::SelfAttention, S::Int) =
+    get(ENV, "LUMINAL_ATTN_PREP", "1") != "0" && sa.output_gate && sa.q_norm !== nothing && sa.k_norm !== nothing &&
+    sa.q_norm.weight !== nothing && sa.k_norm.weight !== nothing && !sa.q_norm.mean_norm && !sa.k_norm.mean_norm &&
+    sa.q_norm.bias === nothing && sa.k_norm.bias === nothing && 0 < sa.rotary_dim < sa.head_dim && sa.rotary_dim % 64 == 0 &&
+    sa.head_dim % 32 == 0 && sa.head_dim <= 256 && S >= 16 && sa.window == 0
+
 """
     llama_self_attn_cached(sa, x, step_pos, step_pos_tensor, past_k, past_v; rope_base=500000f0)
 
@@ -847,13 +852,29 @@ function llama_self_attn_cached(sa::SelfAttention,
     max_seq = Luminal.realized_dims(past_k.shape)[2]
 
     # Project the current tokens: (Hidden, S, B) -> (D, S, H, B), then RoPE
-    q, gate = _query_and_gate(sa, sa.q_proj(x), S, batch)
-    q     = Luminal.permute(q, [1, 3, 2, 4])
-    k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
-    v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
     base = _rope_base(sa, rope_base)
-    q     = _rope(sa, _qk_norm(sa.q_norm, q),     step_pos_tensor, base)
-    k_new = _rope(sa, _qk_norm(sa.k_norm, k_new), step_pos_tensor, base)
+    prep = _fused_attn_prep(sa, S)
+    if prep
+        # gated attention with QK-norm and partial RoPE (Qwen3.5), prefill-sized steps: the norm, the rotation and the layout change of q
+        # and k are one kernel each, and the output gate is read from q_proj's output in place (see AttnPrep, GatedAttnOut)
+        g_ = x.graph_ref; rd = sa.rotary_dim
+        cos_t, sin_t = _rope_cos_sin(g_, rd, S, batch, step_pos_tensor, base, sa.rope_scaling)
+        qraw = sa.q_proj(x)
+        kraw = sa.k_proj(x)
+        q = Luminal.add_op!(g_, Luminal.AttnPrep(sa.q_norm.epsilon, D, sa.n_heads, rd, 2D),
+                            [(t.id, 0, t.shape) for t in (qraw, sa.q_norm.weight, cos_t, sin_t)], Luminal.ShapeTracker([D, S, sa.n_heads, batch]))
+        k_new = Luminal.add_op!(g_, Luminal.AttnPrep(sa.k_norm.epsilon, D, KVH, rd, D),
+                                [(t.id, 0, t.shape) for t in (kraw, sa.k_norm.weight, cos_t, sin_t)], Luminal.ShapeTracker([D, S, KVH, batch]))
+        v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
+        gate = qraw
+    else
+        q, gate = _query_and_gate(sa, sa.q_proj(x), S, batch)
+        q     = Luminal.permute(q, [1, 3, 2, 4])
+        k_new = Luminal.permute(Luminal.reshape(sa.k_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
+        v_new = Luminal.permute(Luminal.reshape(sa.v_proj(x), [D, KVH, S, batch]), [1, 3, 2, 4])
+        q     = _rope(sa, _qk_norm(sa.q_norm, q),     step_pos_tensor, base)
+        k_new = _rope(sa, _qk_norm(sa.k_norm, k_new), step_pos_tensor, base)
+    end
 
     # Attention over cache slots [0, pos) plus the current token(s), in one kernel
     # (see Luminal.DecodeAttention): scores, softmax and the weighted sum of V,
@@ -864,7 +885,8 @@ function llama_self_attn_cached(sa::SelfAttention,
     out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(sa.scale, true, sa.window), ins,
                           Luminal.ShapeTracker(S == 1 ? [D, sa.n_heads, batch] : [D, sa.n_heads, S, batch]))
     out = Luminal.reshape(out, [D * sa.n_heads, S, batch])
-    out = _gate_output(sa, out, gate, S, batch)
+    out = prep ? Luminal.add_op!(x.graph_ref, Luminal.GatedAttnOut(D), [(out.id, 0, out.shape), (gate.id, 0, gate.shape)],
+                                 Luminal.ShapeTracker([D * sa.n_heads, S, batch])) : _gate_output(sa, out, gate, S, batch)
 
     return sa.o_proj(out), k_new, v_new
 end

@@ -335,6 +335,25 @@ struct ConvDeltaRule <: Op
     epsilon::Float32
 end
 
+# AttnPrep: the query / key preparation of a gated full-attention layer in one kernel. Input x (rows, S, B) with `rowstride` rows per head
+#   (2 head_dim for q_proj, whose rows are [query; gate] per head, head_dim for k_proj), the (1 + w) weight of the per-head RMSNorm
+#   (head_dim,), and the RoPE cos / sin tables (rotary_dim / 2, S [, B]). out (head_dim, S, heads, B) = partial RoPE of the first
+#   `rotary_dim` dims of rmsnorm(head of x) * w (rotate-half; the other dims pass through): what slicing the head out of x, the RMSNorm,
+#   the permute and `_rope` (slice, RotaryEmbed, slice, concat) compute with six copies.
+struct AttnPrep <: Op
+    epsilon::Float32
+    head_dim::Int
+    heads::Int
+    rotary_dim::Int
+    rowstride::Int
+end
+
+# GatedAttnOut: out (head_dim * heads, S, B) = a * sigmoid(gate), the gate being the second half of every head's rows of q_proj's output
+#   qp (2 head_dim * heads, S, B): the attention output times its output gate without copying the gate out.
+struct GatedAttnOut <: Op
+    head_dim::Int
+end
+
 # ArgMax: out (S, B) = the 0-based index of the first maximum along dim 1 of x (V, S, B), as Float32.
 #   Greedy decoding picks tokens on the device instead of reading the logits back.
 struct ArgMax <: Op end
