@@ -275,7 +275,13 @@ end
 # The same pipeline as `_flash_prefill_lds!` (S = Q K^T by dim halves in registers, 4-threads-per-row softmax, V^T in LDS, three barriers
 # per 16-key tile) but every K / V tile is used by twice as many rows: half the global (L2) traffic per FLOP and half the barriers.
 #   S phase: wave w computes the score tile of row block w % 8 over the dim half w ÷ 8;  P V: wave w owns dim tile w for all 8 row blocks.
+#   V staging (as in gufo's pipelined attention benchmark, tools/bench/attn_causal_bench.hip): waves 0-7 load the tile with 4 lanes covering
+#   64 contiguous bytes of one key row and 8 key pairs per wave instruction (full cache lines), each lane holds the same 8 dims of two adjacent
+#   keys and writes them as 8 packed dwords of V^T (row = dim, the 16 keys contiguous, 12 dwords per row) instead of 16 two-byte stores, with
+#   16 dwords of padding after every 8 dims so the 32 lanes of a store hit 32 different banks. 16.5 -> 17.4 TFLOP/s at 2048 tokens from an
+#   empty context, 18.6 -> 19.8 at depth 8192, 19.1 -> 20.3 at 32256 (S = 512, D = 256, 24 / 4 heads).
 function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
+    SW = 16                                   # padding of the transposed V tile (dwords per 8 dims; see below)
     D = 32 * NT; NC = D ÷ 8                   # NT = 8: D = 256, 32 16-byte chunks per key row
     KS = NT                                   # k steps (16 dims) per wave of the S phase: half of D / 16
     tid = workitemIdx().x - 1
@@ -292,7 +298,7 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT})
     s_head = first_head + s_tile % 2; s_qoff = (s_tile ÷ 2) * 16
 
     Ks = @ROCStaticLocalArray(WMMA_V8H, (NC + 1, 16), false)
-    Vt = @ROCStaticLocalArray(Float16, (24, D), false)
+    Vt = @ROCStaticLocalArray(UInt32, (D * 12 + (D ÷ 8) * SW + 8,), false)
     s_lds = @ROCStaticLocalArray(Float32, (17, 16, 8, 2), false)
     p_lds = @ROCStaticLocalArray(Float16, (24, 128), false)
     row_scale = @ROCStaticLocalArray(Float32, (128,), false)
@@ -308,21 +314,28 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT})
     running_max = -Inf32; running_sum = 0f0
     zero8 = ntuple(_ -> VecElement(Float16(0)), Val(8))
 
-    v_key = lane % 16; v_chunk = tid ÷ 16 + 1                    # V: lane's key, and its 16-byte chunk (8 dims) of the row
     kcur = Kc[tid % NC + 1, min(tid ÷ NC, NK - 1) + 1, kvh + 1, b + 1]
-    vcur = v_key < NK ? Vc[v_chunk, v_key + 1, kvh + 1, b + 1] : zero8
+    # V staging (waves 0-7): lane = 4 dim groups x 8 key pairs; this lane's 8 dims (chunk vc) of keys 2 vp and 2 vp + 1
+    vp = lane ÷ 4; vc = (wave % 8) * 4 + lane % 4 + 1
+    vdo = wave < 8
+    vA = vdo && 2vp < NK ? Vc[vc, 2vp + 1, kvh + 1, b + 1] : zero8
+    vB = vdo && 2vp + 1 < NK ? Vc[vc, 2vp + 2, kvh + 1, b + 1] : zero8
+    vbase = (vc - 1) * 8 * 12 + (vc - 1) * SW + vp + 1         # dword index of (dim 8 (vc - 1), pair vp); dim steps of 12 dwords (+ SW per 8 dims)
 
     for kt in 0:ntile - 1
         key_start = kt * 16
         Ks[tid % NC + 1, tid ÷ NC + 1] = kcur
         sync_workgroup()                # (all waves are past the previous P V: Vt may be restaged)
-        for i in 0:7
-            Vt[v_key + 1, (v_chunk - 1) * 8 + i + 1] = vcur[i + 1].value
+        if vdo
+            for i in 0:7
+                lo = reinterpret(UInt16, vA[i + 1].value); hi = reinterpret(UInt16, vB[i + 1].value)
+                Vt[vbase + i * 12] = UInt32(lo) | (UInt32(hi) << 16)
+            end
         end
         nstart = key_start + 16
         kcur = Kc[tid % NC + 1, min(nstart + tid ÷ NC, NK - 1) + 1, kvh + 1, b + 1]
-        nkey = nstart + v_key
-        vcur = nkey < NK ? Vc[v_chunk, nkey + 1, kvh + 1, b + 1] : zero8
+        vA = vdo && nstart + 2vp < NK ? Vc[vc, nstart + 2vp + 1, kvh + 1, b + 1] : zero8
+        vB = vdo && nstart + 2vp + 1 < NK ? Vc[vc, nstart + 2vp + 2, kvh + 1, b + 1] : zero8
         # S = Q K^T over this wave's half of the dims
         s_acc = _qk_dot(qf, Ks, 2 * s_kh * KS, sub)
         for i in 0:7
@@ -356,7 +369,11 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT})
         seg == 0 && (row_scale[rg + 1] = prior)
         sync_workgroup()
         # rescale the output accumulators, then O += P V for this wave's dim tile and all 8 row blocks
-        vf = _lds_frag(Vt, (wave * 16 + sub) * 24 + 1)
+        vf = let dd = wave * 16 + sub                        # the 16 keys of dim dd: 32 bytes at dword dd * 12 + (dd >> 3) * SW
+            p16 = reinterpret(Core.LLVMPtr{WMMA_V8H,3}, pointer(Vt))
+            u = (dd * 12 + (dd >> 3) * SW) ÷ 4
+            _wmma_cat(unsafe_load(p16, u + 1, Val(16)), unsafe_load(p16, u + 2, Val(16)))
+        end
         oacc = let o = oacc
             ntuple(Val(8)) do n
                 rbn = n - 1
