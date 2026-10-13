@@ -90,7 +90,10 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
 
     # gated RMSNorm per value head: norm(o) * w * silu(z)
     z = Luminal.reshape(dn.in_proj_z(x), [dv, nv, S, B])
-    o = dn.norm(o) * Luminal.silu(z)
+    # (one kernel for rmsnorm(o) * silu(z); the weight and epsilon are dn.norm's)
+    o = Luminal.add_op!(g_, Luminal.GatedRMSNormOp(dn.norm.epsilon),
+                        [(o.id, 0, o.shape), (dn.norm.weight.id, 0, dn.norm.weight.shape), (z.id, 0, z.shape)],
+                        Luminal.ShapeTracker([dv, nv, S, B]))
     return dn.out_proj(Luminal.reshape(o, [nv * dv, S, B]))
 end
 

@@ -170,6 +170,55 @@ function execute_op!(out, op::L2NormOp, x)
     return out
 end
 
+# --- RMSNorm times silu of a gate -----------------------------------------------------
+# One wave (32 lanes) per column of D elements: sum of squares by a shuffle tree, then out = x * r * w * (z / (1 + exp(-z))),
+# written in the output's element type (Float16 when it feeds a matrix-core GEMM).
+function _gated_rmsnorm_kernel!(out, x, w, z, D, ncols, eps)
+    tid = workitemIdx().x - 1
+    lane = tid % 32
+    col = (workgroupIdx().x - 1) * (workgroupDim().x ÷ 32) + tid ÷ 32
+    col < ncols || return
+    base = col * D
+    acc = 0f0
+    i = lane
+    while i < D
+        v = Float32(@inbounds x[base + i + 1])
+        acc += v * v
+        i += 32
+    end
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(16))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(8))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(4))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(2))
+    acc += AMDGPU.Device.shfl_xor(acc, Cint(1))
+    r = 1f0 / sqrt(acc / D + eps)
+    T = eltype(out)
+    i = lane
+    while i < D
+        zi = Float32(@inbounds z[base + i + 1])
+        @inbounds out[base + i + 1] = T(Float32(x[base + i + 1]) * r * Float32(w[i + 1]) * (zi / (1f0 + exp(-zi))))
+        i += 32
+    end
+    return
+end
+
+function execute_op!(out, op::GatedRMSNormOp, x, w, z)
+    D = size(x, 1)
+    xc = x isa DenseArray ? x : copy(x)
+    zc = z isa DenseArray ? z : copy(z)
+    if !(out isa AMDGPU.ROCArray)
+        x2 = Base.reshape(xc, D, :); z2 = Base.reshape(zc, D, :); o2 = Base.reshape(out, D, :)
+        for c in axes(x2, 2)
+            v = Float32.(view(x2, :, c)); zz = Float32.(view(z2, :, c))
+            o2[:, c] .= v .* (1f0 / sqrt(sum(abs2, v) / D + op.epsilon)) .* Float32.(vec(w)) .* (zz ./ (1f0 .+ exp.(-zz)))
+        end
+        return out
+    end
+    ncols = length(xc) ÷ D
+    @roc groupsize=256 gridsize=cld(ncols, 8) _gated_rmsnorm_kernel!(vec(out), vec(xc), vec(w), vec(zc), D, ncols, op.epsilon)
+    return out
+end
+
 # --- Softmax over dim 1 --------------------------------------------------------
 # One workgroup per column (all dims after the first): the column max and the
 # sum of exponentials with tree reductions, then the normalized write.

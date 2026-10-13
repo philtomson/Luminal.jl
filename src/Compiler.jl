@@ -264,7 +264,7 @@ end
 
 # Ops whose `execute_op!` writes every element of the output, so it needs no zero fill.
 _writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa Luminal.Reshape ||
-    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp || op isa Luminal.L2NormOp ||
+    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp || op isa Luminal.L2NormOp || op isa Luminal.GatedRMSNormOp ||
     op isa Luminal.RotaryEmbed || op isa Luminal.SoftmaxOp || op isa Luminal.LastToken
 
 # A matmul against a quantized / half weight writes every element of its output when it has more
@@ -864,7 +864,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         for x in eachindex(graph.nodes)
             (persistent[x] || folded[x] || dty[x] !== Float32) && continue
             nd = graph.nodes[x]
-            (nd.op isa Luminal.RMSNormOp || (is_elementwise(nd.op) && !(nd.op isa Luminal.Constant))) || continue
+            (nd.op isa Luminal.RMSNormOp || nd.op isa Luminal.GatedRMSNormOp || (is_elementwise(nd.op) && !(nd.op isa Luminal.Constant))) || continue
             (big_n(x) && gemm_input(x)) || continue
             dty[x] = Float16
             get(ENV, "LUMINAL_F16_DEBUG", "") != "" && println("[f16] node ", x, " ", typeof(nd.op).name.name, " dims ", Tuple(realized_dims(graph.shapes[x])))

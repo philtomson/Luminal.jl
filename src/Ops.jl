@@ -268,6 +268,12 @@ struct L2NormOp <: Op
     epsilon::Float32
 end
 
+# RMSNorm over dim 1 with a weight, times silu of a gate: rmsnorm(x, w) * (z * sigmoid(z)) (Gated DeltaNet's output norm).
+# Inputs x, w, z (z the shape of x).
+struct GatedRMSNormOp <: Op
+    epsilon::Float32
+end
+
 # Linear-attention building blocks (Gated DeltaNet: Qwen3.5 / Qwen3.6). Both
 # carry state across calls in a buffer they update in place, like
 # DecodeAttention's cache write; `fresh` starts from zeros (prefill) instead of
