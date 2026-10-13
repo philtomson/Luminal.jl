@@ -105,8 +105,23 @@ if dev isa Luminal.AMDDevice && Luminal.wmma_supported()
         out = Luminal.zero_tensor(dev, Float32, Out, N)
         Luminal._q4_matmul!(out, qw, Luminal.to_device(x, dev); residual = Luminal.to_device(r, dev))
         @test relerr(Array(out), Array(Luminal.dequantize(qw)) * Float32.(Float16.(x)) .+ r) < 2e-3
+        # the 256 x 256 kernel with minimums (asymmetric weights) and groups of 32 / 64 / 128, with and without a residual
+        for (sym, grp) in ((true, 32), (false, 32), (false, 64), (true, 128), (false, 128))
+            Out, In, N = 512, 256, 300
+            W = randn(Float32, Out, In) .+ (sym ? 0f0 : 0.3f0); x = randn(Float32, In, N); r = randn(Float32, Out, N)
+            qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = grp, symmetric = sym)
+            ref = Array(Luminal.dequantize(qw)) * Float32.(Float16.(x))
+            out = Luminal.zero_tensor(dev, Float32, Out, N)
+            Luminal.batch_matmul!(out, qw, Luminal.to_device(x, dev))
+            @test relerr(Array(out), ref) < 2e-3
+            out = Luminal.zero_tensor(dev, Float32, Out, N)
+            Luminal._q4_matmul!(out, qw, Luminal.to_device(x, dev); residual = Luminal.to_device(r, dev))
+            @test relerr(Array(out), ref .+ r) < 2e-3
+        end
         # the residual added in the kernels' store (128x128 and 128x256 kernels, a ragged M), with Float32 and Float16 activations
-        for (Out, In, N) in ((256, 256, 200), (256, 128, 400), (384, 96, 512), (176, 128, 200))
+        for (Out, In, N) in ((256, 256, 200), (256, 128, 400), (384, 96, 512), (176, 128, 200),
+                              # the 256 x 256 kernel (M % 256 == 0, K % 64 == 0, N padded to 256): ragged N, K = 64 and 192, a second row block
+                              (256, 64, 300), (512, 192, 520), (768, 128, 256))
             W = randn(Float32, Out, In); x = randn(Float32, In, N); r = randn(Float32, Out, N)
             qw = Luminal.Q4Weight(Luminal.to_device(W, dev); group = 32)
             ref = Array(Luminal.dequantize(qw)) * Float32.(Float16.(x)) .+ r
