@@ -1034,3 +1034,17 @@ gufo's loop interleaves ds_loads with WMMAs finely (`L2 w W2 L2 w W2`); ours had
 - `llvm.amdgcn.sched.group.barrier` patterns (3 LDS reads : 2 WMMA, 2:1, 1:1, 6:4; `benchmarks/gemm_sched_group.jl`): WRONG RESULTS on LLVM 18 at the production K (rel diff 0.10-0.30 vs the unscheduled kernel; small K = 1024 happened to be exact for two of them). Do not use.
 - source-level software pipelining of the fragments (read step ks + 1's A / B fragments before issuing step ks's MMAs; `benchmarks/gemm_frag_prefetch.jl`): identical speed (36.1 vs 36.0, 37.6 vs 37.5, 36.5 vs 36.5, 37.0 vs 37.1 TFLOP/s; the compiler already schedules the reads that way).
 The kernel stays at 36-37.5 TFLOP/s on the quiet machine (gufo in-model 38.5). Tried and exhausted on the structure side: unconditional prefetch (+3%), split decode, depth-2 load pipeline, bounds-check removal, workgroup swizzle, f16 output store (gate/up only), ROCm's LLVM 24 backend (+1.4% with max-ilp), fragment prefetch, sched.group.barrier.
+
+## Full re-measurement against gufo, idle machine (2026-10-13, commit 14a3718 + this note)
+Qwen3.8-27B-UD-Q4_K_XL, both engines run one after the other on the otherwise idle machine (load average ~1, no other GPU user), two rounds each, prompt processing in tok/s from an empty context. gufo: `gufo bench -m <gguf> -p 512,2048,8192,16384,32768 -n 16` (its mixed Q4_K / Q5_K / Q6_K / IQ4_XS weights, 16.35 GiB); Luminal: `examples/qwen35_prefill_bench.jl --int4 --no-check --chunk=512 --lens=... --max-ctx=33500` (every weight re-quantized to uniform int4, group 32).
+| prompt tokens | Luminal r1 / r2 | gufo r1 / r2 | Luminal / gufo |
+| 512 | 615.8 / 613.3 | 424.0 / 420.0 | 1.46 |
+| 2048 | 635.8 / 637.6 | 696.7 / 689.3 | 0.92 |
+| 8192 | 592.4 / 590.4 | 650.6 / 649.8 | 0.91 |
+| 16384 | 560.2 / 560.0 | 626.4 / 626.0 | 0.89 |
+| 32768 | 507.9 / 507.8 | 581.7 / 584.2 | 0.87 |
+Decode (batch 1, 512-token context): Luminal 13.3 tok/s (75.5 ms per token, `qwen35_gguf_bench.jl --int4`), gufo `tg16` 12.13 tok/s.
+- Run-to-run spread is under 1% on both engines. Starting point of today's work: 465 / 416 tok/s at 2048 / 8192 tokens (this session's earlier window); now 637 / 591 (+37% / +42%); gufo is unchanged (~690 / 650).
+- gufo's 512-token number is low because it takes its W8A8 int8 route below 1024 tokens of batch; the FP16 GEMM it uses from 1024 tokens up is the one we compare with.
+- The gap grows with context (8% at 2048 -> 13% at 32768), so the part that is not the GEMM is attention: our flash prefill runs at ~18 TFLOP/s against gufo's ~20 and its share rises with the context (flash 31% of a late 32k prefill versus 6% early, see the context section above). Per-token GEMM work is the same at every length.
+- Not like for like: Luminal runs every weight as int4 (the GGUF's Q5_K / Q6_K tensors are dequantized and re-quantized), gufo reads the file's own formats (16.35 GiB). That makes our decode read fewer bytes, and the quality of our int4 is lower than gufo's mixed formats; the prefill numbers are compute-bound and comparable, the decode comparison is not.
