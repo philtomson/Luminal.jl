@@ -342,6 +342,22 @@ end
     return ntuple(i -> p[(i + 1) >> 1][2 - i % 2], Val(8))
 end
 
+# 5-bit codes: the fifth bits come in `bits` (bit 4 of the low half, bit 20 of the high half), see `Q5Weight`
+@inline function _wmma_pair5(b::UInt8, bits::UInt32, s2::WMMA_V2H, m2::WMMA_V2H)
+    x = UInt32(b)
+    h = _wmma_bitcast2(0x64006400 | (x & 0x0f) | ((x >> 0x04) << 0x10) | bits)
+    one2 = (VecElement(Float16(1)), VecElement(Float16(1)))
+    off2 = (VecElement(Float16(-1024)), VecElement(Float16(-1024)))
+    return _wmma_fma2(_wmma_fma2(h, one2, off2), s2, m2)
+end
+# 8 codes: the word `w` (4 bytes) and the fifth-bit plane `hr` rotated so that byte i of this word is plane byte `rot0 + i`
+@inline function _wmma_dq5w(w::UInt32, hr::UInt32, ::Val{R0}, s::Float32, m::Float32) where {R0}
+    s2 = (VecElement(Float16(s)), VecElement(Float16(s)))
+    m2 = (VecElement(Float16(m)), VecElement(Float16(m)))
+    p = ntuple(i -> _wmma_pair5(UInt8((w >> UInt32(8 * (i - 1))) & 0xff), bitrotate(hr, -(R0 + i - 1)) & 0x00100010, s2, m2), Val(4))
+    return ntuple(i -> p[(i + 1) >> 1][2 - i % 2], Val(8))
+end
+
 @inline function _wmma_q4w_load(Pw, Sc, Mn, Bv, grow, qrt, c0, bcol0, bcol1, group, ::Val{SYM}, t) where {SYM}
     gi = (32 * t) >> trailing_zeros(group) + 1
     sa = Float32(Sc[gi, grow + 1])
@@ -643,6 +659,58 @@ function _wmma_q4_g_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, R, hr::V
     end
 end
 
+# The same kernel for 5-bit codes (`Q5Weight`): `Hp` (K/32, M) UInt32 holds each group's fifth bits (bit 4 + b of the word: low-nibble
+# code of byte b, bit (20 + b) mod 32: its high-nibble code), loaded once per K16 step and rotated to this half of the group.
+@inline function _g5_load(Pw, Sc, Mn, Hp, Bv, grow, tok, kk, q, group)
+    gi = (64 * q + 16 * kk) >> trailing_zeros(group) + 1
+    sa = Float32(Sc[gi, grow + 1])
+    ma = Float32(Mn[gi, grow + 1])
+    hw = Hp[gi, grow + 1]
+    return (Pw[8q + 2kk + 1, grow + 1], Pw[8q + 2kk + 2, grow + 1], sa, ma, Bv[8q + 2kk + 1, tok + 1], Bv[8q + 2kk + 2, tok + 1], hw)
+end
+@inline function _g5_decode(ld, half)
+    w1, w2, sa, ma, b1, b2, hw = ld
+    hr = bitrotate(hw, -(8 * half))
+    return (_wmma_dq5w(w1, hr, Val(0), sa, ma), _wmma_dq5w(w2, hr, Val(4), sa, ma), b1, b2)
+end
+function _wmma_q5_g_kernel!(C, Pw, Sc, Mn, Hp, Bv, K, N, group, R, hr::Val)
+    @inbounds begin
+    tid = workitemIdx().x - 1
+    wave = tid ÷ 32; lane = tid % 32; sl = lane % 16; h = lane ÷ 16
+    wr = wave ÷ 4; wt = wave % 4
+    bm = (workgroupIdx().y - 1) * 256; bn = (workgroupIdx().x - 1) * 256
+    As = @ROCStaticLocalArray(WMMA_V8H, (16, 16, 4, 2), false)
+    Bs = @ROCStaticLocalArray(WMMA_V8H, (16, 16, 4, 2), false)
+    acc = ntuple(_ -> _wmma_zero(), Val(8))
+    row = tid ÷ 4; kk = tid % 4
+    grow = min(bm + row, _vec_rows(C) * size(C, 1) - 1)
+    tok = bn + row
+    tile = row ÷ 16; inr = row % 16
+    pos = ((inr + 2 * kk) & 15) + 1
+    half = kk & 1
+    nk = K ÷ 64
+    ld = _g5_load(Pw, Sc, Mn, Hp, Bv, grow, tok, kk, 0, group)
+    dec = _g5_decode(ld, half)
+    for q in 0:nk-1
+        a1, a2, b1, b2 = dec
+        As[pos, tile + 1, kk + 1, 1] = a1
+        As[pos, tile + 1, kk + 1, 2] = a2
+        Bs[pos, tile + 1, kk + 1, 1] = b1
+        Bs[pos, tile + 1, kk + 1, 2] = b2
+        sync_workgroup()
+        ld = _g5_load(Pw, Sc, Mn, Hp, Bv, grow, tok, kk, min(q + 1, nk - 1), group)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 0)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 1)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 2)
+        dec = _g5_decode(ld, half)
+        acc = _g_ks(acc, As, Bs, wr, wt, sl, 3)
+        sync_workgroup()
+    end
+    _wmma_store_big!(C, acc, bm + wr * 32, bn + wt * 64, sl, h, N, R, hr)
+    return
+    end
+end
+
 # --- the paired gate/up GEMM with the SwiGLU in the epilogue, in the structure of the 256 x 256 kernel ---------------
 # H (M, N) Float16 = silu(Wg B) * (Wu B): a 256-row block holds 128 gate rows and the 128 up rows of the same output rows, interleaved in
 # 16-row tiles (tile 2p = gate rows 16p..16p+15 of the block, tile 2p + 1 = the up rows), so a wave's two A tiles (2 wr, 2 wr + 1) are
@@ -862,7 +930,7 @@ end
 # of NTuple{16,UInt8}, scale / mn (K/group, M) Float16 (`mn` = nothing when symmetric).
 function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
                        group::Int, B::ROCArray{Float16,2}, N::Int; kind::Symbol = :auto, pd::Int = WMMA_Q4_PD[], wpe::Int = WMMA_Q4_WPE[],
-                       residual = nothing) where {T<:Union{Float32,Float16}}
+                       residual = nothing, hi = nothing) where {T<:Union{Float32,Float16}}
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
     (M % 16 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
@@ -872,6 +940,11 @@ function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
     T === Float16 && !(kind in (:auto, :g) && M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && ispow2(group) && residual === nothing) &&
         throw(ArgumentError("wmma_q4_gemm!: a Float16 output needs the 256x256 kernel (M % 256, K % 64, padded N % 256, power-of-two group, no residual)"))
     T === Float16 && (kind = :g)
+    if hi !== nothing           # 5-bit codes (`Q5Weight`): only the 256 x 256 kernel reads the fifth-bit plane
+        (kind in (:auto, :g) && mn !== nothing && M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && group == 32 && size(hi) == (K32, M)) ||
+            throw(ArgumentError("wmma_q4_gemm!: 5-bit weights need the 256x256 kernel (M % 256, K % 64, padded N % 256, group 32, a minimum)"))
+        kind = :g
+    end
     if kind == :auto
         kind = M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && ispow2(group) && get(ENV, "LUMINAL_WMMA_G", "1") != "0" ? :g :
                M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ?
@@ -886,7 +959,9 @@ function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
         Cv = T === Float16 ? reinterpret(NTuple{8,VecElement{Float16}}, C) : reinterpret(WMMA_V4F, C)   # 16 bytes at a time
         Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
     end
-    if kind == :g
+    if kind == :g && hi !== nothing
+        _launch_q4(_wmma_q5_g_kernel!, (Cv, reinterpret(UInt32, Pv), scale, mn, hi, Bv, K, N, group, Rv, hr), 1024, (Npad ÷ 256, M ÷ 256), wpe)
+    elseif kind == :g
         Pw = reinterpret(UInt32, Pv)
         _launch_q4(_wmma_q4_g_kernel!, (Cv, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Rv, hr),
                    1024, (Npad ÷ 256, M ÷ 256), wpe)

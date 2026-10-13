@@ -1,6 +1,6 @@
 # What does re-quantizing a Qwen3.5 / Qwen3.6 GGUF's weights cost? Next-token logits of the same prompts under two weight formats, compared.
 #
-#   julia -t auto,1 --project=. examples/qwen35_quant_quality.jl run <base.gguf> <int4|int8> <out.jls> [--prompts=100] [--ctx=256]
+#   julia -t auto,1 --project=. examples/qwen35_quant_quality.jl run <base.gguf> <int4|int8|native> <out.jls> [--prompts=100] [--ctx=256]
 #   julia --project=. examples/qwen35_quant_quality.jl compare <ref.jls> <test.jls>
 #
 # `run` takes real English text (this repo's README and gufo's docs when present), cuts `--prompts` windows of `--ctx` tokens at random positions
@@ -21,7 +21,7 @@ function logsoftmax(x)
 end
 
 function run_mode(base, fmt, out; nprompts, ctx)
-    T = fmt == "int8" ? Int8 : Luminal.Int4
+    T = fmt == "int8" ? Int8 : Luminal.Int4          # "native": the file's own values where a native layout exists (else int4)
     ENV["LUMINAL_PREFILL_CHUNK"] = "256"
     f = read_gguf(base); cfg = qwen35_config(f)
     tok = LlamaTokenizer(f)
@@ -31,7 +31,7 @@ function run_mode(base, fmt, out; nprompts, ctx)
     println("text: $(length(ids)) tokens from $(length(files)) files")
     rng = MersenneTwister(1234)
     cuts = sort(rand(rng, ctx+1:length(ids)-1, nprompts))
-    W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
+    W = load_qwen35_gguf(base, cfg; quantize = _ -> T, native = fmt == "native")
     s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = 1024, weights = W, decode_weights = T, kv_dtype = Float16)
     logits = Vector{Vector{Float32}}(); targets = Int[]
     t0 = time()

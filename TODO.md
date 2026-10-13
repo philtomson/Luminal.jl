@@ -1069,3 +1069,17 @@ Qwen3.8-27B, 100 prompts of 256 real English tokens (this repo's README + gufo's
 | Luminal int4 g32 | 85 % | 41 % | 0.0613 nats | 0.0485 | 0.341 |
 (int4 against the native Q4_K_XL values: 86 %, KL 0.056.) The int4 re-quantization adds ~11x the KL divergence of the file's own quantization and flips the top-1 token in 15 % of positions instead of 3 %. The log-probability of the true next token moves by -0.037 +- 0.042 (perplexity +3.7 %, not significant with 100 positions; the KL and the agreement are). The Q4_K_XL file is mostly Q5_K (42 % of the parameters), IQ4_XS (21 %), Q4_K (20 %) and Q6_K (13 %); int4 g32 (16 levels, f16 scale + min = 5.0 bits per weight) drops 1-1.5 bits on the 55 % that are Q5_K / Q6_K. Reading the file's formats directly (as gufo does) would also cut the load from 137 s (dequantize + re-quantize) to a few seconds (mmap + upload).
 Memory traffic is within 3 % (5.0 vs the file's 5.12 bits per weight), so decode speed is not the argument: quality and load time are.
+
+## Native GGUF weights (stage 1: Q4_K and Q5_K)
+
+`load_qwen35_gguf(...; native=true)` (or `LUMINAL_GGUF_NATIVE=1`, off by default for now) reads Q4_K and Q5_K tensors in the file's own
+values: `native_weight` (src/NativeWeights.jl) uploads the raw blocks and repacks them on the GPU into `Q4Weight`'s asymmetric group-32 planes
+(Float16 scale = d*sc, min = -dmin*m); Q5_K adds a UInt32 fifth-bit plane (`Q5Weight`). Value error against `gguf_tensor`: 1.6e-4..1.8e-4 on
+values up to 0.4 (Float16 rounding). Row slices/concats/permutations (value-head untiling) and the `ssm_out` input permutation (multiples of
+128 = whole groups) work on the planes. The 256x256 kernel has a 5-bit variant (`_wmma_q5_g_kernel!`): 31.5-32 TFLOP/s vs 33.5 for 4-bit
+(ffn_up shape, N=2048). Q5 weights with N <= 16 (decode) still dequantize to Float32 per call (slow, correct); Q5 weights are not yet
+fused into swiglu / Float16-output passes. Q6_K, IQ4_XS, IQ4_NL, Q8_0, Q3_K, IQ3_S still go through dequantize + int4.
+
+Quality (100 prompts x 256 tokens vs the Q8_K_XL int8 reference): Q4_K+Q5_K native (62% of parameters), rest int4:
+top-1 88%, top-5 set 55%, KL 0.0327 nats (int4 everywhere: 85% / 41% / 0.0613; all native values: 97% / 74% / 0.0056).
+Next: Q6_K (group-16 scales), IQ4_XS (table lookup), Q5 GEMV for decode, swiglu fusion for mixed formats.

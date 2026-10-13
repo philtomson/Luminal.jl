@@ -54,6 +54,7 @@ export reactant_function, reactant_compile, to_stablehlo
 # Weight Loading
 include("Weights.jl")
 include("GGUF.jl")
+include("NativeWeights.jl")
 export WeightRegistry, register_weight!, tie_weight!, load_weights!, load_weights_hf!
 
 include("NN.jl")

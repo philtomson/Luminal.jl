@@ -173,6 +173,7 @@ end
 # the Float32 copy at once. Returns the weight and the Float32 bytes converted.
 function _quantize_loaded(key, data, quantize)
     (quantize === nothing || ndims(data) != 2 || occursin("embed_tokens", key)) && return data, 0
+    (data isa Luminal.Q4Weight || data isa Luminal.Q5Weight) && return data, 0       # already in a reduced format (native GGUF values)
     S = Luminal.storage_type(quantize(key))
     (S === nothing || !Luminal.storage_fits(S, size(data, 2))) && return data, 0
     q = S(data)

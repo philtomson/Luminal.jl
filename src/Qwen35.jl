@@ -353,7 +353,8 @@ layers' value heads reordered from grouped to tiled when there are fewer key
 heads than value heads), moved to `device` and, with `quantize` (as
 `load_weights_to_dict`), converted to reduced precision one tensor at a time.
 """
-function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quantize=nothing)
+function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quantize=nothing,
+                          native::Bool = get(ENV, "LUMINAL_GGUF_NATIVE", "0") != "0")
     f = Luminal.read_gguf(path)
     p = cfg.prefix
     nk, nv, dk, dv = cfg.linear_nk, cfg.linear_nv, cfg.linear_dk, cfg.linear_dv
@@ -373,13 +374,26 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
         Luminal._free_now!(A)
         return B                                                     # HF (out, in), on the device
     end
+    # With `native` (and a `quantize` policy), the matrix types that have a native layout (Luminal.native_weight) are
+    # taken in the file's own values instead of being dequantized and re-quantized; the others go through `mat`.
+    function matn(name)
+        if native && quantize !== nothing
+            w = Luminal.native_weight(f, name, device)
+            w === nothing || return w
+        end
+        return mat(name)
+    end
     vec_(name) = vec(Luminal.gguf_tensor(f, name))
+    isnat(A) = A isa Luminal.Q4Weight || A isa Luminal.Q5Weight
     function rows(A, perm)                                           # A[perm, :] on the device
         perm === nothing && return A
-        B = A[perm, :]
+        B = isnat(A) ? Luminal._wrows(A, perm) : A[perm, :]
         Luminal._free_now!(A)
         return B
     end
+    sliceR(A, r) = isnat(A) ? Luminal._wrows(A, r) : A[r, :]
+    catR(a, b) = isnat(a) ? Luminal._wvcat(a, b) : vcat(a, b)
+    colsP(A, perm) = isnat(A) ? Luminal._wcols(A, perm) : A[:, perm]
     function store!(key, A)
         data = A isa Array ? Luminal.to_device(Array{Float32}(A), device) : A
         data, n = Luminal._quantize_loaded(key, data, quantize)
@@ -395,15 +409,15 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
         store!("$h.input_layernorm.weight", vec_("$b.attn_norm.weight") .- 1f0)
         store!("$h.post_attention_layernorm.weight", vec_("$b.post_attention_norm.weight") .- 1f0)
         for (g, hf) in (("ffn_gate", "gate_proj"), ("ffn_up", "up_proj"), ("ffn_down", "down_proj"))
-            store!("$h.mlp.$hf.weight", mat("$b.$g.weight"))
+            store!("$h.mlp.$hf.weight", matn("$b.$g.weight"))
         end
         if cfg.layer_types[i+1] == "linear_attention"
             la = "$h.linear_attn"
-            qkv = mat("$b.attn_qkv.weight")
+            qkv = matn("$b.attn_qkv.weight")
             qk = 2nk * dk
-            store!("$la.in_proj_qkv.weight", vcat(qkv[1:qk, :], rows(qkv[qk+1:end, :], pvd)))
+            store!("$la.in_proj_qkv.weight", catR(sliceR(qkv, 1:qk), rows(sliceR(qkv, qk+1:size(qkv, 1)), pvd)))
             Luminal._free_now!(qkv)
-            store!("$la.in_proj_z.weight", rows(mat("$b.attn_gate.weight"), pvd))
+            store!("$la.in_proj_z.weight", rows(matn("$b.attn_gate.weight"), pvd))
             store!("$la.in_proj_a.weight", rows(mat("$b.ssm_alpha.weight"), p1d))
             store!("$la.in_proj_b.weight", rows(mat("$b.ssm_beta.weight"), p1d))
             A = vec_("$b.ssm_a")                                             # -exp(A_log)
@@ -414,12 +428,12 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
             cw = vcat(cw[1:qk, :], rows(cw[qk+1:end, :], pv))
             store!("$la.conv1d.weight", Base.reshape(cw, size(cw, 1), 1, size(cw, 2)))
             store!("$la.norm.weight", vec_("$b.ssm_norm.weight"))              # plain weight, not 1 + w
-            op = mat("$b.ssm_out.weight")
-            store!("$la.out_proj.weight", pvd === nothing ? op : (o2 = op[:, pvd]; Luminal._free_now!(op); o2))
+            op = matn("$b.ssm_out.weight")
+            store!("$la.out_proj.weight", pvd === nothing ? op : (o2 = isnat(op) ? Luminal._wcols(op, pv) : op[:, pvd]; Luminal._free_now!(op); o2))
         else
             sa = "$h.self_attn"
             for (g, hf) in (("attn_q", "q_proj"), ("attn_k", "k_proj"), ("attn_v", "v_proj"), ("attn_output", "o_proj"))
-                store!("$sa.$hf.weight", mat("$b.$g.weight"))
+                store!("$sa.$hf.weight", matn("$b.$g.weight"))
             end
             store!("$sa.q_norm.weight", vec_("$b.attn_q_norm.weight") .- 1f0)
             store!("$sa.k_norm.weight", vec_("$b.attn_k_norm.weight") .- 1f0)

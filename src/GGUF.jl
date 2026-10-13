@@ -341,6 +341,30 @@ function _deq_iq3_s!(out, b)
 end
 
 """
+    gguf_raw(f::GGUFFile, name) -> Vector{UInt8}
+
+The tensor's bytes as stored in the file (blocks of its ggml type, row after row). The pages are dropped
+from the page cache once read (`LUMINAL_GGUF_KEEP_CACHE=1` keeps them).
+"""
+function gguf_raw(f::GGUFFile, name::String)
+    t = f.tensors[name]
+    ty = ggml_type(t)
+    haskey(GGML_BLOCKS, ty) || error("GGUF tensor $name: type $ty is not supported")
+    per, bytes = GGML_BLOCKS[ty]
+    return open(f.path, "r") do io
+        off = f.data_start + t.offset; len = (prod(t.dims) ÷ per) * bytes
+        seek(io, off)
+        data = read(io, len)
+        # The model is read once: let the kernel drop these pages from the page cache at once. (A 28 GB file
+        # otherwise fills the cache and the kernel swaps out other processes' idle memory to make room.
+        # Only clean, unmapped pages are dropped. LUMINAL_GGUF_KEEP_CACHE=1 disables this.)
+        get(ENV, "LUMINAL_GGUF_KEEP_CACHE", "0") == "1" ||
+            ccall(:posix_fadvise, Cint, (Cint, Int64, Int64, Cint), Cint(reinterpret(Int32, fd(io))), off, len, 4)
+        data
+    end
+end
+
+"""
     gguf_tensor(f::GGUFFile, name) -> Array{Float32}
 
 Tensor `name` dequantized to Float32, in GGUF's order read column-major: dims
@@ -352,18 +376,7 @@ function gguf_tensor(f::GGUFFile, name::String)
     ty = ggml_type(t)
     haskey(GGML_BLOCKS, ty) || error("GGUF tensor $name: type $ty is not supported")
     n = prod(t.dims)
-    per, bytes = GGML_BLOCKS[ty]
-    raw = open(f.path, "r") do io
-        off = f.data_start + t.offset; len = (n ÷ per) * bytes
-        seek(io, off)
-        data = read(io, len)
-        # The model is read once: let the kernel drop these pages from the page cache at once. (A 28 GB file
-        # otherwise fills the cache and the kernel swaps out other processes' idle memory to make room.
-        # Only clean, unmapped pages are dropped. LUMINAL_GGUF_KEEP_CACHE=1 disables this.)
-        get(ENV, "LUMINAL_GGUF_KEEP_CACHE", "0") == "1" ||
-            ccall(:posix_fadvise, Cint, (Cint, Int64, Int64, Cint), Cint(reinterpret(Int32, fd(io))), off, len, 4)
-        data
-    end
+    raw = gguf_raw(f, name)
     out = Vector{Float32}(undef, n)
     if ty === :F32
         out .= reinterpret(Float32, raw)
@@ -395,4 +408,4 @@ function gguf_tensor(f::GGUFFile, name::String)
     return Base.reshape(out, t.dims...)
 end
 
-export GGUFFile, GGUFTensor, read_gguf, gguf_tensor
+export GGUFFile, GGUFTensor, read_gguf, gguf_tensor, gguf_raw
