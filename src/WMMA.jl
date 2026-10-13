@@ -268,7 +268,7 @@ end
 # One K tile's operands for this thread: its 16 bytes of weight codes with the scale and minimum
 # of their group, and its two 16-byte chunks of the activations.
 @inline function _wmma_q4_load(Pv, Sc, Mn, Bv, grow, c0, bcol0, bcol1, group, ::Val{SYM}, t) where {SYM}
-    gi = (32 * t) ÷ group + 1
+    gi = (32 * t) >> trailing_zeros(group) + 1
     sa = Float32(Sc[gi, grow + 1])
     return (Pv[t + 1, grow + 1], sa, SYM ? -8f0 * sa : Float32(Mn[gi, grow + 1]),
             Bv[4t + c0 + 1, bcol0 + 1], Bv[4t + c0 + 1, bcol1 + 1])
@@ -320,7 +320,7 @@ end
 end
 
 @inline function _wmma_q4w_load(Pw, Sc, Mn, Bv, grow, qrt, c0, bcol0, bcol1, group, ::Val{SYM}, t) where {SYM}
-    gi = (32 * t) ÷ group + 1
+    gi = (32 * t) >> trailing_zeros(group) + 1
     sa = Float32(Sc[gi, grow + 1])
     return (Pw[4t + qrt + 1, grow + 1], sa, SYM ? -8f0 * sa : Float32(Mn[gi, grow + 1]),
             Bv[4t + c0 + 1, bcol0 + 1], Bv[4t + c0 + 1, bcol1 + 1])
@@ -362,7 +362,7 @@ end
 # (measured: 30 -> 32-34 TFLOP/s, interleaved best-of-40 on the 27B's shapes). The NP = 16 producers (1024 threads in all) hold
 # 1/16 of a tile's rows and chunks each; 4 producer waves were slower (one wave per SIMD cannot keep the stage fed).
 @inline function _ws_load(Pw, Sc, Mn, Bv, p, bm, bn, t, group, ::Val{SYM}, M4, ::Val{NP}) where {SYM, NP}
-    gi = (32 * t) ÷ group + 1
+    gi = (32 * t) >> trailing_zeros(group) + 1
     qrt = p % 4; r0 = p ÷ 4
     a = ntuple(Val(16 ÷ NP)) do k
         grow = min(bm + r0 + 8NP * (k - 1), M4 - 1)
@@ -471,7 +471,7 @@ end
 
 # One producer thread (512 of them): one weight word (8 codes) of the gate or the up tile and two 16-byte chunks of the activations
 @inline function _sw_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, p, bm, bn, t, group, ::Val{SYM}, M) where {SYM}
-    gi = (32 * t) ÷ group + 1
+    gi = (32 * t) >> trailing_zeros(group) + 1
     which = p ÷ 256; rem = p % 256
     row = min(bm + rem ÷ 4, M - 1) + 1; qrt = rem % 4
     word = which == 0 ? Pwg[4t + qrt + 1, row] : Pwu[4t + qrt + 1, row]
