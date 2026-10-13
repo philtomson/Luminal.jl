@@ -170,6 +170,11 @@ function execute_op!(out, op::L2NormOp, x)
     return out
 end
 
+# --- SwiGLU: silu(gate) * up -----------------------------------------------------------
+# (a scalar function: `-g` on an array would allocate a temporary, which a captured HIP graph cannot do)
+@inline _swiglu(g, u) = (g / (1f0 + exp(-g))) * u
+execute_op!(out, op::SwiGLUOp, g, u) = (out .= _swiglu.(g, u); out)
+
 # --- RMSNorm times silu of a gate -----------------------------------------------------
 # One wave (32 lanes) per column of D elements: sum of squares by a shuffle tree, then out = x * r * w * (z / (1 + exp(-z))),
 # written in the output's element type (Float16 when it feeds a matrix-core GEMM).

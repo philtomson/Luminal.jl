@@ -274,6 +274,10 @@ struct GatedRMSNormOp <: Op
     epsilon::Float32
 end
 
+# silu(gate) * up = gate * sigmoid(gate) * up (the SwiGLU of the MLP), inputs (gate, up) of one shape. A node of its own, so that the
+# compiler can fold it into the two GEMMs that produce its inputs.
+struct SwiGLUOp <: Op end
+
 # Linear-attention building blocks (Gated DeltaNet: Qwen3.5 / Qwen3.6). Both
 # carry state across calls in a buffer they update in place, like
 # DecodeAttention's cache write; `fresh` starts from zeros (prefill) instead of

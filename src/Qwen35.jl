@@ -167,7 +167,7 @@ function Qwen35(graph::Luminal.Graph, reg=nothing; vocab_size, hidden, n_layers,
         Qwen35Block(kind, mixer,
                     _gemma_rmsnorm(hidden, graph, reg, "$(p).input_layernorm"; epsilon=rms_eps),
                     _gemma_rmsnorm(hidden, graph, reg, "$(p).post_attention_layernorm"; epsilon=rms_eps),
-                    Mlp(hidden, intermediate, graph, reg, "$(p).mlp"))
+                    Mlp(hidden, intermediate, graph, reg, "$(p).mlp"; swiglu=true))
     end
     emb = Luminal.tensor(graph, [vocab_size, hidden])
     reg !== nothing && register_weight!(reg, "$(prefix).embed_tokens.weight", emb)
@@ -457,7 +457,7 @@ function Qwen35MTP(graph::Luminal.Graph, reg=nothing; vocab_size, hidden, n_head
                                          head_dim=head_dim, rotary_dim=rotary_dim, rope_theta=rope_base, epsilon=rms_eps),
                         _gemma_rmsnorm(hidden, graph, reg, "$(p).input_layernorm"; epsilon=rms_eps),
                         _gemma_rmsnorm(hidden, graph, reg, "$(p).post_attention_layernorm"; epsilon=rms_eps),
-                        Mlp(hidden, intermediate, graph, reg, "$(p).mlp"))
+                        Mlp(hidden, intermediate, graph, reg, "$(p).mlp"; swiglu=true))
     config = (; vocab_size, hidden, n_heads, n_kv_heads, head_dim, intermediate, rotary_dim,
               rope_base=Float32(rope_base), rms_eps=Float32(rms_eps), prefix)
     return Qwen35MTP(Embedding(emb),

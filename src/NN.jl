@@ -213,20 +213,28 @@ struct Mlp
     down_proj::Linear
     up_proj::Linear
     act::Symbol          # gate activation: :silu (Llama, Qwen) or :gelu_tanh (Gemma)
+    swiglu::Bool         # build silu(gate) * up as one `SwiGLUOp` node (the compiler can fold it into the GEMMs)
 end
-Mlp(gate_proj::Linear, down_proj::Linear, up_proj::Linear) = Mlp(gate_proj, down_proj, up_proj, :silu)
+Mlp(gate_proj::Linear, down_proj::Linear, up_proj::Linear, act::Symbol) = Mlp(gate_proj, down_proj, up_proj, act, false)
+Mlp(gate_proj::Linear, down_proj::Linear, up_proj::Linear) = Mlp(gate_proj, down_proj, up_proj, :silu, false)
 
-function Mlp(hidden::Int, intermediate::Int, graph::Luminal.Graph, reg=nothing, prefix::String="mlp"; act::Symbol=:silu)
+function Mlp(hidden::Int, intermediate::Int, graph::Luminal.Graph, reg=nothing, prefix::String="mlp"; act::Symbol=:silu, swiglu::Bool=false)
     return Mlp(
         _linear(hidden, intermediate, graph, reg, "$(prefix).gate_proj"; bias=false),
         _linear(intermediate, hidden, graph, reg, "$(prefix).down_proj"; bias=false),
         _linear(hidden, intermediate, graph, reg, "$(prefix).up_proj"; bias=false),
-        act
+        act, swiglu
     )
 end
 
 function (m::Mlp)(x::Luminal.GraphTensor)
     g = m.gate_proj(x)
+    if m.swiglu && m.act === :silu
+        up = m.up_proj(x)
+        h = Luminal.add_op!(x.graph_ref, Luminal.SwiGLUOp(), [(g.id, 0, g.shape), (up.id, 0, up.shape)],
+                            Luminal.ShapeTracker(Luminal.realized_dims(g.shape)))
+        return m.down_proj(h)
+    end
     gate = m.act === :gelu_tanh ? Luminal.gelu(g; approximate=true) : Luminal.silu(g)
     up = m.up_proj(x)
     return m.down_proj(gate * up)
