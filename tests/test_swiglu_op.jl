@@ -15,6 +15,11 @@ using AMDGPU
             @test Array(og) ≈ r rtol = 1e-5
             oh = AMDGPU.zeros(Float16, dims...); Luminal.execute_op!(oh, op, ROCArray(g), ROCArray(u)); AMDGPU.synchronize()
             @test Float32.(Array(oh)) ≈ r rtol = 3e-3 atol = 1e-3
+            # Float16 in and out: the vectorized kernel (a multiple of 8 elements) and the broadcast (a ragged count)
+            gh = Float16.(g); uh = Float16.(u)
+            rh = Float32.(gh) ./ (1 .+ exp.(-Float32.(gh))) .* Float32.(uh)
+            oq = AMDGPU.zeros(Float16, dims...); Luminal.execute_op!(oq, op, ROCArray(gh), ROCArray(uh)); AMDGPU.synchronize()
+            @test Float32.(Array(oq)) ≈ rh rtol = 2e-3 atol = 1e-3
         end
     end
 end

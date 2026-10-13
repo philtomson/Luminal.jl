@@ -876,6 +876,30 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
+    # Gate / up GEMM results in Float16. A matmul with a 4-bit weight whose only consumer is a `SwiGLUOp` writes its result as
+    # Float16 (the 256 x 256 kernel's store converts): the elementwise SwiGLU then reads half the bytes (it runs at the memory
+    # bandwidth) and the GEMM writes half. The SwiGLU computes in Float32 from the Float16 values.
+    if get(ENV, "LUMINAL_F16_GEMM_OUT", "1") != "0" && compile_device isa Luminal.AMDDevice && Luminal.wmma_enabled()
+        for (nid, nd) in enumerate(graph.nodes)
+            (nd.op isa Luminal.SwiGLUOp && length(nd.inputs) == 2 && nd.inputs[1][1] != nd.inputs[2][1]) || continue
+            for (gid, _, gst) in nd.inputs
+                gm = graph.nodes[gid]
+                ((gm.op isa Luminal.MatMul || gm.op isa Luminal.MatMulQ4) && length(gm.inputs) == 2) || continue
+                (dty[gid] === Float32 && !persistent[gid] && !folded[gid] && !(gid in retain) && !fused_matmuls[gid] &&
+                 consumer_count[gid] == 1 && length(consumers[gid]) == 1 && _is_trivial_view(gst, graph.shapes[gid])) || continue
+                (wid, _, _) = gm.inputs[1]
+                (persistent[wid] && results[wid] isa Luminal.Q4Weight && results[wid].p isa AMDGPU.ROCArray{UInt8} &&
+                 results[wid].scale isa AMDGPU.ROCArray{Float16}) || continue
+                W = results[wid]; M, K = size(W)
+                (M % 256 == 0 && K % 64 == 0 && ispow2(W.group)) || continue
+                dims = try [eval_dim(d) for d in realized_dims(graph.shapes[gid])] catch; continue end
+                (length(dims) >= 2 && dims[1] == M && prod(dims[2:end]) >= 384 && prod(dims[2:end]) % 256 == 0) || continue
+                dty[gid] = Float16
+                get(ENV, "LUMINAL_F16_DEBUG", "") != "" && println("[f16 out] node ", gid, " ", typeof(gm.op).name.name, " dims ", Tuple(dims))
+            end
+        end
+    end
+
     # Gate / up GEMMs with the SwiGLU in the epilogue: a `SwiGLUOp` (computed as Float16, see above) whose two inputs are int4 matmuls of
     # the same activations that nothing else reads becomes one step (`wmma_q4_swiglu!`): no Float32 gate / up results, no elementwise kernel.
     swiglu_fused = Dict{Int, Any}()   # SwiGLUOp node => (gate weight id, up weight id, activation id, activation view)

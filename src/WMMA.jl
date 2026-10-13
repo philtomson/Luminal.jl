@@ -265,6 +265,29 @@ end
     return
 end
 
+# The same store for a Float16 output (`Cv` is (M/8, N) of 8-row vectors): one 16-byte store per tile, no residual.
+@inline function _wmma_store_big!(Cv::AbstractArray{NTuple{8,VecElement{Float16}},2}, acc, m0, n0, r, h, N, Rv, ::Val{HR}) where {HR}
+    for j in 0:3
+        col = n0 + 16j + r
+        for i in 0:1
+            a = acc[4i + j + 1]
+            v1, v2, v3, v4, v5, v6, v7, v8 = a[1].value, a[2].value, a[3].value, a[4].value, a[5].value, a[6].value, a[7].value, a[8].value
+            lo = h == 0
+            q1 = AMDGPU.Device.shfl_xor(ifelse(lo, v5, v1), Cint(16))
+            q2 = AMDGPU.Device.shfl_xor(ifelse(lo, v6, v2), Cint(16))
+            q3 = AMDGPU.Device.shfl_xor(ifelse(lo, v7, v3), Cint(16))
+            q4 = AMDGPU.Device.shfl_xor(ifelse(lo, v8, v4), Cint(16))
+            f1 = ifelse(lo, v1, q1); f2 = ifelse(lo, q1, v5); f3 = ifelse(lo, v2, q2); f4 = ifelse(lo, q2, v6)
+            f5 = ifelse(lo, v3, q3); f6 = ifelse(lo, q3, v7); f7 = ifelse(lo, v4, q4); f8 = ifelse(lo, q4, v8)
+            if col < N
+                Cv[(m0 + 16i + 8h) ÷ 8 + 1, col + 1] = (VecElement(Float16(f1)), VecElement(Float16(f2)), VecElement(Float16(f3)), VecElement(Float16(f4)),
+                                                         VecElement(Float16(f5)), VecElement(Float16(f6)), VecElement(Float16(f7)), VecElement(Float16(f8)))
+            end
+        end
+    end
+    return
+end
+
 # One K tile's operands for this thread: its 16 bytes of weight codes with the scale and minimum
 # of their group, and its two 16-byte chunks of the activations.
 @inline function _wmma_q4_load(Pv, Sc, Mn, Bv, grow, c0, bcol0, bcol1, group, ::Val{SYM}, t) where {SYM}
@@ -557,6 +580,8 @@ end
 # halves in separate planes, so 16 lanes read 256 contiguous bytes (a 32-byte row stride made every fragment read 2-way bank conflicted);
 # (3) the row position of a K16 step rotated by 2 x the step, so 8 lanes of a store hit 8 different bank groups; (4) no integer division
 # by the runtime group size in the loop (a shift). Needs M % 256 == 0, K % 64 == 0, padded N % 256 == 0 and a power-of-two group.
+@inline _vec_rows(::AbstractArray{NTuple{4,VecElement{Float32}}}) = 4
+@inline _vec_rows(::AbstractArray{NTuple{8,VecElement{Float16}}}) = 8
 @inline function _g_load(Pw, Sc, Mn, Bv, grow, tok, kk, q, group, ::Val{SYM}) where {SYM}
     gi = (64 * q + 16 * kk) >> trailing_zeros(group) + 1
     sa = Float32(Sc[gi, grow + 1])
@@ -588,7 +613,7 @@ function _wmma_q4_g_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, R, hr::V
     Bs = @ROCStaticLocalArray(WMMA_V8H, (16, 16, 4, 2), false)
     acc = ntuple(_ -> _wmma_zero(), Val(8))
     row = tid ÷ 4; kk = tid % 4                                   # this thread's weight row / token and k16 step of every K64 tile
-    grow = min(bm + row, 4 * size(C, 1) - 1)
+    grow = min(bm + row, _vec_rows(C) * size(C, 1) - 1)    # (C is the vector view: 4 rows of Float32 or 8 of Float16 per element)
     tok = bn + row
     tile = row ÷ 16; inr = row % 16
     pos = ((inr + 2 * kk) & 15) + 1                                # rotation of the row within the fragment by 2 x the k16 step
@@ -833,15 +858,18 @@ end
 
 # C (M, N) = dequantize(P, scale, mn)' * B for the 4-bit layout of `Q4Weight`: Pv (K/32, M)
 # of NTuple{16,UInt8}, scale / mn (K/group, M) Float16 (`mn` = nothing when symmetric).
-function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, mn,
+function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
                        group::Int, B::ROCArray{Float16,2}, N::Int; kind::Symbol = :auto, pd::Int = WMMA_Q4_PD[], wpe::Int = WMMA_Q4_WPE[],
-                       residual = nothing)
+                       residual = nothing) where {T<:Union{Float32,Float16}}
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
     (M % 16 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
         throw(ArgumentError("wmma_q4_gemm!: need M % 16 == 0, group % 32 == 0, padded N % 64 == 0"))
     Bv = reinterpret(WMMA_V8H, B)
     args = (C, Pv, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing))
+    T === Float16 && !(kind in (:auto, :g) && M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && ispow2(group) && residual === nothing) &&
+        throw(ArgumentError("wmma_q4_gemm!: a Float16 output needs the 256x256 kernel (M % 256, K % 64, padded N % 256, power-of-two group, no residual)"))
+    T === Float16 && (kind = :g)
     if kind == :auto
         kind = M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && ispow2(group) && get(ENV, "LUMINAL_WMMA_G", "1") != "0" ? :g :
                M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ?
@@ -853,7 +881,7 @@ function wmma_q4_gemm!(C::ROCArray{Float32,2}, Pv, scale::ROCArray{Float16,2}, m
     residual !== nothing && R === nothing && throw(ArgumentError("wmma_q4_gemm!: the residual must be a Float32 ROCArray of the output's size"))
     hr = Val(R !== nothing)
     if kind == :wide || kind == :big || kind == :ws || kind == :g
-        Cv = reinterpret(WMMA_V4F, C)              # (M/4, N): the 128-row kernels store 16 bytes at a time
+        Cv = T === Float16 ? reinterpret(NTuple{8,VecElement{Float16}}, C) : reinterpret(WMMA_V4F, C)   # 16 bytes at a time
         Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
     end
     if kind == :g

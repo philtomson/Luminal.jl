@@ -173,7 +173,29 @@ end
 # --- SwiGLU: silu(gate) * up -----------------------------------------------------------
 # (a scalar function: `-g` on an array would allocate a temporary, which a captured HIP graph cannot do)
 @inline _swiglu(g, u) = (g / (1f0 + exp(-g))) * u
-execute_op!(out, op::SwiGLUOp, g, u) = (out .= _swiglu.(g, u); out)
+@inline _swiglu(g::Float16, u::Float16) = _swiglu(Float32(g), Float32(u))
+# Float16 in and out (the gate / up GEMM results and the input of the down GEMM): eight elements per thread with 16-byte
+# loads and stores, so it runs at the memory bandwidth (a broadcast over Float16 arrays loads two bytes at a time).
+function _swiglu_f16_kernel!(out, g, u, n8)
+    i = (workgroupIdx().x - 1) * workgroupDim().x + workitemIdx().x
+    i <= n8 || return
+    @inbounds begin
+        gv = g[i]; uv = u[i]
+        out[i] = ntuple(k -> VecElement(Float16(_swiglu(Float32(gv[k].value), Float32(uv[k].value)))), Val(8))
+    end
+    return
+end
+const _V8F16 = NTuple{8,VecElement{Float16}}
+function execute_op!(out, op::SwiGLUOp, g, u)
+    if out isa AMDGPU.ROCArray{Float16} && g isa AMDGPU.ROCArray{Float16} && u isa AMDGPU.ROCArray{Float16} &&
+       length(out) == length(g) == length(u) && length(out) % 8 == 0
+        n8 = length(out) ÷ 8
+        @roc groupsize=256 gridsize=cld(n8, 256) _swiglu_f16_kernel!(reinterpret(_V8F16, vec(out)), reinterpret(_V8F16, vec(g)), reinterpret(_V8F16, vec(u)), n8)
+        return out
+    end
+    out .= _swiglu.(g, u)
+    return out
+end
 
 # --- RMSNorm times silu of a gate -----------------------------------------------------
 # One wave (32 lanes) per column of D elements: sum of squares by a shuffle tree, then out = x * r * w * (z / (1 + exp(-z))),
@@ -1558,6 +1580,13 @@ function _q4_matmul!(C, W::Q4Weight, B; group::Int = DEFAULT_Q4_THREADS, cols::I
                      residual = nothing)
     M, K = size(W)
     N = length(B) ÷ K
+    if eltype(C) === Float16          # a Float16 result: the 256 x 256 matrix-core GEMM stores it directly, anything else goes through Float32
+        N > QUANT_GEMM_COLS && residual === nothing && _wmma_q4_gemm!(C, W, B, nothing) && return C
+        C32 = similar(C, Float32)
+        _q4_matmul!(C32, W, B; group, cols, residual)
+        copyto!(C, C32); _free_now!(C32)
+        return C
+    end
     if eltype(B) === Float16          # a Float16 activation (see `dty` in compile): only the matrix-core GEMM takes it as it is
         N > QUANT_GEMM_COLS && _wmma_q4_gemm!(C, W, B, residual) && return C
         B = Float32.(B)
@@ -1699,10 +1728,13 @@ end
 
 # The same for 4-bit weights.
 function _wmma_q4_gemm!(C, W::Q4Weight, B, residual)
-    (C isa ROCArray{Float32} && W.p isa ROCArray{UInt8} && W.scale isa ROCArray{Float16} && wmma_enabled()) || return false
+    (C isa ROCArray{<:Union{Float32,Float16}} && W.p isa ROCArray{UInt8} && W.scale isa ROCArray{Float16} && wmma_enabled()) || return false
     M, K = size(W)
     (M % 16 == 0 && K % 32 == 0 && W.group % 32 == 0) || return false
     N = length(B) ÷ K
+    if C isa ROCArray{Float16}      # a Float16 result (see `dty` in compile): only the 256 x 256 kernel stores it
+        (residual === nothing && M % 256 == 0 && K % 64 == 0 && ispow2(W.group) && N % 256 == 0 && get(ENV, "LUMINAL_WMMA_G", "1") != "0") || return false
+    end
     x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
     # a dense Float32 residual is added in the kernel's store (no separate pass over C)
