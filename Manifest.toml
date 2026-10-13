@@ -6,9 +6,7 @@ project_hash = "929b7497f1ec00469d8fd75230169cc4b2144dbb"
 
 [[deps.AMDGPU]]
 deps = ["AbstractFFTs", "AcceleratedKernels", "Adapt", "Atomix", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLD_jll", "LLVM", "LLVM_jll", "Libdl", "LinearAlgebra", "Pkg", "Preferences", "PrettyTables", "Printf", "ROCmDeviceLibs_jll", "Random", "Random123", "RandomNumbers", "SparseArrays", "SpecialFunctions", "StaticArraysCore", "Statistics", "UnsafeAtomics"]
-git-tree-sha1 = "62d3a88a982385dce502d95815d2052977e528b9"
-repo-rev = "sds/update_wrappers"
-repo-url = "https://github.com/simeonschaub/AMDGPU.jl"
+path = "/home/phil/devel/AMDGPU.jl"
 uuid = "21141c5a-9bdb-4563-92ae-f87d6854732e"
 version = "2.1.4"
 
@@ -608,7 +606,7 @@ uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
 
 [[deps.Luminal]]
-deps = ["AMDGPU", "BFloat16s", "BenchmarkTools", "CUDA", "FFTW", "GPUArrays", "JSON3", "KernelAbstractions", "LinearAlgebra", "Metatheory", "Random", "SafeTensors", "Serialization", "SymbolicUtils", "Vulkan"]
+deps = ["AMDGPU", "BFloat16s", "BenchmarkTools", "CUDA", "Dates", "FFTW", "GPUArrays", "JSON3", "KernelAbstractions", "LinearAlgebra", "Metatheory", "Random", "SafeTensors", "Serialization", "SymbolicUtils", "Vulkan"]
 path = "."
 uuid = "222a9b07-3232-5822-9dfe-603b9586f401"
 version = "0.1.0"

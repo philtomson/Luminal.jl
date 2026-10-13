@@ -1698,6 +1698,45 @@ end
 _free_now!(w::Q4Weight) = (foreach(_free_now!, (w.p, w.scale)); w.mn === nothing || _free_now!(w.mn); nothing)
 _free_now!(w::Q5Weight) = (_free_now!(w.q); _free_now!(w.hi); nothing)
 
+# GEMV for 5-bit weights: one row per workgroup, a 16-byte code chunk, its fifth-bit word and its scale / minimum per thread and
+# K tile, each column in turn (the row's weights stay in cache across columns).
+@inline function _dot_q5(w::NTuple{16, UInt8}, hi::UInt32, xa, xb, xc, xd)
+    x = (xa..., xb..., xc..., xd...)
+    return sum(ntuple(b -> Float32((w[b] & 0x0f) + 0x10 * UInt8((hi >> UInt32(4 + b - 1)) & 0x01)) * x[2b - 1] +
+                           Float32((w[b] >> 0x04) + 0x10 * UInt8((hi >> UInt32((20 + b - 1) & 31)) & 0x01)) * x[2b], Val(16)))
+end
+@kernel function _q5_gemv_kernel!(Y, @Const(Wv), @Const(sc), @Const(mn), @Const(Hi), @Const(Xv), K32, N,
+                                  @Const(Res), ::Val{RES}) where {RES}
+    row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
+    s = @localmem Float32 (256,)
+    for c in 1:N
+        acc = 0f0
+        k = lid
+        while k <= K32
+            @inbounds w = Wv[k, row]
+            @inbounds s1 = Float32(sc[k, row]); m1 = Float32(mn[k, row]); h = Hi[k, row]
+            kk = 4k
+            @inbounds xa = (Xv[kk - 3, c], Xv[kk - 2, c], Xv[kk - 1, c], Xv[kk, c])
+            acc += s1 * _dot_q5(w, h, xa...) + m1 * _sum32(xa...)
+            k += G
+        end
+        @inbounds s[lid] = acc
+        @synchronize
+        stride = G ÷ 2
+        while stride > 0
+            if lid <= stride
+                @inbounds s[lid] += s[lid + stride]
+            end
+            @synchronize
+            stride ÷= 2
+        end
+        if lid == 1
+            @inbounds Y[row, c] = RES ? s[1] + Res[row, c] : s[1]
+        end
+        @synchronize
+    end
+end
+
 # sum_i q_i x_i over one 32-weight load: byte b holds inputs 2b-1 (low nibble) and
 # 2b (high nibble); x is the load's 32 activations as four 8-tuples. (Unpacking the
 # load once to 32 Float32s for reuse across columns spills registers: ~2x slower.)
@@ -2175,7 +2214,13 @@ function _q5_matmul!(C, W::Q5Weight, B; residual = nothing)
     end
     N > QUANT_GEMM_COLS && _wmma_q5_gemm!(C, W, B, residual) && return C
     eltype(B) === Float16 && (B = Float32.(B))
-    return _dequant_gemm!(C, W, B, residual)
+    (N <= QUANT_GEMM_COLS && C isa ROCArray{Float32} && W.q.p isa ROCArray{UInt8} && K % 256 == 0) || return _dequant_gemm!(C, W, B, residual)
+    Bc = B isa DenseArray ? B : copy(B)
+    Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
+    R, RES = _residual_arg(residual, C, M, N)
+    _q5_gemv_kernel!(KernelAbstractions.get_backend(C), 256)(Base.reshape(C, M, N), W.q.v, W.q.scale, W.q.mn, W.hi, Xv, K ÷ 32, N,
+                                                              R, RES; ndrange = M * 256)
+    return C
 end
 
 # H (M, N...) Float16 = silu(Wg B) * (Wu B) for two 4-bit weights, in one kernel (the compiler folds `SwiGLUOp` of two matmuls into this).
