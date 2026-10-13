@@ -1007,3 +1007,11 @@ After the unconditional prefetch the loop still had ~7 branches and ~96 scalar i
 - adding `llvm.amdgcn.sched.barrier(0)` after the load issue restores parity (33.0 vs 33.1, 34.1 vs 34.1, down N=512 33.5 vs 34.5), not more. A deeper pipeline as in gufo (loads two tiles ahead, decode of the previous tile's data during the MMAs) is also no faster (-1..-3%).
 So the checked loop (kept) is as fast as the one with one branch: the scalar work and branches overlap the matrix work. `benchmarks/gemm_branches.jl`.
 Measured on a quiet machine (the FPGA jobs finished): the current kernel does 36.6-37.7 TFLOP/s (gufo's in-model: 38.5), and prefill is 617.8 tok/s at 2048 tokens and 575.2 at 8192 (gufo 689 / 646).
+
+### Does a newer LLVM backend help? ROCm's clang (LLVM 24) on our kernel's IR: no (2026-10-13)
+Julia 1.12 generates code with LLVM 18.1.7; hipcc here is AMD clang 24.0.0git. `benchmarks/gemm_llvm_backend.jl` dumps the optimized IR of `_wmma_q4_g_kernel!` (`@device_code_llvm raw=true dump_module=true`), compiles it with `$ROCM/lib/llvm/bin/clang -x ir --target=amdgcn-amd-amdhsa -mcpu=gfx1151 -O3`, links with ld.lld, loads the code object with `HIP.HIPModule` and launches it through the same `HIPKernel` wrapper, interleaved with the Julia-compiled kernel in the same process (identical results). TFLOP/s, 8 rotating weight copies, best of 12:
+| shape (M K N) | julia / LLVM 18 | clang -O3 | -O2 | -O3 + max-ilp | -O3 + max-occupancy |
+| 17408 5120 512 | 36.0 | 35.8 | 35.9 | 36.9 | 35.9 |
+| 5120 17408 512 | 37.3 | 37.0 | 37.0 | 37.8 | 36.9 |
+| 17408 5120 2048 | 36.6 | 36.6 | 36.4 | 37.1 | 36.9 |
+LLVM 24 at -O3 is not faster than LLVM 18 for this kernel (-0.5..0); `-mllvm -amdgpu-sched-strategy=max-ilp` is consistently +1.3..1.4%. So the compiler version is not what separates us from gufo's GEMM (38.5 in-model; ours 36-38 on a quiet machine); an out-of-process LLVM 24 backend or a newer Julia (1.13 nightly bundles LLVM 20) would not pay off for this kernel. The kernel-level wins so far came from source structure (indexing codegen, an exec-masked conditional), not from the backend. Not tested: the other kernels (delta rule etc.).
