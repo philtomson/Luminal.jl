@@ -628,7 +628,9 @@ function _wmma_q4_g_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, R, hr::V
         Bs[pos, tile + 1, kk + 1, 1] = b1
         Bs[pos, tile + 1, kk + 1, 2] = b2
         sync_workgroup()
-        q + 1 < nk && (ld = _g_load(Pw, Sc, Mn, Bv, grow, tok, kk, q + 1, group, Val(SYM)))     # next tile's global loads, in flight during the MMAs
+        # next tile's global loads, in flight during the MMAs. Unconditional (the last iteration re-loads the last tile): the `q + 1 < nk &&`
+        # form made the compiler wrap the loads in exec-mask branches (~10 branches and ~100 scalar instructions per iteration; 3-5% slower)
+        ld = _g_load(Pw, Sc, Mn, Bv, grow, tok, kk, min(q + 1, nk - 1), group, Val(SYM))
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 0)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 1)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 2)
