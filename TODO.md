@@ -1083,3 +1083,8 @@ fused into swiglu / Float16-output passes. Q6_K, IQ4_XS, IQ4_NL, Q8_0, Q3_K, IQ3
 Quality (100 prompts x 256 tokens vs the Q8_K_XL int8 reference): Q4_K+Q5_K native (62% of parameters), rest int4:
 top-1 88%, top-5 set 55%, KL 0.0327 nats (int4 everywhere: 85% / 41% / 0.0613; all native values: 97% / 74% / 0.0056).
 Next: Q6_K (group-16 scales), IQ4_XS (table lookup), Q5 GEMV for decode, swiglu fusion for mixed formats.
+
+Stage 2 (Q5 GEMV, Float16 gate/up outputs for 5-bit weights, residual fusion): the Q5 GEMV (`_q5_gemv_kernel!`, one row per workgroup)
+is exact (4e-7) and reads 122 GB/s against 149 GB/s for the 4-bit GEMV (ffn_up shape, N=1). Prefill at 2048 tokens with Q4_K+Q5_K native:
+612 / 611 tok/s against 643 / 641 for int4 everywhere (interleaved pairs): -4.7%, about what a 5% slower kernel on 62% of the weights
+(plus Q5 layers not using the paired gate/up kernel, which is off by default anyway) predicts.

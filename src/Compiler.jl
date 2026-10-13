@@ -890,10 +890,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                 (dty[gid] === Float32 && !persistent[gid] && !folded[gid] && !(gid in retain) && !fused_matmuls[gid] &&
                  consumer_count[gid] == 1 && length(consumers[gid]) == 1 && _is_trivial_view(gst, graph.shapes[gid])) || continue
                 (wid, _, _) = gm.inputs[1]
-                (persistent[wid] && results[wid] isa Luminal.Q4Weight && results[wid].p isa AMDGPU.ROCArray{UInt8} &&
-                 results[wid].scale isa AMDGPU.ROCArray{Float16}) || continue
-                W = results[wid]; M, K = size(W)
-                (M % 256 == 0 && K % 64 == 0 && ispow2(W.group)) || continue
+                W = persistent[wid] ? results[wid] : nothing
+                Wq = W isa Luminal.Q5Weight ? W.q : W                       # (5-bit weights: the 256 x 256 kernel's variant stores Float16 too)
+                (Wq isa Luminal.Q4Weight && Wq.p isa AMDGPU.ROCArray{UInt8} && Wq.scale isa AMDGPU.ROCArray{Float16}) || continue
+                M, K = size(W)
+                (M % 256 == 0 && K % 64 == 0 && ispow2(Wq.group)) || continue
                 dims = try [eval_dim(d) for d in realized_dims(graph.shapes[gid])] catch; continue end
                 (length(dims) >= 2 && dims[1] == M && prod(dims[2:end]) >= 384 && prod(dims[2:end]) % 256 == 0) || continue
                 dty[gid] = Float16
