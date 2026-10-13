@@ -424,6 +424,126 @@ function _wmma_q4_ws_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, ::Val{P
     end
 end
 
+# --- gate/up GEMM with the SwiGLU in its epilogue ---------------------------------------------------------
+# H (M, N) Float16 = silu(Wg B) * (Wu B) for two 4-bit weights Wg, Wu (M, K) and one activation matrix B (K, N). The structure is
+# that of `_wmma_q4_ws_kernel!` (16 consumer waves running the MMAs of tile t while 16 producer waves stage tile t + 1), with a block of
+# 64 rows of H x 256 columns: each consumer wave computes a 32 x 32 piece of BOTH the gate and the up result (4 + 4 accumulator
+# tiles, the same register budget and MMA count per block as the 128 x 256 kernel), so in the epilogue every lane holds the gate and
+# the up value of the same elements, applies silu(g) * u and stores Float16: the two Float32 results (71 MB per layer at N = 512) and
+# the elementwise kernel that read them back (460 us) are gone.
+@inline function _wmma_tile_swiglu(acc::NTuple{8,WMMA_V8F}, Ag, Au, Bs, wm, wn, r)
+    c0, c1, c2, c3, c4, c5, c6, c7 = acc    # gate (i, j) = c[2i + j + 1], up (i, j) = c[4 + 2i + j + 1]
+    for s in 0:1
+        # the two B fragments stay live; the four A fragments are read one at a time (fewer live registers than reading them all first)
+        B0 = _wmma_cat(Bs[2s + 1, wn + r + 1], Bs[2s + 2, wn + r + 1]); B1 = _wmma_cat(Bs[2s + 1, wn + 16 + r + 1], Bs[2s + 2, wn + 16 + r + 1])
+        A = _wmma_cat(Ag[2s + 1, wm + r + 1], Ag[2s + 2, wm + r + 1]);           c0 = _wmma16(A, B0, c0); c1 = _wmma16(A, B1, c1)
+        A = _wmma_cat(Ag[2s + 1, wm + 16 + r + 1], Ag[2s + 2, wm + 16 + r + 1]); c2 = _wmma16(A, B0, c2); c3 = _wmma16(A, B1, c3)
+        A = _wmma_cat(Au[2s + 1, wm + r + 1], Au[2s + 2, wm + r + 1]);           c4 = _wmma16(A, B0, c4); c5 = _wmma16(A, B1, c5)
+        A = _wmma_cat(Au[2s + 1, wm + 16 + r + 1], Au[2s + 2, wm + 16 + r + 1]); c6 = _wmma16(A, B0, c6); c7 = _wmma16(A, B1, c7)
+    end
+    return (c0, c1, c2, c3, c4, c5, c6, c7)
+end
+
+@inline _swiglu_f(g, u) = (g / (1f0 + exp(-g))) * u
+
+# store H (viewed as vectors of 8 Float16 rows): the same lane regrouping as `_wmma_store_big!`, applied to h = silu(g) * u
+@inline function _wmma_store_swiglu!(Hv, acc, m0, n0, r, h, N)
+    for j in 0:1
+        col = n0 + 16j + r
+        for i in 0:1
+            g = acc[2i + j + 1]; u = acc[4 + 2i + j + 1]
+            v1, v2, v3, v4, v5, v6, v7, v8 = ntuple(e -> _swiglu_f(g[e].value, u[e].value), Val(8))
+            lo = h == 0
+            q1 = AMDGPU.Device.shfl_xor(ifelse(lo, v5, v1), Cint(16))
+            q2 = AMDGPU.Device.shfl_xor(ifelse(lo, v6, v2), Cint(16))
+            q3 = AMDGPU.Device.shfl_xor(ifelse(lo, v7, v3), Cint(16))
+            q4 = AMDGPU.Device.shfl_xor(ifelse(lo, v8, v4), Cint(16))
+            f1 = ifelse(lo, v1, q1); f2 = ifelse(lo, q1, v5); f3 = ifelse(lo, v2, q2); f4 = ifelse(lo, q2, v6)
+            f5 = ifelse(lo, v3, q3); f6 = ifelse(lo, q3, v7); f7 = ifelse(lo, v4, q4); f8 = ifelse(lo, q4, v8)
+            if col < N
+                Hv[(m0 + 16i + 8h) ÷ 8 + 1, col + 1] = (VecElement(Float16(f1)), VecElement(Float16(f2)), VecElement(Float16(f3)), VecElement(Float16(f4)),
+                                                         VecElement(Float16(f5)), VecElement(Float16(f6)), VecElement(Float16(f7)), VecElement(Float16(f8)))
+            end
+        end
+    end
+    return
+end
+
+# One producer thread (512 of them): one weight word (8 codes) of the gate or the up tile and two 16-byte chunks of the activations
+@inline function _sw_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, p, bm, bn, t, group, ::Val{SYM}, M) where {SYM}
+    gi = (32 * t) ÷ group + 1
+    which = p ÷ 256; rem = p % 256
+    row = min(bm + rem ÷ 4, M - 1) + 1; qrt = rem % 4
+    word = which == 0 ? Pwg[4t + qrt + 1, row] : Pwu[4t + qrt + 1, row]
+    sa = Float32(which == 0 ? Scg[gi, row] : Scu[gi, row])
+    ma = SYM ? -8f0 * sa : Float32(which == 0 ? Mng[gi, row] : Mnu[gi, row])
+    c0 = p % 4; r0 = p ÷ 4
+    return ((word, sa, ma), Bv[4t + c0 + 1, bn + r0 + 1], Bv[4t + c0 + 1, bn + r0 + 128 + 1])
+end
+@inline function _sw_stage(Ag, Au, Bs, p, ld, st)
+    (word, sa, ma), b0, b1 = ld
+    which = p ÷ 256; rem = p % 256
+    row = rem ÷ 4 + 1; qrt = rem % 4
+    frag = _wmma_dq4w(word, sa, ma)
+    which == 0 ? (Ag[qrt + 1, row, st] = frag) : (Au[qrt + 1, row, st] = frag)
+    c0 = p % 4; r0 = p ÷ 4
+    Bs[c0 + 1, r0 + 1, st] = b0; Bs[c0 + 1, r0 + 128 + 1, st] = b1
+    return nothing
+end
+
+function _wmma_q4_swiglu_kernel!(Hv, Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, K, N, group, ::Val{SYM}, ::Val{PD}) where {SYM, PD}
+    @inbounds begin
+    tid = workitemIdx().x - 1
+    wv = tid ÷ 32
+    l = tid % 32; r = l % 16; h = l ÷ 16
+    bm = (workgroupIdx().y - 1) * 64; bn = (workgroupIdx().x - 1) * 256
+    Ag = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64, 2), false)
+    Au = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64, 2), false)
+    Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 256, 2), false)
+    nk = K ÷ 32
+    if wv < 16
+        wm = (wv % 2) * 32; wn = (wv ÷ 2) * 32
+        acc = ntuple(_ -> _wmma_zero(), Val(8))
+        sync_workgroup()                                       # tile 0 is staged
+        for t in 0:nk-1
+            st = t & 1 + 1
+            acc = _wmma_tile_swiglu(acc, view(Ag, :, :, st), view(Au, :, :, st), view(Bs, :, :, st), wm, wn, r)
+            sync_workgroup()                                   # tile t + 1 is staged, tile t's stage is free
+        end
+        _wmma_store_swiglu!(Hv, acc, bm + wm, bn + wn, r, h, N)
+    else
+        p = tid - 512
+        M = 8 * size(Hv, 1)
+        pipe = ntuple(d -> _sw_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, p, bm, bn, min(d - 1, nk - 1), group, Val(SYM), M), Val(PD))
+        _sw_stage(Ag, Au, Bs, p, pipe[1], 1)
+        pipe = (Base.tail(pipe)..., _sw_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, p, bm, bn, min(PD, nk - 1), group, Val(SYM), M))
+        sync_workgroup()
+        for t in 0:nk-1
+            if t + 1 < nk
+                _sw_stage(Ag, Au, Bs, p, pipe[1], (t + 1) & 1 + 1)
+                pipe = (Base.tail(pipe)..., _sw_load(Pwg, Scg, Mng, Pwu, Scu, Mnu, Bv, p, bm, bn, min(t + 1 + PD, nk - 1), group, Val(SYM), M))
+            end
+            sync_workgroup()
+        end
+    end
+    return
+    end
+end
+
+# H (M, N) Float16 = silu(Wg B) * (Wu B); weights in the layout of `Q4Weight` (Pg / Pu: (K/32, M) of 16 bytes, scale / mn (K/group, M)),
+# B (K, Npad) Float16. M % 64 == 0, padded N % 256 == 0, both weights symmetric or both with minimums.
+function wmma_q4_swiglu!(H::ROCArray{Float16,2}, Pg, scale_g, mn_g, Pu, scale_u, mn_u, group::Int, B::ROCArray{Float16,2}, N::Int)
+    K32, M = size(Pg); K = 32 * K32; Npad = size(B, 2)
+    (M % 64 == 0 && Npad % 256 == 0 && group % 32 == 0 && size(B, 1) == K && size(Pu) == size(Pg) && N <= Npad && size(H) == (M, N) &&
+     (mn_g === nothing) == (mn_u === nothing)) ||
+        throw(ArgumentError("wmma_q4_swiglu!: need M % 64 == 0, padded N % 256 == 0 and two weights of the same size and kind"))
+    Bv = reinterpret(WMMA_V8H, B); Hv = reinterpret(WMMA_V8H, H)
+    Pwg = reinterpret(UInt32, Pg); Pwu = reinterpret(UInt32, Pu)
+    _launch_q4(_wmma_q4_swiglu_kernel!, (Hv, Pwg, scale_g, mn_g === nothing ? scale_g : mn_g, Pwu, scale_u, mn_u === nothing ? scale_u : mn_u, Bv, K, N, group,
+                                         Val(mn_g === nothing), Val(2)), 1024, (Npad ÷ 256, M ÷ 64), 0)
+    return H
+end
+
 # Skinny GEMM for N <= 16 columns (prefill of a short prompt, a few decode streams, speculative
 # verification): the weights are streamed once at memory speed. No LDS and no barriers: each
 # wave owns 16 weight rows, dequantizes its 16-byte chunk per K tile straight into the two WMMA

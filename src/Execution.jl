@@ -1683,6 +1683,16 @@ function _wmma_q4_gemm!(C, W::Q4Weight, B, residual)
     return true
 end
 
+# H (M, N...) Float16 = silu(Wg B) * (Wu B) for two 4-bit weights, in one kernel (the compiler folds `SwiGLUOp` of two matmuls into this).
+function swiglu_gemm!(H, Wg::Q4Weight, Wu::Q4Weight, B)
+    M, K = size(Wg)
+    N = length(B) ÷ K
+    x16, Bc = _wmma_activations(B, K, N)
+    wmma_q4_swiglu!(Base.reshape(H, M, N), Wg.v, Wg.scale, Wg.mn, Wu.v, Wu.scale, Wu.mn, Wg.group, x16, N)
+    Bc === B || _free_now!(Bc)
+    return H
+end
+
 # 7..32 columns: the weights are streamed once by the skinny matrix-core kernel (the GEMV would
 # read them N/2 times; measured crossover at the 27B's shapes is ~7 columns).
 const SKINNY_MIN_COLS = 7

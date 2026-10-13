@@ -874,6 +874,38 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
         end
     end
 
+    # Gate / up GEMMs with the SwiGLU in the epilogue: a `SwiGLUOp` (computed as Float16, see above) whose two inputs are int4 matmuls of
+    # the same activations that nothing else reads becomes one step (`wmma_q4_swiglu!`): no Float32 gate / up results, no elementwise kernel.
+    swiglu_fused = Dict{Int, Any}()   # SwiGLUOp node => (gate weight id, up weight id, activation id, activation view)
+    if get(ENV, "LUMINAL_FUSED_SWIGLU", "1") != "0" && fuse && compile_device isa Luminal.AMDDevice && Luminal.wmma_enabled()
+        is_mmq(op) = op isa Luminal.MatMul || op isa Luminal.MatMulQ4
+        for (nid, nd) in enumerate(graph.nodes)
+            (nd.op isa Luminal.SwiGLUOp && length(nd.inputs) == 2 && dty[nid] === Float16 && !persistent[nid] && !(nid in retain)) || continue
+            (gid, _, gst) = nd.inputs[1]; (uid, _, ust) = nd.inputs[2]
+            gid != uid || continue
+            gm = graph.nodes[gid]; um = graph.nodes[uid]
+            (is_mmq(gm.op) && is_mmq(um.op) && length(gm.inputs) == 2 && length(um.inputs) == 2) || continue
+            (consumer_count[gid] == 1 && consumer_count[uid] == 1 && !(gid in retain) && !(uid in retain) &&
+             !persistent[gid] && !persistent[uid] && !fused_matmuls[gid] && !fused_matmuls[uid]) || continue
+            (_is_trivial_view(gst, graph.shapes[gid]) && _is_trivial_view(ust, graph.shapes[uid])) || continue
+            (wg, _, _) = gm.inputs[1]; (xg, _, xgst) = gm.inputs[2]
+            (wu, _, _) = um.inputs[1]; (xu, _, xust) = um.inputs[2]
+            (xg == xu && _is_trivial_view(xgst, graph.shapes[xg]) && _is_trivial_view(xust, graph.shapes[xu])) || continue
+            (persistent[wg] && persistent[wu] && results[wg] isa Luminal.Q4Weight && results[wu] isa Luminal.Q4Weight) || continue
+            Wg = results[wg]; Wu = results[wu]
+            (Wg.p isa AMDGPU.ROCArray{UInt8} && Wu.p isa AMDGPU.ROCArray{UInt8} && Wg.scale isa AMDGPU.ROCArray{Float16} && Wu.scale isa AMDGPU.ROCArray{Float16} &&
+             size(Wg) == size(Wu) && Wg.group == Wu.group && (Wg.mn === nothing) == (Wu.mn === nothing)) || continue
+            M, K = size(Wg)
+            dims = try [eval_dim(d) for d in realized_dims(graph.shapes[nid])] catch; continue end
+            (length(dims) >= 2 && dims[1] == M && M % 64 == 0 && K % 32 == 0 && Wg.group % 32 == 0) || continue
+            N = prod(dims[2:end])
+            (N >= 384 && N % 256 == 0) || continue
+            allow("swiglu gemm $(_dimstr(nid))") || continue
+            swiglu_fused[nid] = (wg, wu, xg, xgst)
+            fused_matmuls[gid] = true; fused_matmuls[uid] = true
+        end
+    end
+
     steps = Base.Function[]
     step_nodes = Int[]          # the node each step computes (for LUMINAL_TRACE_MEM)
     processed = folded .| processed_pads .| fused_matmuls   # these nodes need no step of their own
@@ -906,6 +938,30 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                         _release!(res, src, owned)
                     end
                 end
+            end)
+            processed[node_id] = true
+            continue
+        end
+
+        if haskey(swiglu_fused, node_id)
+            wg, wu, xid, xst = swiglu_fused[node_id]
+            dims = Tuple(eval_dim(d) for d in realized_dims(graph.shapes[node_id]))
+            xsts = evaluate_shapes(xst, Dict{Symbol,Int}())
+            owned[node_id] = true
+            backing = Ref{Any}(nothing)
+            push!(step_nodes, node_id)
+            push!(steps, (res, dev, sym_vals, live) -> begin
+                scope = _scope_begin()
+                x = realize_view(res[xid], xsts)
+                _scope_hold()
+                _prepare_output!(res, node_id, dims, dev, backing, owned, free_intermediates, dty[node_id]; zero=false)
+                _scope_resume(scope)
+                Luminal.swiglu_gemm!(res[node_id], res[wg], res[wu], x)
+                live[xid] -= 2                       # read by both matmuls
+                if free_intermediates && live[xid] == 0 && !persistent[xid]
+                    _release!(res, xid, owned)
+                end
+                _scope_end!(scope)
             end)
             processed[node_id] = true
             continue
