@@ -20,8 +20,8 @@ if dev isa Luminal.AMDDevice
             v = ROCArray(randn(Float32, dv, nv, S, B)); g = ROCArray(-abs.(randn(Float32, nv, S, B)) .* 0.1f0)
             beta = ROCArray(rand(Float32, nv, S, B)); st0 = ROCArray(randn(Float32, dv, dk, nv, B) .* 0.1f0)
             lens = ROCArray(Float32.(lenv)); op = Luminal.DeltaRule(Float32(1 / sqrt(dk)), fresh)
-            function run(reg)
-                withenv("LUMINAL_DELTA_REG" => reg ? "1" : "0") do
+            function run(reg; rows = false)
+                withenv("LUMINAL_DELTA_REG" => reg ? "1" : "0", "LUMINAL_DELTA_RS" => rows ? "1" : "0") do
                     out = AMDGPU.fill(7f0, dv, nv, S, B); st = copy(st0)
                     Luminal.execute_op!(out, op, q, k, v, g, beta, st, lens); AMDGPU.synchronize()
                     out, st
@@ -30,6 +30,11 @@ if dev isa Luminal.AMDDevice
             o0, s0 = run(false); o1, s1 = run(true)
             @test rel(o0, o1) < 5e-6
             @test rel(s0, s1) < 5e-6
+            # the row-split kernel (dk = dv = 128 only; anything else takes the register kernel)
+            o2, s2 = run(true; rows = true)
+            @test rel(o0, o2) < 5e-6
+            @test rel(s0, s2) < 5e-6
+            o1 = o2
             # positions past a sequence's length are zero
             for b in 1:B
                 @test all(==(0f0), Array(o1)[:, :, lenv[b]+1:S, b])

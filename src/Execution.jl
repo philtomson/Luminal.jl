@@ -920,6 +920,81 @@ function _delta_rule_reg_kernel!(out, q, k, v, g, beta, st, lens, snap, snap_t, 
     return
 end
 
+# --- Delta rule, row-split: one wave per 8 state rows ----------------------------------
+# gufo's structure for dk = dv = 128 (Float32 q / k / v, no snapshots): a wave owns 8 rows of the state matrix (4 lanes per
+# row with 32 keys each in registers), k and q come from memory (L1) at every step through 16-byte loads, and there is no
+# LDS and no barrier: the waves of a head are independent. Written with raw pointers and constant offsets: the same kernel
+# with 4-D array indexing generated ~2000 address instructions per step instead of ~200 and ran 3x slower than this one.
+# Grid (dv / 64, nv, B), 256 threads. 1.43 -> 1.1 us per token over the register kernel above.
+@generated function _dot_tt32(a::NTuple{N,Float32}, b::NTuple{N,Float32}) where {N}
+    accs = Any[:(0f0) for _ in 1:4]
+    for i in 1:N
+        r = (i - 1) % 4 + 1
+        accs[r] = :(muladd(a[$i], b[$i], $(accs[r])))
+    end
+    return :(($(accs[1]) + $(accs[2])) + ($(accs[3]) + $(accs[4])))
+end
+const _DR_P4 = Core.LLVMPtr{NTuple{4,VecElement{Float32}},1}
+# 32 consecutive Float32 from `p` as a tuple, by eight 16-byte loads
+@inline function _dr_load32(p::Core.LLVMPtr{Float32,1})
+    pv = reinterpret(_DR_P4, p)
+    return ntuple(Val(32)) do i
+        v = unsafe_load(pv, (i - 1) ÷ 4 + 1, Val(16))
+        @inbounds v[(i - 1) % 4 + 1].value
+    end
+end
+function _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh)
+    tid = workitemIdx().x - 1
+    wave = tid >> 5; lane = tid & 31; seg = lane & 3; grp = lane >> 2
+    j = (workgroupIdx().x - 1) * 64 + wave * 8 + grp + 1
+    h = workgroupIdx().y; b = workgroupIdx().z
+    dk = size(q, 1); nk = size(q, 2); dv = size(v, 1); nv = size(v, 2); S = size(v, 3)
+    hk = (h - 1) ÷ G + 1
+    L = min(S, unsafe_trunc(Int, @inbounds lens[b]))
+    kq_stride = nk * dk
+    s = let fresh = fresh, st = st, j = j, seg = seg, h = h, b = b
+        ntuple(i -> fresh ? 0f0 : (@inbounds st[j, seg * 32 + i, h, b]), Val(32))::NTuple{32,Float32}
+    end
+    kp = pointer(k) + 4 * (((b - 1) * S) * kq_stride + (hk - 1) * dk + seg * 32)
+    qp = pointer(q) + 4 * (((b - 1) * S) * kq_stride + (hk - 1) * dk + seg * 32)
+    vp = pointer(v) + 4 * ((j - 1) + dv * ((h - 1) + nv * S * (b - 1)))
+    gp = pointer(g) + 4 * ((h - 1) + nv * S * (b - 1))
+    bp = pointer(beta) + 4 * ((h - 1) + nv * S * (b - 1))
+    op = pointer(out) + 4 * ((j - 1) + dv * ((h - 1) + nv * S * (b - 1)))
+    for t in 0:L-1
+        kv = _dr_load32(kp + 4 * kq_stride * t); qv = _dr_load32(qp + 4 * kq_stride * t)
+        dec = exp(unsafe_load(gp, t * nv + 1)); bet = unsafe_load(bp, t * nv + 1); vj = unsafe_load(vp, t * nv * dv + 1)
+        kq = _quad_sum(_dot_tt32(kv, qv))
+        kvs = dec * _quad_sum(_dot_tt32(s, kv))
+        sq = dec * _quad_sum(_dot_tt32(s, qv))
+        delta = (vj - kvs) * bet
+        seg == 0 && unsafe_store!(op, (sq + delta * kq) * scale, t * nv * dv + 1)
+        s = let s0 = s, kv = kv, delta = delta, dec = dec
+            ntuple(i -> muladd(@inbounds(kv[i]), delta, @inbounds(s0[i]) * dec), Val(32))::NTuple{32,Float32}
+        end
+    end
+    for i in 1:32
+        @inbounds st[j, seg * 32 + i, h, b] = s[i]
+    end
+    if seg == 0
+        for t in L+1:S
+            @inbounds out[j, h, t, b] = 0f0
+        end
+    end
+    return
+end
+
+function _launch_delta_rows!(out, q, k, v, g, beta, st, lens, scale, G, fresh, nv, B, dv)
+    @roc groupsize=256 gridsize=(dv ÷ 64, nv, B) _delta_rule_rows_kernel!(out, q, k, v, g, beta, st, lens, scale, G, fresh)
+    return nothing
+end
+function _delta_rows_ok(out, q, k, v, g, beta, st, snap_t)
+    return out isa AMDGPU.ROCArray{Float32} && q isa AMDGPU.ROCArray{Float32} && k isa AMDGPU.ROCArray{Float32} && v isa AMDGPU.ROCArray{Float32} &&
+           g isa AMDGPU.ROCArray{Float32} && beta isa AMDGPU.ROCArray{Float32} && st isa AMDGPU.ROCArray{Float32} && snap_t == 0 &&
+           size(q, 1) == 128 && size(v, 1) == 128 && size(k) == size(q) && ndims(q) == 4 && size(q, 3) == size(v, 3) &&
+           UInt(pointer(q)) % 16 == 0 && UInt(pointer(k)) % 16 == 0 && get(ENV, "LUMINAL_DELTA_RS", "1") != "0"
+end
+
 # Launch of the register kernel. On an AMDGPU.jl that has the `flat_work_group_size` / `waves_per_eu` compiler
 # options (the luminal-launch-bounds branch, see TODO.md) the kernel is compiled for exactly this workgroup size
 # and (at dk = 128) a 12-waves-per-SIMD register budget (~120 VGPRs, so that all 48 heads of the 27B model are
@@ -965,7 +1040,12 @@ function execute_op!(out, op::DeltaRule, q, k, v, g, beta, st, lens, snap = st)
     (dk <= DELTA_MAX_DK && dv <= 256) || error("DeltaRule: head dims must be <= 256 (key $dk, value $dv)")
     gs = min(256, max(32, nextpow(2, max(dv, dk))))
     if out isa AMDGPU.ROCArray && dk <= DELTA_REG_MAX_DK && dk % DELTA_REG_LANES == 0 && dv <= 128 && get(ENV, "LUMINAL_DELTA_REG", "1") != "0"
-        _launch_delta_reg!(out, _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), st, _dense(lens), snap, op.snap_t, op.scale, G, op.fresh, nv, B, dk, dv)
+        qd, kd, vd, gd, bd, ld = _dense(q), _dense(k), _dense(v), _dense(g), _dense(beta), _dense(lens)
+        if _delta_rows_ok(out, qd, kd, vd, gd, bd, st, op.snap_t)
+            _launch_delta_rows!(out, qd, kd, vd, gd, bd, st, ld, op.scale, G, op.fresh, nv, B, dv)
+        else
+            _launch_delta_reg!(out, qd, kd, vd, gd, bd, st, ld, snap, op.snap_t, op.scale, G, op.fresh, nv, B, dk, dv)
+        end
         return out
     end
     _delta_rule_kernel!(KernelAbstractions.get_backend(out), gs)(
