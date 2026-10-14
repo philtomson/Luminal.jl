@@ -1103,3 +1103,9 @@ Quality, 100 prompts x 256 tokens vs Q8_K_XL: int4 everywhere 85% / 41% / KL 0.0
 Prefill at 2048 tokens: 581 tok/s native vs 643 int4 (-9.7%; interleaving not repeated for this pair). Still off by default (LUMINAL_GGUF_NATIVE=1).
 Open: decode speed and load time with native weights not measured; Q3_K / IQ3_S still int4; fused paired SwiGLU kernel and the
 residual-add path only for 4-bit weights; the 5-bit / 6-bit / table kernels are 5-10% slower than the 4-bit one.
+
+Native weights, load time and decode (examples/qwen35_gguf_bench.jl --int4, 512-token prompt, 64 new tokens, same session conditions):
+load (after the header read to the weights on the GPU) 38 s native vs 142 s int4 (gufo mmaps in 2.7 s); prefill 567 vs 628 tok/s;
+decode 117.8 ms/token = 8.5 tok/s vs 77.8 ms = 12.9 tok/s (gufo 12.1). The decode loss (-34%) is the GEMV kernels (one row per workgroup, 109-156 GB/s
+against 149 for the 4-bit kernel at N=1, no multi-row sharing of the activation loads), not the bytes: the native layouts hold 5.5-6.1 bits per
+weight against 5.0. Next: profile decode per format and give the 5-bit / 6-bit / table GEMVs the 4-bit kernel's structure.
