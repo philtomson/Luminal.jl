@@ -1979,6 +1979,79 @@ function _nat_gemvN_kernel!(Y, Wv, Meta, Blk, Xv, K32, M, c0, Res, ::Val{RES}, :
     return
 end
 
+# The same with Float16 activations and packed dot products (the Q5_K / Q6_K counterpart of `_q4d_kernel!` below): a weight is decoded once into
+# Float16 pairs (input 2j, input 2j+1) of a byte, as 1024 + q (the 0x6400 mantissa trick; the fifth / fifth-and-sixth bits are or-ed in at bits 4-5
+# and 20-21), and each column then costs one v_dot2_f32_f16 per 2 weights. The 1024 offset (and Q6's -32) is folded into the group's minimum term,
+# which needs the activations' sum per group (a dot2 against ones, shared by the 4 rows): s*sum((1024+q) x) + (m - 1024 s) sum(x).
+@inline _d2_ones(x::NTuple{4, UInt32}, a::Float32) = _fdot2(0x3c003c00, x[4], _fdot2(0x3c003c00, x[3], _fdot2(0x3c003c00, x[2], _fdot2(0x3c003c00, x[1], a))))
+@inline _d2_dot(p::NTuple{4, UInt32}, x::NTuple{4, UInt32}, a::Float32) = _fdot2(p[4], x[4], _fdot2(p[3], x[3], _fdot2(p[2], x[2], _fdot2(p[1], x[1], a))))
+@inline _d2_nib(w::UInt32, ::Val{J}) where {J} = (u = w >> UInt32(8J); ((u & 0x0000000f) | ((u << 12) & 0x000f0000)) | 0x64006400)
+@inline function _d2_pairs(::Val{:q5}, pre, ::Val{S}) where {S}
+    w = pre[1][S]; hw = pre[2]
+    return ntuple(jj -> _d2_nib(w, Val(jj - 1)) | (bitrotate(hw, -(4S + jj - 5)) & 0x00100010), Val(4))
+end
+@inline function _d2_pairs(::Val{:q6}, pre, ::Val{S}) where {S}
+    w = pre[1][S]; hw = S <= 2 ? pre[2] : pre[3]
+    return ntuple(jj -> _d2_nib(w, Val(jj - 1)) | (bitrotate(hw, -2 * (4 * ((S - 1) & 1) + jj - 1)) & 0x00300030), Val(4))
+end
+@inline function _d2_chunk(::Val{F}, ::Val{S}, d0, xs0, pres, Xq, g, c0, ::Val{C}) where {F, S, C}
+    x = ntuple(j -> (@inbounds Xq[4g - 4 + S, c0 + j]), Val(C))
+    ps = map(p -> _d2_pairs(Val(F), p, Val(S)), pres)
+    xs1 = ntuple(j -> _d2_ones(x[j], xs0[j]), Val(C))
+    d1 = ntuple(r -> ntuple(j -> _d2_dot(ps[r], x[j], d0[r][j]), Val(C)), Val(4))
+    return d1, xs1
+end
+@inline _d2_zero(::Val{C}) where {C} = (ntuple(_ -> ntuple(_ -> 0f0, Val(C)), Val(4)), ntuple(_ -> 0f0, Val(C)))
+@inline function _d2_group(::Val{:q5}, acc, pres, Xq, g, c0, vc::Val{C}) where {C}
+    d0, xs0 = _d2_zero(vc)
+    d1, xs1 = _d2_chunk(Val(:q5), Val(1), d0, xs0, pres, Xq, g, c0, vc)
+    d2, xs2 = _d2_chunk(Val(:q5), Val(2), d1, xs1, pres, Xq, g, c0, vc)
+    d3, xs3 = _d2_chunk(Val(:q5), Val(3), d2, xs2, pres, Xq, g, c0, vc)
+    d4, xs4 = _d2_chunk(Val(:q5), Val(4), d3, xs3, pres, Xq, g, c0, vc)
+    return ntuple(j -> ntuple(r -> acc[j][r] + pres[r][3] * d4[r][j] + (pres[r][4] - 1024f0 * pres[r][3]) * xs4[j], Val(4)), Val(C))
+end
+@inline function _d2_group(::Val{:q6}, acc, pres, Xq, g, c0, vc::Val{C}) where {C}
+    d0, xs0 = _d2_zero(vc)
+    d1, xs1 = _d2_chunk(Val(:q6), Val(1), d0, xs0, pres, Xq, g, c0, vc)
+    d2, xs2 = _d2_chunk(Val(:q6), Val(2), d1, xs1, pres, Xq, g, c0, vc)
+    acc1 = ntuple(j -> ntuple(r -> acc[j][r] + pres[r][4] * (d2[r][j] - 1056f0 * xs2[j]), Val(4)), Val(C))
+    e0, ys0 = _d2_zero(vc)
+    e1, ys1 = _d2_chunk(Val(:q6), Val(3), e0, ys0, pres, Xq, g, c0, vc)
+    e2, ys2 = _d2_chunk(Val(:q6), Val(4), e1, ys1, pres, Xq, g, c0, vc)
+    return ntuple(j -> ntuple(r -> acc1[j][r] + pres[r][5] * (e2[r][j] - 1056f0 * ys2[j]), Val(4)), Val(C))
+end
+function _nat_gemvD_kernel!(Y, Wv, Meta, Blk, Xq, K32, M, c0, Res, ::Val{RES}, ::Val{F}, ::Val{C}) where {RES, F, C}
+    t = workitemIdx().x - 1; lane = t & 31; wave = t >> 5
+    row0 = ((workgroupIdx().x - 1) * 8 + wave) * 4 + 1
+    if row0 <= M
+        acc = ntuple(_ -> (0f0, 0f0, 0f0, 0f0), Val(C))
+        g = lane + 1
+        l1 = _gv_load(Val(F), Wv, Meta, Blk, g, row0); l2 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 1)
+        l3 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 2); l4 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 3)
+        while g <= K32
+            gn = min(g + 32, K32)
+            n1 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0); n2 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 1)
+            n3 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 2); n4 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 3)
+            pres = (_gv_pre(Val(F), l1, g), _gv_pre(Val(F), l2, g), _gv_pre(Val(F), l3, g), _gv_pre(Val(F), l4, g))
+            acc = _d2_group(Val(F), acc, pres, Xq, g, c0, Val(C))
+            l1 = n1; l2 = n2; l3 = n3; l4 = n4
+            g += 32
+        end
+        for j in 1:C
+            a1, a2, a3, a4 = acc[j]
+            for off in (16, 8, 4, 2, 1)
+                a1 += AMDGPU.Device.shfl_xor(a1, Cint(off)); a2 += AMDGPU.Device.shfl_xor(a2, Cint(off))
+                a3 += AMDGPU.Device.shfl_xor(a3, Cint(off)); a4 += AMDGPU.Device.shfl_xor(a4, Cint(off))
+            end
+            if lane < 4
+                v = lane == 0 ? a1 : lane == 1 ? a2 : lane == 2 ? a3 : a4
+                @inbounds Y[row0 + lane, c0 + j] = RES ? v + Res[row0 + lane, c0 + j] : v
+            end
+        end
+    end
+    return
+end
+
 # sum_i q_i x_i over one 32-weight load: byte b holds inputs 2b-1 (low nibble) and
 # 2b (high nibble); x is the load's 32 activations as four 8-tuples. (Unpacking the
 # load once to 32 Float32s for reuse across columns spills registers: ~2x slower.)
@@ -2480,6 +2553,19 @@ function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
         return C
     end
     c0 = 0
+    if _nat_fmt(W) !== :iq4 && get(ENV, "LUMINAL_NAT_DOT2", "1") != "0"     # Float16 activations + packed dot products
+        X16 = get!(() -> similar(Bc, Float16, K, N), _Q4D_WORKSPACE, (:d2, typeof(Bc), K, N))
+        X16 .= Base.reshape(Bc, K, N)
+        Xq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(X16)), K ÷ 8, N)
+        while c0 < N
+            nc = min(4, N - c0)
+            vc = nc == 4 ? Val(4) : nc == 3 ? Val(3) : nc == 2 ? Val(2) : Val(1)
+            @roc groupsize=256 gridsize=cld(M, 32) _nat_gemvD_kernel!(Y, Wq, _nat_meta(W), _nat_blk(W), Xq, K ÷ 32, M, c0, R, RES, Val(_nat_fmt(W)), vc)
+            c0 += nc
+        end
+        Bc === B || _free_now!(Bc)
+        return C
+    end
     while c0 < N                                              # up to 4 columns per pass over the weights
         nc = min(4, N - c0)
         vc = nc == 4 ? Val(4) : nc == 3 ? Val(3) : nc == 2 ? Val(2) : Val(1)
