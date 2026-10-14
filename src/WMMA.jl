@@ -113,9 +113,10 @@ function _wmma_q8_kernel!(C, Qv, Sc, Bv, K, N, group)
     Bs = @ROCStaticLocalArray(WMMA_V8H, (WMMA_PADC, 64), false)
     acc = _wmma_zeros()
     arow = tid ÷ 2; ah = tid % 2                       # A: 64 rows x 2 chunks per K tile
+    grow = min(bm + arow, size(C, 1) - 1)              # a ragged last block re-reads the last row (the store skips rows past M)
     c0 = tid % 4; row0 = tid ÷ 4; row1 = row0 + 32     # B as in the Float16 kernel
     nk = K ÷ 32
-    qa = Qv[ah + 1, bm + arow + 1]; sa = Sc[(16ah) ÷ group + 1, bm + arow + 1]
+    qa = Qv[ah + 1, grow + 1]; sa = Sc[(16ah) ÷ group + 1, grow + 1]
     rb0 = Bv[c0 + 1, bn + row0 + 1]; rb1 = Bv[c0 + 1, bn + row1 + 1]
     for t in 0:nk-1
         lo, hi = _wmma_dq8(qa, sa)
@@ -124,7 +125,7 @@ function _wmma_q8_kernel!(C, Qv, Sc, Bv, K, N, group)
         sync_workgroup()
         if t + 1 < nk
             kq = 2 * (t + 1) + ah                      # next 16-wide chunk along K (0-based)
-            qa = Qv[kq + 1, bm + arow + 1]; sa = Sc[(16kq) ÷ group + 1, bm + arow + 1]
+            qa = Qv[kq + 1, grow + 1]; sa = Sc[(16kq) ÷ group + 1, grow + 1]
             kc = (t + 1) * 4 + c0 + 1
             rb0 = Bv[kc, bn + row0 + 1]; rb1 = Bv[kc, bn + row1 + 1]
         end
@@ -977,11 +978,11 @@ end
 function wmma_q8_gemm!(C::ROCArray{Float32,2}, Q::ROCArray{Int8,2}, scale::ROCArray{Float32,2},
                        group::Int, B::ROCArray{Float16,2}, N::Int)
     K, M = size(Q); Npad = size(B, 2)
-    (M % 64 == 0 && Npad % 64 == 0 && K % 32 == 0 && group % 16 == 0 && size(B, 1) == K &&
+    (M % 16 == 0 && Npad % 64 == 0 && K % 32 == 0 && group % 16 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
-        throw(ArgumentError("wmma_q8_gemm!: need M % 64 == 0, K % 32 == 0, padded N % 64 == 0"))
+        throw(ArgumentError("wmma_q8_gemm!: need M % 16 == 0, K % 32 == 0, padded N % 64 == 0"))
     Qv = reinterpret(NTuple{16,Int8}, Q); Bv = reinterpret(WMMA_V8H, B)
-    @roc groupsize=128 gridsize=(Npad ÷ 64, M ÷ 64) _wmma_q8_kernel!(C, Qv, scale, Bv, K, N, group)
+    @roc groupsize=128 gridsize=(Npad ÷ 64, cld(M, 64)) _wmma_q8_kernel!(C, Qv, scale, Bv, K, N, group)
     return C
 end
 

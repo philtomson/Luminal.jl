@@ -2389,7 +2389,7 @@ end
 function _wmma_q8_gemm!(C, W::QuantWeight, B, residual)
     (C isa ROCArray{Float32} && W.q isa ROCArray{Int8} && W.scale isa ROCArray{Float32} && wmma_enabled()) || return false
     K, M = size(W.q)
-    (M % 64 == 0 && K % 32 == 0 && W.group % 16 == 0) || return false
+    (M % 16 == 0 && K % 32 == 0 && W.group % 16 == 0) || return false
     N = length(B) ÷ K
     x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
