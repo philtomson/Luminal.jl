@@ -273,7 +273,7 @@ _writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa L
 # than QUANT_GEMM_COLS columns (matrix-core or dequantize + GEMM path; the GEMV path for fewer
 # columns is left alone).
 _gemm_writes_all(W, x) =
-    (W isa Luminal.Q4Weight || W isa Luminal.Q5Weight) ? length(x) ÷ size(W, 2) > Luminal.QUANT_GEMM_COLS :
+    (W isa Luminal.Q4Weight || W isa Luminal.NativeWeight) ? length(x) ÷ size(W, 2) > Luminal.QUANT_GEMM_COLS :
     W isa Luminal.QuantWeight ? length(x) ÷ size(W.q, 1) > Luminal.QUANT_GEMM_COLS :
     W isa Luminal.HalfWeight ? length(x) ÷ size(W.t, 1) > Luminal.QUANT_GEMM_COLS : false
 
@@ -588,6 +588,10 @@ function release!(cg::CompiledGraph)
             free!(x.p); free!(x.scale); x.mn === nothing || free!(x.mn)
         elseif x isa Luminal.Q5Weight
             free!(x.q.p); free!(x.q.scale); free!(x.q.mn); free!(x.hi)
+        elseif x isa Luminal.IQ4Weight
+            free!(x.q.p); free!(x.q.scale)
+        elseif x isa Luminal.Q6Weight
+            free!(x.q.p); free!(x.q.scale); free!(x.hi)
         else
             free!(x)
         end
@@ -829,7 +833,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
             _is_trivial_view(mst, graph.shapes[mid]) && _is_trivial_view(rst, graph.shapes[rid]) || continue
             (wid, _, wst) = m.inputs[1]
             (persistent[wid] && (results[wid] isa Luminal.HalfWeight || results[wid] isa Luminal.QuantWeight ||
-                                 results[wid] isa Luminal.Q4Weight || results[wid] isa Luminal.Q5Weight)) || continue
+                                 results[wid] isa Luminal.Q4Weight || results[wid] isa Luminal.NativeWeight)) || continue
             rdims = try [eval_dim(d) for d in realized_dims(graph.shapes[rid])] catch; continue end
             isequal(rdims, dims) || continue
             allow("residual $(nameof(typeof(results[wid]))) $(_dimstr(node_id))") || continue
@@ -891,7 +895,7 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                  consumer_count[gid] == 1 && length(consumers[gid]) == 1 && _is_trivial_view(gst, graph.shapes[gid])) || continue
                 (wid, _, _) = gm.inputs[1]
                 W = persistent[wid] ? results[wid] : nothing
-                Wq = W isa Luminal.Q5Weight ? W.q : W                       # (5-bit weights: the 256 x 256 kernel's variant stores Float16 too)
+                Wq = W isa Luminal.NativeWeight ? W.q : W                       # (5-bit weights: the 256 x 256 kernel's variant stores Float16 too)
                 (Wq isa Luminal.Q4Weight && Wq.p isa AMDGPU.ROCArray{UInt8} && Wq.scale isa AMDGPU.ROCArray{Float16}) || continue
                 M, K = size(W)
                 (M % 256 == 0 && K % 64 == 0 && ispow2(Wq.group)) || continue

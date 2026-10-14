@@ -10,7 +10,7 @@ using KernelAbstractions
 using KernelAbstractions.Extras: @unroll
 
 
-export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight, Q4Weight, Q5Weight, Int4, dequantize
+export execute_op, execute_op!, realize_view, execute, eval_dim, FusedElementwiseOp, HalfWeight, HalfWeightN, QuantWeight, Q4Weight, Q5Weight, IQ4Weight, Q6Weight, NativeWeight, Int4, dequantize
 
 # Functional batched matmul, left-aligned as the MatMul op: (M, K, batch...) *
 # (K, N, batch...) -> (M, N, batch...), batch dims broadcasting.
@@ -1695,8 +1695,76 @@ function dequantize(w::Q5Weight)
     foreach(_free_now!, (xr, x, cg, codes, pos))
     return out
 end
+_free_now!(w::QuantWeight) = (_free_now!(w.q); _free_now!(w.scale); nothing)
 _free_now!(w::Q4Weight) = (foreach(_free_now!, (w.p, w.scale)); w.mn === nothing || _free_now!(w.mn); nothing)
 _free_now!(w::Q5Weight) = (_free_now!(w.q); _free_now!(w.hi); nothing)
+
+"""
+    IQ4Weight
+
+A 4-bit weight with a value table (GGUF's IQ4_XS / IQ4_NL): the layout of a symmetric-less `Q4Weight` (`q`, whose `mn` is `nothing` and whose
+Float16 `scale` is the group's step) whose codes index `IQ4NL_VALUES`: value = scale * IQ4NL_VALUES[code + 1].
+"""
+struct IQ4Weight{Q <: Q4Weight} <: AbstractMatrix{Float32}
+    q::Q
+end
+const IQ4NL_VALUES = Float32[-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+Base.size(w::IQ4Weight) = size(w.q)
+function Base.getindex(w::IQ4Weight, i::Int, j::Int)
+    b = w.q.p[(j + 1) ÷ 2, i]
+    c = isodd(j) ? b & 0x0f : b >> 0x04
+    return IQ4NL_VALUES[Int(c) + 1] * Float32(w.q.scale[(j - 1) ÷ 32 + 1, i])
+end
+function dequantize(w::IQ4Weight)
+    M, K = size(w); G = K ÷ 32
+    codes = similar(w.q.p, UInt8, 2, K ÷ 2, M)
+    view(codes, 1, :, :) .= w.q.p .& 0x0f
+    view(codes, 2, :, :) .= w.q.p .>> 0x04
+    lut = similar(w.q.p, Float32, 16); copyto!(lut, IQ4NL_VALUES)
+    v = lut[Int.(vec(codes)) .+ 1]
+    x = Base.reshape(v, 32, G, M) .* Base.reshape(Float32.(w.q.scale), 1, G, M)
+    xr = Base.reshape(x, K, M)
+    out = permutedims(xr, (2, 1))
+    foreach(_free_now!, (xr, x, v, lut, codes))
+    return out
+end
+_free_now!(w::IQ4Weight) = (_free_now!(w.q); nothing)
+"""
+    Q6Weight
+
+GGUF's Q6_K: `q` is a `Q4Weight`-shaped holder (`group` 16, `mn` nothing) of the low four bits of each code and a Float16 step per 16 inputs
+(d * sc); `hi` (In/16, Out) `UInt32` holds the codes' two high bits (see `_wmma_dq6w`). Value = (code - 32) * step.
+"""
+struct Q6Weight{Q <: Q4Weight, H} <: AbstractMatrix{Float32}
+    q::Q
+    hi::H
+end
+Base.size(w::Q6Weight) = size(w.q)
+@inline _q6_bitpos(l) = (b = l >> 1; iseven(l) ? 4 + 2b : (20 + 2b) & 31)   # l: 0-based code index in its K16 step
+function Base.getindex(w::Q6Weight, i::Int, j::Int)
+    b = w.q.p[(j + 1) ÷ 2, i]
+    c = isodd(j) ? b & 0x0f : b >> 0x04
+    gi = (j - 1) ÷ 16 + 1
+    h2 = (w.hi[gi, i] >> _q6_bitpos((j - 1) % 16)) & 0x03
+    return Float32(Int(c) + 16 * Int(h2) - 32) * Float32(w.q.scale[gi, i])
+end
+function dequantize(w::Q6Weight)
+    M, K = size(w); G = K ÷ 16
+    codes = similar(w.q.p, UInt8, 2, K ÷ 2, M)
+    view(codes, 1, :, :) .= w.q.p .& 0x0f
+    view(codes, 2, :, :) .= w.q.p .>> 0x04
+    pos = similar(w.q.p, UInt32, 16); copyto!(pos, UInt32[_q6_bitpos(l) for l in 0:15])
+    hi = Base.reshape(w.hi, 1, G, M)
+    cg = Base.reshape(codes, 16, G, M)
+    x = (Float32.(cg) .+ 16f0 .* Float32.((hi .>> Base.reshape(pos, 16, 1, 1)) .& 0x03) .- 32f0) .* Base.reshape(Float32.(w.q.scale), 1, G, M)
+    xr = Base.reshape(x, K, M)
+    out = permutedims(xr, (2, 1))
+    foreach(_free_now!, (xr, x, cg, codes, pos))
+    return out
+end
+_free_now!(w::Q6Weight) = (_free_now!(w.q); _free_now!(w.hi); nothing)
+"""A weight in a GGUF file's own values, repacked on the GPU (see src/NativeWeights.jl)."""
+const NativeWeight = Union{Q5Weight, IQ4Weight, Q6Weight}
 
 # GEMV for 5-bit weights: one row per workgroup, a 16-byte code chunk, its fifth-bit word and its scale / minimum per thread and
 # K tile, each column in turn (the row's weights stay in cache across columns).
@@ -1705,8 +1773,22 @@ _free_now!(w::Q5Weight) = (_free_now!(w.q); _free_now!(w.hi); nothing)
     return sum(ntuple(b -> Float32((w[b] & 0x0f) + 0x10 * UInt8((hi >> UInt32(4 + b - 1)) & 0x01)) * x[2b - 1] +
                            Float32((w[b] >> 0x04) + 0x10 * UInt8((hi >> UInt32((20 + b - 1) & 31)) & 0x01)) * x[2b], Val(16)))
 end
-@kernel function _q5_gemv_kernel!(Y, @Const(Wv), @Const(sc), @Const(mn), @Const(Hi), @Const(Xv), K32, N,
-                                  @Const(Res), ::Val{RES}) where {RES}
+# Q6_K: bytes 1..8 are the first K16 step (high bits `h`, step `s1`), bytes 9..16 the second
+@inline function _dot_q6(w::NTuple{16, UInt8}, h::UInt32, h2::UInt32, s1::Float32, s2::Float32, xa, xb, xc, xd)
+    x = (xa..., xb..., xc..., xd...)
+    t(b, hw, r) = (Float32(Int(w[b] & 0x0f) + 16 * Int(bitrotate(hw, -(4 + 2r)) & 0x03) - 32) * x[2b - 1] +
+                   Float32(Int(w[b] >> 0x04) + 16 * Int(bitrotate(hw, -(20 + 2r)) & 0x03) - 32) * x[2b])
+    a1 = sum(ntuple(b -> t(b, h, b - 1), Val(8)))
+    a2 = sum(ntuple(b -> t(b + 8, h2, b - 1), Val(8)))
+    return s1 * a1 + s2 * a2
+end
+@inline function _dot_iq4(w::NTuple{16, UInt8}, xa, xb, xc, xd)
+    x = (xa..., xb..., xc..., xd...)
+    return sum(ntuple(b -> IQ4NL_TUPLE[Int(w[b] & 0x0f) + 1] * x[2b - 1] + IQ4NL_TUPLE[Int(w[b] >> 0x04) + 1] * x[2b], Val(16)))
+end
+const IQ4NL_TUPLE = (-127f0, -104f0, -83f0, -65f0, -49f0, -35f0, -22f0, -10f0, 1f0, 13f0, 25f0, 38f0, 53f0, 69f0, 89f0, 113f0)
+@kernel function _nat_gemv_kernel!(Y, @Const(Wv), @Const(sc), @Const(mn), @Const(Hi), @Const(Xv), K32, N,
+                                   @Const(Res), ::Val{RES}, ::Val{F}) where {RES, F}
     row = @index(Group, Linear); lid = @index(Local, Linear); G = @groupsize()[1]
     s = @localmem Float32 (256,)
     for c in 1:N
@@ -1714,10 +1796,19 @@ end
         k = lid
         while k <= K32
             @inbounds w = Wv[k, row]
-            @inbounds s1 = Float32(sc[k, row]); m1 = Float32(mn[k, row]); h = Hi[k, row]
+            @inbounds s1 = F === :q6 ? 0f0 : Float32(sc[k, row])
             kk = 4k
             @inbounds xa = (Xv[kk - 3, c], Xv[kk - 2, c], Xv[kk - 1, c], Xv[kk, c])
-            acc += s1 * _dot_q5(w, h, xa...) + m1 * _sum32(xa...)
+            if F === :q6
+                @inbounds s2 = Float32(sc[2k, row]); h = Hi[2k - 1, row]; h2 = Hi[2k, row]
+                @inbounds s1 = Float32(sc[2k - 1, row])
+                acc += _dot_q6(w, h, h2, s1, s2, xa...)
+            elseif F === :q5
+                @inbounds m1 = Float32(mn[k, row]); @inbounds h = Hi[k, row]
+                acc += s1 * _dot_q5(w, h, xa...) + m1 * _sum32(xa...)
+            else
+                acc += s1 * _dot_iq4(w, xa...)
+            end
             k += G
         end
         @inbounds s[lid] = acc
@@ -2186,9 +2277,16 @@ function _wmma_q4_gemm!(C, W::Q4Weight, B, residual)
     return true
 end
 
-# The same for 5-bit weights (the 256 x 256 kernel only; other shapes dequantize).
-function _wmma_q5_gemm!(C, W::Q5Weight, B, residual)
-    (C isa ROCArray{<:Union{Float32,Float16}} && W.q.p isa ROCArray{UInt8} && wmma_enabled() && get(ENV, "LUMINAL_WMMA_G", "1") != "0") || return false
+# The same for the native formats (the 256 x 256 kernel only; other shapes dequantize).
+_nat_fmt(::Q5Weight) = :q5
+_nat_fmt(::IQ4Weight) = :iq4
+_nat_fmt(::Q6Weight) = :q6
+_nat_planes(w::Q5Weight) = (w.q, w.hi)
+_nat_planes(w::IQ4Weight) = (w.q, nothing)
+_nat_planes(w::Q6Weight) = (w.q, w.hi)
+function _wmma_nat_gemm!(C, W::NativeWeight, B, residual)
+    q, hi = _nat_planes(W)
+    (C isa ROCArray{<:Union{Float32,Float16}} && q.p isa ROCArray{UInt8} && wmma_enabled() && get(ENV, "LUMINAL_WMMA_G", "1") != "0") || return false
     M, K = size(W)
     N = length(B) ÷ K
     (M % 256 == 0 && K % 64 == 0 && (N % 256 == 0 || N >= 384) && (residual === nothing || C isa ROCArray{Float32})) || return false
@@ -2196,30 +2294,31 @@ function _wmma_q5_gemm!(C, W::Q5Weight, B, residual)
     x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
     R = residual isa ROCArray{Float32} && length(residual) == M * N ? Base.reshape(residual, M, N) : nothing
-    wmma_q4_gemm!(C2, W.q.v, W.q.scale, W.q.mn, 32, x16, N; residual = R, hi = W.hi)
+    wmma_q4_gemm!(C2, q.v, q.scale, q.mn, q.group, x16, N; residual = R, hi = hi, fmt = _nat_fmt(W))
     R === nothing && _wmma_add_residual!(C2, residual, M, N)
     Bc === B || _free_now!(Bc)
     return true
 end
 
-function _q5_matmul!(C, W::Q5Weight, B; residual = nothing)
+function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
     M, K = size(W)
     N = length(B) ÷ K
     if eltype(C) === Float16
-        N > QUANT_GEMM_COLS && residual === nothing && _wmma_q5_gemm!(C, W, B, nothing) && return C
+        N > QUANT_GEMM_COLS && residual === nothing && _wmma_nat_gemm!(C, W, B, nothing) && return C
         C32 = similar(C, Float32)
-        _q5_matmul!(C32, W, B; residual)
+        _nat_matmul!(C32, W, B; residual)
         copyto!(C, C32); _free_now!(C32)
         return C
     end
-    N > QUANT_GEMM_COLS && _wmma_q5_gemm!(C, W, B, residual) && return C
+    N > QUANT_GEMM_COLS && _wmma_nat_gemm!(C, W, B, residual) && return C
     eltype(B) === Float16 && (B = Float32.(B))
-    (N <= QUANT_GEMM_COLS && C isa ROCArray{Float32} && W.q.p isa ROCArray{UInt8} && K % 256 == 0) || return _dequant_gemm!(C, W, B, residual)
+    q, _ = _nat_planes(W)
+    (N <= QUANT_GEMM_COLS && C isa ROCArray{Float32} && q.p isa ROCArray{UInt8} && K % 256 == 0) || return _dequant_gemm!(C, W, B, residual)
     Bc = B isa DenseArray ? B : copy(B)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R, RES = _residual_arg(residual, C, M, N)
-    _q5_gemv_kernel!(KernelAbstractions.get_backend(C), 256)(Base.reshape(C, M, N), W.q.v, W.q.scale, W.q.mn, W.hi, Xv, K ÷ 32, N,
-                                                              R, RES; ndrange = M * 256)
+    _nat_gemv_kernel!(KernelAbstractions.get_backend(C), 256)(Base.reshape(C, M, N), q.v, q.scale, q.mn === nothing ? q.scale : q.mn,
+                                                               W isa Union{Q5Weight, Q6Weight} ? W.hi : q.scale, Xv, K ÷ 32, N, R, RES, Val(_nat_fmt(W)); ndrange = M * 256)
     return C
 end
 
@@ -2290,7 +2389,7 @@ function matmul_residual!(out, op, W, x, r)
     W isa Q4Weight && return _q4_matmul!(out, W, x; residual = r,
                                           group = op isa MatMulQ4 ? op.group : DEFAULT_Q4_THREADS,
                                           cols = op isa MatMulQ4 ? op.cols : 0)
-    W isa Q5Weight && return _q5_matmul!(out, W, x; residual = r)
+    W isa NativeWeight && return _nat_matmul!(out, W, x; residual = r)
     W isa HalfWeight && return _half_matmul!(out, W, x; residual = r,
                                               group = op isa MatMulF16 ? op.group : DEFAULT_HALF_GROUP)
     error("matmul_residual!: unsupported weight storage $(typeof(W))")
@@ -2306,7 +2405,7 @@ const _HALF_WEIGHTS_LOCK = ReentrantLock()
 # Reduced-precision weight formats are built on their device and moved as they
 # are: the generic AbstractArray path would expand them to dense Float32.
 for D in (CPUDevice, AMDDevice, CUDADevice)
-    @eval Device.to_device(w::Union{HalfWeight, HalfWeightN, QuantWeight, Q4Weight, Q5Weight}, ::$D) = w
+    @eval Device.to_device(w::Union{HalfWeight, HalfWeightN, QuantWeight, Q4Weight, Q5Weight, IQ4Weight, Q6Weight}, ::$D) = w
 end
 
 # The storage format for a weight dtype (see compile's weight_dtype), or nothing
@@ -2375,11 +2474,11 @@ function _matmul2d!(C, A, B)
 end
 
 function batch_matmul!(C, A, B)
-    eltype(B) === Float16 && !(A isa Q4Weight || A isa Q5Weight) && (B = Float32.(B))   # (Float16 activations: see `dty` in compile)
+    eltype(B) === Float16 && !(A isa Q4Weight || A isa NativeWeight) && (B = Float32.(B))   # (Float16 activations: see `dty` in compile)
     A isa HalfWeight && return _half_matmul!(C, A, B)
     A isa QuantWeight && return _q8_matmul!(C, A, B)
     A isa Q4Weight && return _q4_matmul!(C, A, B)
-    A isa Q5Weight && return _q5_matmul!(C, A, B)
+    A isa NativeWeight && return _nat_matmul!(C, A, B)
     A = _ensure_contiguous(A)
     B = _ensure_contiguous(B)
     # println("DEBUG matmul: C=$(size(C)) ($(typeof(C))), A=$(size(A)) ($(typeof(A))), B=$(size(B)) ($(typeof(B)))")
@@ -2414,7 +2513,7 @@ function batch_matmul!(C, A, B)
 end
 
 function realize_view(data, st::ShapeTracker)
-    (data isa HalfWeight || data isa HalfWeightN || data isa QuantWeight || data isa Q4Weight || data isa Q5Weight) && return data  # consumed whole, as a matmul weight
+    (data isa HalfWeight || data isa HalfWeightN || data isa QuantWeight || data isa Q4Weight || data isa NativeWeight) && return data  # consumed whole, as a matmul weight
     # If buffer already matches logical size, it's likely already realized (common in interpreter)
     r_dims = realized_dims(st)
     # Already exactly this shape (e.g. a strided slice view): pass through unchanged

@@ -1088,3 +1088,18 @@ Stage 2 (Q5 GEMV, Float16 gate/up outputs for 5-bit weights, residual fusion): t
 is exact (4e-7) and reads 122 GB/s against 149 GB/s for the 4-bit GEMV (ffn_up shape, N=1). Prefill at 2048 tokens with Q4_K+Q5_K native:
 612 / 611 tok/s against 643 / 641 for int4 everywhere (interleaved pairs): -4.7%, about what a 5% slower kernel on 62% of the weights
 (plus Q5 layers not using the paired gate/up kernel, which is off by default anyway) predicts.
+
+Stage 3 (IQ4_XS, IQ4_NL, Q6_K, Q8_0, lm_head): every format of the Q4_K_XL file except Q3_K / IQ3_S (3 tensors) is read in the file's values.
+- IQ4_XS / IQ4_NL (`IQ4Weight`): the 16-entry value table is looked up four codes at a time with `v_perm_b32` (two 8-byte tables + select),
+  codes become the Float16 mantissa of 1024 as for the 4-bit path, 1152 (1024 + the table's +128 bias) is subtracted exactly, then the step multiplies.
+  GEMM 33.6-36 TFLOP/s (as fast as 4-bit), GEMV 109-113 GB/s.
+- Q6_K (`Q6Weight`): low nibbles in the 4-bit layout, a Float16 step per 16 inputs, the two high bits of a K16 step's codes in one UInt32 (rotate + mask
+  0x00300030 onto the mantissa); GEMM 31.3 TFLOP/s (K=17408 shape), GEMV 156 GB/s. The kernels are one generic `_wmma_gx_kernel!` over :q5/:iq4/:q6.
+- Q8_0: the existing `QuantWeight` (group 32). `lm_head` (Q6_K) and ssm_alpha / beta / attn_v (Q8_0) were still re-quantized to int4 before this.
+All repacks match `gguf_tensor` (dequantize err <= 1e-4, IQ4_NL / Q8_0 exact); row / column permutations exact.
+
+Quality, 100 prompts x 256 tokens vs Q8_K_XL: int4 everywhere 85% / 41% / KL 0.0613 -> Q4_K + Q5_K native 88% / 55% / 0.0327 ->
++ IQ4_XS, Q6_K, IQ4_NL 90% / 64% / 0.0178 -> + lm_head 94% / 66% / 0.0106 -> + Q8_0 96% / 75% / 0.0056, the same as the int8 build of the file's values.
+Prefill at 2048 tokens: 581 tok/s native vs 643 int4 (-9.7%; interleaving not repeated for this pair). Still off by default (LUMINAL_GGUF_NATIVE=1).
+Open: decode speed and load time with native weights not measured; Q3_K / IQ3_S still int4; fused paired SwiGLU kernel and the
+residual-add path only for 4-bit weights; the 5-bit / 6-bit / table kernels are 5-10% slower than the 4-bit one.

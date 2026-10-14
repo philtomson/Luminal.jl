@@ -384,7 +384,7 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
         return mat(name)
     end
     vec_(name) = vec(Luminal.gguf_tensor(f, name))
-    isnat(A) = A isa Luminal.Q4Weight || A isa Luminal.Q5Weight
+    isnat(A) = A isa Luminal.Q4Weight || A isa Luminal.NativeWeight || A isa Luminal.QuantWeight
     function rows(A, perm)                                           # A[perm, :] on the device
         perm === nothing && return A
         B = isnat(A) ? Luminal._wrows(A, perm) : A[perm, :]
@@ -402,7 +402,7 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
         converted >= 2^31 && (Luminal.reclaim!(device); GC.gc(false); converted = 0)
     end
     store!("$p.embed_tokens.weight", mat("token_embd.weight"))
-    store!("lm_head.weight", haskey(f.tensors, "output.weight") ? mat("output.weight") : mat("token_embd.weight"))
+    store!("lm_head.weight", haskey(f.tensors, "output.weight") ? matn("output.weight") : mat("token_embd.weight"))
     store!("$p.norm.weight", vec_("output_norm.weight") .- 1f0)
     for i in 0:cfg.n_layers-1
         b = "blk.$i"; h = "$p.layers.$i"
@@ -418,8 +418,8 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
             store!("$la.in_proj_qkv.weight", catR(sliceR(qkv, 1:qk), rows(sliceR(qkv, qk+1:size(qkv, 1)), pvd)))
             Luminal._free_now!(qkv)
             store!("$la.in_proj_z.weight", rows(matn("$b.attn_gate.weight"), pvd))
-            store!("$la.in_proj_a.weight", rows(mat("$b.ssm_alpha.weight"), p1d))
-            store!("$la.in_proj_b.weight", rows(mat("$b.ssm_beta.weight"), p1d))
+            store!("$la.in_proj_a.weight", rows(matn("$b.ssm_alpha.weight"), p1d))
+            store!("$la.in_proj_b.weight", rows(matn("$b.ssm_beta.weight"), p1d))
             A = vec_("$b.ssm_a")                                             # -exp(A_log)
             store!("$la.A_log", log.(-(p1 === nothing ? A : A[p1])))
             dt = vec_("$b.ssm_dt.bias")
