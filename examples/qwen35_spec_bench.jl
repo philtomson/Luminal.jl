@@ -42,7 +42,7 @@ function main()
     # (the GGUF reader drops each tensor from the page cache after reading it; see LUMINAL_GGUF_KEEP_CACHE)
     nnew = parse(Int, flag("new", "128")); reps = parse(Int, flag("reps", "2"))
     oracle = parse(Float64, flag("oracle", "-1"))
-    ndraft = parse(Int, flag("ndraft", "1"))
+    ndraft = parse(Int, flag("ndraft", "1")); maxdraft = parse(Int, flag("maxdraft", "3"))
     start_watchdog(parse(Int, flag("min-avail", "20")); swap_gb = parse(Int, flag("swap-gb", "3")))
     prompt = String(flag("prompt", DEFAULT_PROMPT))
     f = read_gguf(base); cfg = qwen35_config(f)
@@ -63,17 +63,17 @@ function main()
     prompt_ids = Int.(ids)
     # warm-ups compile the graphs (plain decode, MTP, verify) and capture the HIP graphs
     generate_ids(s, [prompt_ids]; max_new_tokens = 4)
-    generate_ids_speculative(s, d, prompt_ids; max_new_tokens = 8, ndraft = ndraft)
-    generate_ids_speculative(s, d, prompt_ids; max_new_tokens = 8, ndraft = ndraft)
-    plain = nothing; spec = nothing; tp = Inf; ts = Inf; st = Dict{Symbol,Int}()
+    generate_ids_speculative(s, d, prompt_ids; max_new_tokens = 8, ndraft = ndraft, maxdraft = maxdraft)
+    generate_ids_speculative(s, d, prompt_ids; max_new_tokens = 8, ndraft = ndraft, maxdraft = maxdraft)
+    plain = nothing; spec = nothing; tp = Inf; ts = Inf; st = Dict{Symbol,Any}()
     for _ in 1:reps
         t = @elapsed plain = only(generate_ids(s, [prompt_ids]; max_new_tokens = nnew))
         tp = min(tp, t)
         # --oracle=P: draft the true next token with probability P (a sliced model's MTP head is useless; this fixes the
         # acceptance rate to measure the cost of the cycle)
         hook = oracle < 0 ? nothing : (n, draft) -> (rand() < oracle && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, cfg.vocab_size))
-        st1 = Dict{Symbol,Int}()
-        t = @elapsed spec1 = generate_ids_speculative(s, d, prompt_ids; max_new_tokens = nnew, stats = st1, draft_hook = hook, ndraft = ndraft)
+        st1 = Dict{Symbol,Any}()
+        t = @elapsed spec1 = generate_ids_speculative(s, d, prompt_ids; max_new_tokens = nnew, stats = st1, draft_hook = hook, ndraft = ndraft, maxdraft = maxdraft)
         if t < ts
             ts = t; st = st1; spec = spec1          # the stats of the fastest run
         end
@@ -85,7 +85,8 @@ function main()
     @printf("speculative  : %d tokens in %.2f s  -> %.2f tok/s (decode only %.2f tok/s)\n", length(spec), ts, length(spec) / ts, (length(spec) - 1) / (ts - t1))
     @printf("acceptance   : %d of %d drafts (%.0f%%), %.2f tokens per verify step\n", st[:accepted], st[:cycles],
             100 * st[:accepted] / max(st[:cycles], 1), (length(spec) - 1) / max(st[:cycles], 1))
-    haskey(st, :cycles_nd1) && @printf("adaptive    : cycles with 1 / 2 / 3 drafts: %d / %d / %d\n", st[:cycles_nd1], st[:cycles_nd2], st[:cycles_nd3])
+    haskey(st, :cycles_nd) && println("adaptive    : cycles with 1.. drafts: ", join(st[:cycles_nd], " / "))
+    haskey(st, :acc_by_depth) && println("depth       : cycles in which drafts 1..j were all accepted (j = 1..): ", join(st[:acc_by_depth], " / "))
     haskey(st, :accepted2) && @printf("second drafts: %d accepted of %d first-accepted\n", st[:accepted2], st[:accepted])
     haskey(st, :accepted3) && @printf("third drafts: %d accepted of %d second-accepted\n", st[:accepted3], st[:accepted2])
     @printf("phases (ms, whole run): verify %d, MTP steps %d, rollback %d (%d cycles)\n",

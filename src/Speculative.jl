@@ -54,6 +54,7 @@ function _first_rows(w::Luminal.Q4Weight, n::Int)
     v = Base.reshape(reinterpret(NTuple{16, UInt8}, vec(p)), size(p, 1) ÷ 16, n)
     Luminal.Q4Weight(p, v, w.scale[:, 1:n], w.mn === nothing ? nothing : w.mn[:, 1:n], w.group)
 end
+_first_rows(w::Luminal.NativeWeight, n::Int) = Luminal._wrows(w, 1:n)
 function _first_rows(w::Luminal.QuantWeight, n::Int)
     q = w.q[:, 1:n]
     v = Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), size(q, 1) ÷ 16, n)
@@ -195,8 +196,9 @@ Greedy generation for one prompt with MTP speculative decoding (0-indexed token 
 and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
-                                  stats=nothing, draft_hook=nothing, ndraft::Int=1)
-    ndraft in (0, 1, 2, 3) || error("ndraft must be 1, 2, 3, or 0 (adaptive: 1 to 3 drafts per cycle from the recent acceptance rate)")
+                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3)
+    ndraft in 0:7 || error("ndraft must be 1..7, or 0 (adaptive: 1 to `maxdraft` drafts per cycle from the recent acceptance rate)")
+    maxdraft in 1:7 || error("maxdraft must be 1..7")
     d.session === s || error("the drafter belongs to another session")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt])
     pf.hidden_id == 0 && error("this model's prefill does not return its hidden states")
@@ -210,7 +212,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
-    ndraft != 1 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? 3 : ndraft; adaptive=ndraft == 0, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
+    ndraft != 1 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -265,11 +267,11 @@ end
 # adaptive = true: ND is the maximum; each cycle drafts the count (1..ND) with the best expected tokens per millisecond, from running
 # estimates of the conditional acceptance rate of each draft position (an exponential average over the cycles that tested it) and
 # fixed relative costs of a verify step with K columns and of a draft chain (`_SPEC_COST_VERIFY`, `_SPEC_COST_MTP`, ms at 27B int4).
-const _SPEC_COST_VERIFY = (86.0, 91.5, 96.6)       # K = 2, 3, 4 columns
-const _SPEC_COST_MTP = (5.0, 12.0, 16.0)           # 1, 2, 3 drafts
+const _SPEC_COST_VERIFY = (86.0, 91.5, 96.6, 101.7, 106.8, 111.9, 117.0)       # K = 2, 3, 4 columns (beyond: extrapolated)
+const _SPEC_COST_MTP = (5.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0)           # 1, 2, 3 drafts (beyond: extrapolated)
 # Native GGUF weights (27B Q4_K_XL, measured): the multi-column GEMV shares the weight decode but not all of its ALU work, so extra columns cost more.
-const _SPEC_COST_VERIFY_NATIVE = (113.0, 130.0, 148.0)
-const _SPEC_COST_MTP_NATIVE = (7.0, 16.0, 23.0)
+const _SPEC_COST_VERIFY_NATIVE = (113.0, 130.0, 148.0, 166.0, 184.0, 202.0, 220.0)      # K = 2..8 (the last four extrapolated until measured)
+const _SPEC_COST_MTP_NATIVE = (7.0, 16.0, 23.0, 30.0, 37.0, 44.0, 51.0)
 _spec_costs(s::LlamaSession) = any(w -> w isa Luminal.NativeWeight, values(s.weights)) ?
     (_SPEC_COST_VERIFY_NATIVE, _SPEC_COST_MTP_NATIVE) : (_SPEC_COST_VERIFY, _SPEC_COST_MTP)
 function _best_ndraft(q, ND, costs=(_SPEC_COST_VERIFY, _SPEC_COST_MTP))
@@ -347,7 +349,8 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         stats[:cycles] = cycles; stats[:accepted] = acc[1]; stats[:emitted] = length(out)
         ND >= 2 && (stats[:accepted2] = acc[2])
         ND >= 3 && (stats[:accepted3] = acc[3])
-        adaptive && (stats[:cycles_nd1] = sel[1]; stats[:cycles_nd2] = sel[2]; stats[:cycles_nd3] = sel[3])
+        stats[:acc_by_depth] = copy(acc)
+        adaptive && (stats[:cycles_nd] = copy(sel); stats[:cycles_nd1] = sel[1]; stats[:cycles_nd2] = sel[2]; ND >= 3 && (stats[:cycles_nd3] = sel[3]))
         for (k, name) in enumerate((:ms_verify, :ms_mtp, :ms_rollback))
             stats[name] = round(Int, 1000 * tm[k])
         end
