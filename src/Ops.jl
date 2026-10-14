@@ -270,9 +270,14 @@ end
 
 # RMSNorm over dim 1 with a weight, times silu of a gate: rmsnorm(x, w) * (z * sigmoid(z)) (Gated DeltaNet's output norm).
 # Inputs x, w, z (z the shape of x).
+# `tiled_nk` > 0: the output's value heads are written in llama.cpp's tiled order (head h = k * G + g of the input goes to slot g * tiled_nk + k,
+# G = heads / tiled_nk), for an out-projection whose input columns are the GGUF file's (see `load_qwen35_gguf`).
 struct GatedRMSNormOp <: Op
     epsilon::Float32
+    tiled_nk::Int
+    nv::Int          # value heads (the columns of one position)
 end
+GatedRMSNormOp(epsilon::Real) = GatedRMSNormOp(Float32(epsilon), 0, 0)
 
 # silu(gate) * up = gate * sigmoid(gate) * up (the SwiGLU of the MLP), inputs (gate, up) of one shape. A node of its own, so that the
 # compiler can fold it into the two GEMMs that produce its inputs.

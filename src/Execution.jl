@@ -200,12 +200,17 @@ end
 # --- RMSNorm times silu of a gate -----------------------------------------------------
 # One wave (32 lanes) per column of D elements: sum of squares by a shuffle tree, then out = x * r * w * (z / (1 + exp(-z))),
 # written in the output's element type (Float16 when it feeds a matrix-core GEMM).
-function _gated_rmsnorm_kernel!(out, x, w, z, D, ncols, eps)
+function _gated_rmsnorm_kernel!(out, x, w, z, D, ncols, eps, nv, tnk)
     tid = workitemIdx().x - 1
     lane = tid % 32
     col = (workgroupIdx().x - 1) * (workgroupDim().x ÷ 32) + tid ÷ 32
     col < ncols || return
     base = col * D
+    obase = base
+    if tnk > 0                                   # tiled output slots: head h = k G + g goes to g nk + k
+        h = col % nv; G = nv ÷ tnk
+        obase = (col - h + (h % G) * tnk + h ÷ G) * D
+    end
     acc = 0f0
     i = lane
     while i < D
@@ -223,7 +228,7 @@ function _gated_rmsnorm_kernel!(out, x, w, z, D, ncols, eps)
     i = lane
     while i < D
         zi = Float32(@inbounds z[base + i + 1])
-        @inbounds out[base + i + 1] = T(Float32(x[base + i + 1]) * r * Float32(w[i + 1]) * (zi / (1f0 + exp(-zi))))
+        @inbounds out[obase + i + 1] = T(Float32(x[base + i + 1]) * r * Float32(w[i + 1]) * (zi / (1f0 + exp(-zi))))
         i += 32
     end
     return
@@ -235,14 +240,20 @@ function execute_op!(out, op::GatedRMSNormOp, x, w, z)
     zc = z isa DenseArray ? z : copy(z)
     if !(out isa AMDGPU.ROCArray)
         x2 = Base.reshape(xc, D, :); z2 = Base.reshape(zc, D, :); o2 = Base.reshape(out, D, :)
+        nvh = op.nv
         for c in axes(x2, 2)
             v = Float32.(view(x2, :, c)); zz = Float32.(view(z2, :, c))
-            o2[:, c] .= v .* (1f0 / sqrt(sum(abs2, v) / D + op.epsilon)) .* Float32.(vec(w)) .* (zz ./ (1f0 .+ exp.(-zz)))
+            oc = c
+            if op.tiled_nk > 0
+                h = (c - 1) % nvh; G = nvh ÷ op.tiled_nk
+                oc = c - h + (h % G) * op.tiled_nk + h ÷ G
+            end
+            o2[:, oc] .= v .* (1f0 / sqrt(sum(abs2, v) / D + op.epsilon)) .* Float32.(vec(w)) .* (zz ./ (1f0 .+ exp.(-zz)))
         end
         return out
     end
     ncols = length(xc) ÷ D
-    @roc groupsize=256 gridsize=cld(ncols, 8) _gated_rmsnorm_kernel!(vec(out), vec(xc), vec(w), vec(zc), D, ncols, op.epsilon)
+    @roc groupsize=256 gridsize=cld(ncols, 8) _gated_rmsnorm_kernel!(vec(out), vec(xc), vec(w), vec(zc), D, ncols, op.epsilon, op.nv, op.tiled_nk)
     return out
 end
 

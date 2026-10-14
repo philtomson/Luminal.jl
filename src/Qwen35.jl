@@ -18,10 +18,11 @@ struct GatedDeltaNet
     norm::LayerNorm                  # gated RMSNorm over dv (plain weight)
     out_proj::Linear
     nk::Int; nv::Int; dk::Int; dv::Int; K::Int
+    out_tiled::Bool                  # out_proj takes its input heads in llama.cpp's tiled order (GGUF weights, see `load_qwen35_gguf`)
 end
 
 function GatedDeltaNet(hidden::Int, graph::Luminal.Graph, reg=nothing, prefix::String="linear_attn";
-                       nk::Int, nv::Int, dk::Int, dv::Int, K::Int=4, epsilon=1f-6)
+                       nk::Int, nv::Int, dk::Int, dv::Int, K::Int=4, epsilon=1f-6, out_tiled::Bool=false)
     C = 2nk * dk + nv * dv
     t(dims, name) = (x = Luminal.tensor(graph, dims); reg !== nothing && register_weight!(reg, "$(prefix).$(name)", x); x)
     return GatedDeltaNet(
@@ -32,7 +33,7 @@ function GatedDeltaNet(hidden::Int, graph::Luminal.Graph, reg=nothing, prefix::S
         t([C, 1, K], "conv1d.weight"), t([nv], "A_log"), t([nv], "dt_bias"),
         _rmsnorm(dv, graph, reg, "$(prefix).norm"; epsilon=epsilon),
         _linear(nv * dv, hidden, graph, reg, "$(prefix).out_proj"; bias=false),
-        nk, nv, dk, dv, K)
+        nk, nv, dk, dv, K, out_tiled && nv > nk)
 end
 
 """
@@ -107,7 +108,7 @@ function (dn::GatedDeltaNet)(x::Luminal.GraphTensor, conv_state::Luminal.GraphTe
     # gated RMSNorm per value head: norm(o) * w * silu(z)
     z = Luminal.reshape(dn.in_proj_z(x), [dv, nv, S, B])
     # (one kernel for rmsnorm(o) * silu(z); the weight and epsilon are dn.norm's)
-    o = Luminal.add_op!(g_, Luminal.GatedRMSNormOp(dn.norm.epsilon),
+    o = Luminal.add_op!(g_, Luminal.GatedRMSNormOp(dn.norm.epsilon, dn.out_tiled ? dn.nk : 0, dn.nv),
                         [(o.id, 0, o.shape), (dn.norm.weight.id, 0, dn.norm.weight.shape), (z.id, 0, z.shape)],
                         Luminal.ShapeTracker([dv, nv, S, B]))
     return dn.out_proj(Luminal.reshape(o, [nv * dv, S, B]))
@@ -168,16 +169,16 @@ layers keep a KV cache, the linear ones their convolution and recurrent states.
 """
 function Qwen35(graph::Luminal.Graph, reg=nothing; vocab_size, hidden, n_layers, n_heads, n_kv_heads, head_dim,
                 intermediate, layer_types, linear_nk, linear_nv, linear_dk, linear_dv, conv_kernel=4,
-                rope_base=1f7, rotary_dim, rms_eps=1f-6, tie_embeddings=false, prefix="model.language_model")
+                rope_base=1f7, rotary_dim, rms_eps=1f-6, tie_embeddings=false, prefix="model.language_model", out_tiled=false)
     config = (; vocab_size, hidden, n_layers, n_heads, n_kv_heads, head_dim, intermediate, layer_types,
               linear_nk, linear_nv, linear_dk, linear_dv, conv_kernel, rope_base=Float32(rope_base), rotary_dim,
-              rms_eps=Float32(rms_eps), tie_embeddings, prefix)
+              rms_eps=Float32(rms_eps), tie_embeddings, prefix, out_tiled)
     layers = map(0:n_layers-1) do i
         p = "$(prefix).layers.$i"
         kind = layer_types[i+1] == "linear_attention" ? :linear : :full
         mixer = kind === :linear ?
             GatedDeltaNet(hidden, graph, reg, "$(p).linear_attn"; nk=linear_nk, nv=linear_nv, dk=linear_dk,
-                          dv=linear_dv, K=conv_kernel, epsilon=rms_eps) :
+                          dv=linear_dv, K=conv_kernel, epsilon=rms_eps, out_tiled=out_tiled) :
             qwen35_attention(hidden, graph, reg, "$(p).self_attn"; n_heads=n_heads, n_kv_heads=n_kv_heads,
                              head_dim=head_dim, rotary_dim=rotary_dim, rope_theta=rope_base, epsilon=rms_eps)
         Qwen35Block(kind, mixer,
@@ -324,7 +325,7 @@ function qwen35_config(f::Luminal.GGUFFile)
             conv_kernel=Int(g("ssm.conv_kernel")),
             rope_base=Float32(g("rope.freq_base", 1f7)), rotary_dim=Int(g("rope.dimension_count")),
             rms_eps=Float32(g("attention.layer_norm_rms_epsilon", 1f-6)),
-            tie_embeddings=!haskey(f.tensors, "output.weight"), prefix="model")
+            tie_embeddings=!haskey(f.tensors, "output.weight"), prefix="model", out_tiled=get(ENV, "LUMINAL_OUT_TILED", "1") != "0")
 end
 
 # ── Loading llama.cpp GGUF files ──────────────────────────────────────────────
@@ -428,8 +429,9 @@ function load_qwen35_gguf(path::String, cfg; device=Luminal.get_device(), quanti
             cw = vcat(cw[1:qk, :], rows(cw[qk+1:end, :], pv))
             store!("$la.conv1d.weight", Base.reshape(cw, size(cw, 1), 1, size(cw, 2)))
             store!("$la.norm.weight", vec_("$b.ssm_norm.weight"))              # plain weight, not 1 + w
-            op = matn("$b.ssm_out.weight")
-            store!("$la.out_proj.weight", pvd === nothing ? op : (o2 = isnat(op) ? Luminal._wcols(op, pv) : op[:, pvd]; Luminal._free_now!(op); o2))
+            op = matn("$b.ssm_out.weight")      # (with `out_tiled` the model's gated norm writes the heads in the file's order: no column permutation)
+            store!("$la.out_proj.weight", (pvd === nothing || get(cfg, :out_tiled, false)) ? op :
+                                          (o2 = isnat(op) ? Luminal._wcols(op, pv) : op[:, pvd]; Luminal._free_now!(op); o2))
         else
             sa = "$h.self_attn"
             for (g, hf) in (("attn_q", "q_proj"), ("attn_k", "k_proj"), ("attn_v", "v_proj"), ("attn_output", "o_proj"))
