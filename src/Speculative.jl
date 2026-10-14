@@ -267,12 +267,18 @@ end
 # fixed relative costs of a verify step with K columns and of a draft chain (`_SPEC_COST_VERIFY`, `_SPEC_COST_MTP`, ms at 27B int4).
 const _SPEC_COST_VERIFY = (86.0, 91.5, 96.6)       # K = 2, 3, 4 columns
 const _SPEC_COST_MTP = (5.0, 12.0, 16.0)           # 1, 2, 3 drafts
-function _best_ndraft(q, ND)
+# Native GGUF weights (27B Q4_K_XL, measured): the multi-column GEMV shares the weight decode but not all of its ALU work, so extra columns cost more.
+const _SPEC_COST_VERIFY_NATIVE = (113.0, 130.0, 148.0)
+const _SPEC_COST_MTP_NATIVE = (7.0, 16.0, 23.0)
+_spec_costs(s::LlamaSession) = any(w -> w isa Luminal.NativeWeight, values(s.weights)) ?
+    (_SPEC_COST_VERIFY_NATIVE, _SPEC_COST_MTP_NATIVE) : (_SPEC_COST_VERIFY, _SPEC_COST_MTP)
+function _best_ndraft(q, ND, costs=(_SPEC_COST_VERIFY, _SPEC_COST_MTP))
+    cv, cm = costs
     best, bn = -1.0, 1
     e = 1.0; p = 1.0
     for nd in 1:ND
         p *= q[nd]; e += p
-        r = e / (_SPEC_COST_VERIFY[nd] + _SPEC_COST_MTP[nd])
+        r = e / (cv[nd] + cm[nd])
         r > best && ((best, bn) = (r, nd))
     end
     bn
@@ -282,6 +288,7 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
     K = ND + 1
     q = fill(0.7, ND)                                                 # conditional acceptance of draft j given 1..j-1 were
     sel = zeros(Int, ND)                                              # cycles run with each draft count
+    costs = _spec_costs(s)
     function draft_chain!(toks, hid, nreal, ND)
         am, xp = _mtp_step!(d, toks, hid, nreal; with_hidden=true)
         ds = Int[hook(am[nreal], 0)]
@@ -297,7 +304,7 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         d.pos -= ND - 1                                              # the chain's slots are scratch: the next real step overwrites them
         ds
     end
-    ndc = adaptive ? _best_ndraft(q, ND) : ND
+    ndc = adaptive ? _best_ndraft(q, ND, costs) : ND
     K = ndc + 1
     ds = draft_chain!(fill(y, K), cat(ntuple(_ -> h1, K)...; dims=2), 1, ndc)
     vg = _verify_graph(s, 1, K)
@@ -327,7 +334,7 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         y = emitted[end]
         any(e -> e in eos_ids, emitted) && break
         t2 = time_ns(); tm[3] += (t2 - t1) / 1e9
-        ndn = adaptive ? _best_ndraft(q, ND) : ND
+        ndn = adaptive ? _best_ndraft(q, ND, costs) : ND
         ds = draft_chain!([emitted; fill(y, K - nreal)], hid, nreal, ndn)
         K = ndn + 1
         vg = _verify_graph(s, 1, K)

@@ -85,6 +85,7 @@ function main()
     @printf("speculative  : %d tokens in %.2f s  -> %.2f tok/s (decode only %.2f tok/s)\n", length(spec), ts, length(spec) / ts, (length(spec) - 1) / (ts - t1))
     @printf("acceptance   : %d of %d drafts (%.0f%%), %.2f tokens per verify step\n", st[:accepted], st[:cycles],
             100 * st[:accepted] / max(st[:cycles], 1), (length(spec) - 1) / max(st[:cycles], 1))
+    haskey(st, :cycles_nd1) && @printf("adaptive    : cycles with 1 / 2 / 3 drafts: %d / %d / %d\n", st[:cycles_nd1], st[:cycles_nd2], st[:cycles_nd3])
     haskey(st, :accepted2) && @printf("second drafts: %d accepted of %d first-accepted\n", st[:accepted2], st[:accepted])
     haskey(st, :accepted3) && @printf("third drafts: %d accepted of %d second-accepted\n", st[:accepted3], st[:accepted2])
     @printf("phases (ms, whole run): verify %d, MTP steps %d, rollback %d (%d cycles)\n",
