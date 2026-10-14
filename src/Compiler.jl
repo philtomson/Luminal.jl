@@ -586,12 +586,10 @@ function release!(cg::CompiledGraph)
             free!(x.q); free!(x.scale)
         elseif x isa Luminal.Q4Weight
             free!(x.p); free!(x.scale); x.mn === nothing || free!(x.mn)
-        elseif x isa Luminal.Q5Weight
-            free!(x.q.p); free!(x.q.scale); free!(x.q.mn); free!(x.hi)
+        elseif x isa Luminal.Q5Weight || x isa Luminal.Q6Weight
+            free!(x.p); free!(x.meta)
         elseif x isa Luminal.IQ4Weight
             free!(x.q.p); free!(x.q.scale)
-        elseif x isa Luminal.Q6Weight
-            free!(x.q.p); free!(x.q.scale); free!(x.hi)
         else
             free!(x)
         end
@@ -895,10 +893,11 @@ function compile(graph::Luminal.Graph; device::Luminal.AbstractDevice=Luminal.ge
                  consumer_count[gid] == 1 && length(consumers[gid]) == 1 && _is_trivial_view(gst, graph.shapes[gid])) || continue
                 (wid, _, _) = gm.inputs[1]
                 W = persistent[wid] ? results[wid] : nothing
-                Wq = W isa Luminal.NativeWeight ? W.q : W                       # (5-bit weights: the 256 x 256 kernel's variant stores Float16 too)
-                (Wq isa Luminal.Q4Weight && Wq.p isa AMDGPU.ROCArray{UInt8} && Wq.scale isa AMDGPU.ROCArray{Float16}) || continue
+                ok = W isa Luminal.Q4Weight ? (W.p isa AMDGPU.ROCArray{UInt8} && W.scale isa AMDGPU.ROCArray{Float16} && ispow2(W.group)) :
+                     W isa Luminal.NativeWeight ? Luminal._nat_p(W) isa AMDGPU.ROCArray{UInt8} : false     # (the 256 x 256 kernel's native variants store Float16 too)
+                ok || continue
                 M, K = size(W)
-                (M % 256 == 0 && K % 64 == 0 && ispow2(Wq.group)) || continue
+                (M % 256 == 0 && K % 64 == 0) || continue
                 dims = try [eval_dim(d) for d in realized_dims(graph.shapes[gid])] catch; continue end
                 (length(dims) >= 2 && dims[1] == M && prod(dims[2:end]) >= 384 && prod(dims[2:end]) % 256 == 0) || continue
                 dty[gid] = Float16

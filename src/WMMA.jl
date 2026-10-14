@@ -702,29 +702,33 @@ function _wmma_q4_g_kernel!(C, Pw, Sc, Mn, Bv, K, N, group, ::Val{SYM}, R, hr::V
     end
 end
 
-# The same kernel for the other native formats (`F`): :q5 (`Q5Weight`: `Hp` (K/32, M) UInt32 holds each group's fifth bits, loaded once per
-# K16 step and rotated to this half of the group) and :iq4 (`IQ4Weight`: the 4-bit codes index a table of 16 values, `Hp` unused).
-@inline function _gx_load(::Val{F}, Pw, Sc, Mn, Hp, Bv, grow, tok, kk, q, group) where {F}
-    gi = (64 * q + 16 * kk) >> trailing_zeros(group) + 1       # (:q6: group 16, one scale and one word of high bits per K16 step)
-    sa = Float32(Sc[gi, grow + 1])
-    ma = F === :q5 ? Float32(Mn[gi, grow + 1]) : 0f0
-    hw = (F === :q5 || F === :q6) ? Hp[gi, grow + 1] : UInt32(0)
-    return (Pw[8q + 2kk + 1, grow + 1], Pw[8q + 2kk + 2, grow + 1], sa, ma, Bv[8q + 2kk + 1, tok + 1], Bv[8q + 2kk + 2, tok + 1], hw)
+@inline _sched_barrier() = ccall("llvm.amdgcn.sched.barrier", llvmcall, Cvoid, (Int32,), Int32(0))
+# The same kernel for the other native formats (`F`): :q5 (`Q5Weight`), :q6 (`Q6Weight`) and :iq4 (`IQ4Weight`: the 4-bit codes index a table of 16 values).
+# `Meta` (K/32, M) is each group's record: one load per K16 step (an 8-byte word for :q5, three words for :q6, the Float16 step for :iq4).
+@inline function _gx_load(::Val{F}, Pw, Meta, Bv, grow, tok, kk, q) where {F}
+    g = 2q + (kk >> 1) + 1                                      # the K32 group of this thread's K16 step
+    m = Meta[g, grow + 1]
+    return (Pw[8q + 2kk + 1, grow + 1], Pw[8q + 2kk + 2, grow + 1], m, Bv[8q + 2kk + 1, tok + 1], Bv[8q + 2kk + 2, tok + 1])
 end
+@inline _f16lo_(u::UInt32) = Float32(reinterpret(Float16, UInt16(u & 0xffff)))
+@inline _f16hi_(u::UInt32) = Float32(reinterpret(Float16, UInt16(u >> 16)))
 @inline function _gx_decode(::Val{:q5}, ld, half)
-    w1, w2, sa, ma, b1, b2, hw = ld
-    hr = bitrotate(hw, -(8 * half))
+    w1, w2, m, b1, b2 = ld
+    lo = UInt32(m & 0xffffffff); hr = bitrotate(UInt32(m >> 32), -(8 * half))
+    sa = _f16lo_(lo); ma = _f16hi_(lo)
     return (_wmma_dq5w(w1, hr, Val(0), sa, ma), _wmma_dq5w(w2, hr, Val(4), sa, ma), b1, b2)
 end
 @inline function _gx_decode(::Val{:q6}, ld, half)
-    w1, w2, sa, ma, b1, b2, hw = ld
+    w1, w2, m, b1, b2 = ld
+    sa = half == 0 ? _f16lo_(m[1]) : _f16hi_(m[1]); hw = half == 0 ? m[2] : m[3]
     return (_wmma_dq6w(w1, hw, Val(0), sa), _wmma_dq6w(w2, hw, Val(4), sa), b1, b2)
 end
 @inline function _gx_decode(::Val{:iq4}, ld, half)
-    w1, w2, sa, ma, b1, b2, hw = ld
+    w1, w2, m, b1, b2 = ld
+    sa = Float32(m)
     return (_wmma_dq_iq4w(w1, sa), _wmma_dq_iq4w(w2, sa), b1, b2)
 end
-function _wmma_gx_kernel!(C, Pw, Sc, Mn, Hp, Bv, K, N, group, R, hr::Val, fmt::Val)
+function _wmma_gx_kernel!(C, Pw, Meta, Bv, K, N, R, hr::Val, fmt::Val)
     @inbounds begin
     tid = workitemIdx().x - 1
     wave = tid ÷ 32; lane = tid % 32; sl = lane % 16; h = lane ÷ 16
@@ -740,7 +744,7 @@ function _wmma_gx_kernel!(C, Pw, Sc, Mn, Hp, Bv, K, N, group, R, hr::Val, fmt::V
     pos = ((inr + 2 * kk) & 15) + 1
     half = kk & 1
     nk = K ÷ 64
-    ld = _gx_load(fmt, Pw, Sc, Mn, Hp, Bv, grow, tok, kk, 0, group)
+    ld = _gx_load(fmt, Pw, Meta, Bv, grow, tok, kk, 0)
     dec = _gx_decode(fmt, ld, half)
     for q in 0:nk-1
         a1, a2, b1, b2 = dec
@@ -749,7 +753,8 @@ function _wmma_gx_kernel!(C, Pw, Sc, Mn, Hp, Bv, K, N, group, R, hr::Val, fmt::V
         Bs[pos, tile + 1, kk + 1, 1] = b1
         Bs[pos, tile + 1, kk + 1, 2] = b2
         sync_workgroup()
-        ld = _gx_load(fmt, Pw, Sc, Mn, Hp, Bv, grow, tok, kk, min(q + 1, nk - 1), group)
+        ld = _gx_load(fmt, Pw, Meta, Bv, grow, tok, kk, min(q + 1, nk - 1))
+        _sched_barrier()          # keep the loads here, in flight during the MMAs (the scheduler otherwise sinks them below the MMAs)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 0)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 1)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 2)
@@ -760,6 +765,21 @@ function _wmma_gx_kernel!(C, Pw, Sc, Mn, Hp, Bv, K, N, group, R, hr::Val, fmt::V
     _wmma_store_big!(C, acc, bm + wr * 32, bn + wt * 64, sl, h, N, R, hr)
     return
     end
+end
+# C (M, N) = W * B for a native-format weight (`fmt`: :q5, :q6, :iq4; `Pv` (K/32, M) of 16 code bytes, `Meta` (K/32, M) its records),
+# B (K, Npad) Float16; M % 256 == 0, K % 64 == 0, padded N % 256 == 0 (the 256 x 256 kernel only).
+function wmma_nat_gemm!(C::ROCArray{T,2}, Pv, Meta, B::ROCArray{Float16,2}, N::Int; fmt::Symbol, residual = nothing) where {T<:Union{Float32,Float16}}
+    K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
+    (M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && size(B, 1) == K && N <= Npad && size(C) == (M, N) && size(Meta) == (K32, M)) ||
+        throw(ArgumentError("wmma_nat_gemm!: need M % 256 == 0, K % 64 == 0, padded N % 256 == 0"))
+    R = residual isa ROCArray{Float32,2} && size(residual) == (M, N) ? residual : nothing
+    residual !== nothing && R === nothing && throw(ArgumentError("wmma_nat_gemm!: the residual must be a Float32 ROCArray of the output's size"))
+    T === Float16 && R !== nothing && throw(ArgumentError("wmma_nat_gemm!: no residual with a Float16 output"))
+    Cv = T === Float16 ? reinterpret(NTuple{8,VecElement{Float16}}, C) : reinterpret(WMMA_V4F, C)
+    Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
+    _launch_q4(_wmma_gx_kernel!, (Cv, reinterpret(UInt32, Pv), Meta, reinterpret(WMMA_V8H, B), K, N, Rv, Val(R !== nothing), Val(fmt)),
+               1024, (Npad ÷ 256, M ÷ 256), WMMA_Q4_WPE[])
+    return C
 end
 
 # --- the paired gate/up GEMM with the SwiGLU in the epilogue, in the structure of the 256 x 256 kernel ---------------
@@ -981,9 +1001,9 @@ end
 # of NTuple{16,UInt8}, scale / mn (K/group, M) Float16 (`mn` = nothing when symmetric).
 function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
                        group::Int, B::ROCArray{Float16,2}, N::Int; kind::Symbol = :auto, pd::Int = WMMA_Q4_PD[], wpe::Int = WMMA_Q4_WPE[],
-                       residual = nothing, hi = nothing, fmt::Symbol = hi === nothing ? :q4 : :q5) where {T<:Union{Float32,Float16}}
+                       residual = nothing) where {T<:Union{Float32,Float16}}
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
-    (M % 16 == 0 && Npad % 64 == 0 && (group % 32 == 0 || fmt === :q6) && size(B, 1) == K &&
+    (M % 16 == 0 && Npad % 64 == 0 && group % 32 == 0 && size(B, 1) == K &&
      size(scale) == (K ÷ group, M) && N <= Npad && size(C) == (M, N)) ||
         throw(ArgumentError("wmma_q4_gemm!: need M % 16 == 0, group % 32 == 0, padded N % 64 == 0"))
     Bv = reinterpret(WMMA_V8H, B)
@@ -991,12 +1011,6 @@ function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
     T === Float16 && !(kind in (:auto, :g) && M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && ispow2(group) && residual === nothing) &&
         throw(ArgumentError("wmma_q4_gemm!: a Float16 output needs the 256x256 kernel (M % 256, K % 64, padded N % 256, power-of-two group, no residual)"))
     T === Float16 && (kind = :g)
-    if fmt !== :q4              # native formats (`Q5Weight`, `IQ4Weight`): only the 256 x 256 kernel decodes them
-        (kind in (:auto, :g) && M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && group == (fmt === :q6 ? 16 : 32) &&
-         (fmt === :iq4 || (fmt === :q6 && size(hi) == (2K32, M)) || (mn !== nothing && size(hi) == (K32, M)))) ||
-            throw(ArgumentError("wmma_q4_gemm!: native weights need the 256x256 kernel (M % 256, K % 64, padded N % 256, group 32)"))
-        kind = :g
-    end
     if kind == :auto
         kind = M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && ispow2(group) && get(ENV, "LUMINAL_WMMA_G", "1") != "0" ? :g :
                M % 128 == 0 && Npad % 256 == 0 && get(ENV, "LUMINAL_WMMA_WIDE", "1") != "0" ?
@@ -1011,10 +1025,7 @@ function wmma_q4_gemm!(C::ROCArray{T,2}, Pv, scale::ROCArray{Float16,2}, mn,
         Cv = T === Float16 ? reinterpret(NTuple{8,VecElement{Float16}}, C) : reinterpret(WMMA_V4F, C)   # 16 bytes at a time
         Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
     end
-    if kind == :g && fmt !== :q4
-        _launch_q4(_wmma_gx_kernel!, (Cv, reinterpret(UInt32, Pv), scale, mn === nothing ? scale : mn, hi === nothing ? scale : hi, Bv, K, N, group, Rv, hr, Val(fmt)),
-                   1024, (Npad ÷ 256, M ÷ 256), wpe)
-    elseif kind == :g
+    if kind == :g
         Pw = reinterpret(UInt32, Pv)
         _launch_q4(_wmma_q4_g_kernel!, (Cv, Pw, scale, mn === nothing ? scale : mn, Bv, K, N, group, Val(mn === nothing), Rv, hr),
                    1024, (Npad ÷ 256, M ÷ 256), wpe)

@@ -1109,3 +1109,13 @@ load (after the header read to the weights on the GPU) 38 s native vs 142 s int4
 decode 117.8 ms/token = 8.5 tok/s vs 77.8 ms = 12.9 tok/s (gufo 12.1). The decode loss (-34%) is the GEMV kernels (one row per workgroup, 109-156 GB/s
 against 149 for the 4-bit kernel at N=1, no multi-row sharing of the activation loads), not the bytes: the native layouts hold 5.5-6.1 bits per
 weight against 5.0. Next: profile decode per format and give the 5-bit / 6-bit / table GEMVs the 4-bit kernel's structure.
+
+Stage 4 (GEMV rebuild, interleaved group records): Q5 / Q6 weights keep each K32 group's metadata in one record (`Q5Weight.meta`: UInt64 = Float16 step |
+Float16 min << 16 | fifth bits << 32; `Q6Weight.meta`: 3 words = two Float16 steps + two high-bit words) instead of 3-4 separate arrays.
+- GEMV (`_nat_gemv2_kernel!`): one wave per 4 rows, lanes stride over K32 groups, shuffle reduction (no LDS, no barriers), next group's weights loaded
+  one iteration ahead; the weights travel as 4 UInt32 words (a carried NTuple{16, UInt8} spilled 1 KB/lane to scratch: 4-5x slower). Microbenchmark
+  (back-to-back launches, N=1): Q5_K 166 -> 217 GB/s, IQ4_XS 150 -> 209, Q6_K 164 -> 173-191, existing 4-bit kernel 211. Single launches with a sync
+  between them under-report by ~25% (the clocks have not ramped): always time batches.
+- GEMM (`wmma_nat_gemm!`, `_wmma_gx_kernel!`): after the refactor the scheduler sank the global loads below the 32 WMMAs (IQ4 -12%, Q6 -17%);
+  `llvm.amdgcn.sched.barrier(0)` after the loads restores them: Q5_K 33.2-34.4, Q6_K 34.5, IQ4_XS 35.1-35.2 TFLOP/s against 33.6-34.6 for 4-bit.
+- Whole model (Qwen3.8-27B Q4_K_XL, native): decode 117.8 -> 100.4 ms/token (8.5 -> 10.0 tok/s; int4 77.8, gufo 82); prefill 2048: 594 tok/s (int4 642).

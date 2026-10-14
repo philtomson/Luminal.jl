@@ -36,7 +36,7 @@
 end
 
 # Q5_K: 176-byte blocks, d, dmin, 12 scale bytes, 32 bytes qh (bit j of qh[l] = fifth bit of code l of sub-block j), 128 bytes qs.
-@kernel function _repack_q5k_kernel!(p, scale, mn, hi, @Const(raw))
+@kernel function _repack_q5k_kernel!(p, meta, @Const(raw))
     i = @index(Global, Linear)
     g0 = i - 1
     blk = g0 >> 3; j = g0 & 7
@@ -50,8 +50,8 @@ end
         s = (raw[sc + j + 5] & 0x0f) | ((raw[sc + j - 3] >> 0x06) << 0x04)
         m = (raw[sc + j + 5] >> 0x04) | ((raw[sc + j + 1] >> 0x06) << 0x04)
     end
-    scale[i] = Float16(d * Float32(s))
-    mn[i] = Float16(-dmin * Float32(m))
+    sb = UInt64(reinterpret(UInt16, Float16(d * Float32(s))))
+    mb = UInt64(reinterpret(UInt16, Float16(-dmin * Float32(m))))
     q = o + 48 + (j >> 1) * 32
     qh = o + 16
     sh = UInt8(4) * UInt8(j & 1)
@@ -65,7 +65,7 @@ end
         bh = UInt32((raw[qh + 2t + 2] >> jj) & 0x01)
         w |= (bl << UInt32(4 + t)) | (bh << UInt32((20 + t) & 31))
     end
-    hi[i] = w
+    meta[i] = sb | (mb << 16) | (UInt64(w) << 32)
 end
 
 # IQ4_XS: 136-byte blocks: d (f16), scales_h (u16), scales_l (4 bytes), 128 bytes qs; sub-block ib (32 values) has the 6-bit scale
@@ -113,21 +113,20 @@ end
 end
 _q8_planes(q, scale) = QuantWeight(q, Base.reshape(reinterpret(NTuple{16, Int8}, vec(q)), size(q, 1) ÷ 16, size(q, 2)), scale, 32)
 
+_vview(p) = Base.reshape(reinterpret(NTuple{16, UInt8}, vec(p)), size(p, 1) ÷ 16, size(p, 2))
 _q4_planes(p, scale, mn) = Q4Weight(p, Base.reshape(reinterpret(NTuple{16, UInt8}, vec(p)), size(p, 1) ÷ 16, size(p, 2)),
                                     scale, mn, 2 * size(p, 1) ÷ size(scale, 1))
 
 # Q6_K: 210-byte blocks: ql (128 bytes, low nibbles), qh (64 bytes, 2 bits per code), 16 int8 scales, d (f16). Code e (0..255) of a block:
 # half n = e >> 7, quarter qd = (e >> 5) & 3, l = e & 31: ql[64 n + 32 (qd & 1) + l] (high nibble when qd >= 2), qh[32 n + l] >> (2 qd), step d * scales[e >> 4].
-@kernel function _repack_q6k_kernel!(p, scale, hi, @Const(raw))
+@kernel function _repack_q6k_kernel!(p, meta, @Const(raw))
     i = @index(Global, Linear)
     g0 = i - 1                                      # group of 32 codes
     blk = g0 >> 3; j = g0 & 7
     o = blk * 210
     d = Float32(reinterpret(Float16, UInt16(raw[o + 209]) | UInt16(raw[o + 210]) << 8))
-    for s in 0:1
-        e0 = 32j + 16s
-        scale[2g0 + s + 1] = Float16(d * Float32(reinterpret(Int8, raw[o + 193 + (e0 >> 4)])))
-    end
+    sb0 = UInt32(reinterpret(UInt16, Float16(d * Float32(reinterpret(Int8, raw[o + 193 + ((32j) >> 4)])))))
+    sb1 = UInt32(reinterpret(UInt16, Float16(d * Float32(reinterpret(Int8, raw[o + 193 + ((32j + 16) >> 4)])))))
     w0 = UInt32(0); w1 = UInt32(0)
     for t in 0:15
         v = 0x00
@@ -149,7 +148,7 @@ _q4_planes(p, scale, mn) = Q4Weight(p, Base.reshape(reinterpret(NTuple{16, UInt8
         end
         p[g0 * 16 + t + 1] = v
     end
-    hi[2g0 + 1] = w0; hi[2g0 + 2] = w1
+    meta[g0 + 1] = (sb0 | (sb1 << 16), w0, w1)
 end
 
 """
@@ -177,11 +176,10 @@ function native_weight(f::GGUFFile, name::String, device)
         K % 256 == 0 || return nothing
         raw = to_device(gguf_raw(f, name), device)
         G = K ÷ 32
-        p = similar(raw, UInt8, K ÷ 2, M)
-        scale = similar(raw, Float16, G, M); mn = similar(raw, Float16, G, M); hi = similar(raw, UInt32, G, M)
-        _repack_q5k_kernel!(KernelAbstractions.get_backend(raw), 256)(p, scale, mn, hi, raw; ndrange = G * M)
+        p = similar(raw, UInt8, K ÷ 2, M); meta = similar(raw, UInt64, G, M)
+        _repack_q5k_kernel!(KernelAbstractions.get_backend(raw), 256)(p, meta, raw; ndrange = G * M)
         _free_now!(raw)
-        return Q5Weight(_q4_planes(p, scale, mn), hi)
+        return Q5Weight(p, _vview(p), meta)
     end
     if ty === :IQ4_XS
         K % 256 == 0 || return nothing
@@ -212,10 +210,10 @@ function native_weight(f::GGUFFile, name::String, device)
     if ty === :Q6_K
         K % 256 == 0 || return nothing
         raw = to_device(gguf_raw(f, name), device)
-        p = similar(raw, UInt8, K ÷ 2, M); scale = similar(raw, Float16, K ÷ 16, M); hi = similar(raw, UInt32, K ÷ 16, M)
-        _repack_q6k_kernel!(KernelAbstractions.get_backend(raw), 256)(p, scale, hi, raw; ndrange = (K ÷ 32) * M)
+        p = similar(raw, UInt8, K ÷ 2, M); meta = similar(raw, NTuple{3, UInt32}, K ÷ 32, M)
+        _repack_q6k_kernel!(KernelAbstractions.get_backend(raw), 256)(p, meta, raw; ndrange = (K ÷ 32) * M)
         _free_now!(raw)
-        return Q6Weight(_q4_planes(p, scale, nothing), hi)
+        return Q6Weight(p, _vview(p), meta)
     end
     return nothing
 end
@@ -238,27 +236,25 @@ _device_of(x) = x isa AnyGPUArray ? get_device() : CPUDevice()
 
 export native_weight
 
-_wrows(w::Q5Weight, idx) = Q5Weight(_wrows(w.q, idx), w.hi[:, idx])
-_wvcat(a::Q5Weight, b::Q5Weight) = Q5Weight(_wvcat(a.q, b.q), hcat(a.hi, b.hi))
-function _wcols(w::Q5Weight, perm::AbstractVector{Int})
-    gd = to_device((perm[1:32:end] .- 1) .÷ 32 .+ 1, _device_of(w.hi))
-    return Q5Weight(_wcols(w.q, perm), w.hi[gd, :])
-end
 _wrows(w::IQ4Weight, idx) = IQ4Weight(_wrows(w.q, idx))
 _wvcat(a::IQ4Weight, b::IQ4Weight) = IQ4Weight(_wvcat(a.q, b.q))
 _wcols(w::IQ4Weight, perm::AbstractVector{Int}) = IQ4Weight(_wcols(w.q, perm))
-_wrows(w::Q6Weight, idx) = Q6Weight(_wrows(w.q, idx), w.hi[:, idx])
-_wvcat(a::Q6Weight, b::Q6Weight) = Q6Weight(_wvcat(a.q, b.q), hcat(a.hi, b.hi))
-function _wcols(w::Q6Weight, perm::AbstractVector{Int})      # whole K16 steps
-    G = size(w.hi, 1); M = size(w.hi, 2)
-    gd = to_device((perm[1:16:end] .- 1) .÷ 16 .+ 1, _device_of(w.hi))
-    p3 = Base.reshape(w.q.p, 8, G, M)[:, gd, :]
-    return Q6Weight(_q4_planes(Base.reshape(p3, 8 * G, M), w.q.scale[gd, :], nothing), w.hi[gd, :])
-end
 
 _wrows(w::QuantWeight, idx) = _q8_planes(w.q[:, idx], w.scale[:, idx])
 _wvcat(a::QuantWeight, b::QuantWeight) = _q8_planes(hcat(a.q, b.q), hcat(a.scale, b.scale))
 function _wcols(w::QuantWeight, perm::AbstractVector{Int})
     gd = to_device((perm[1:32:end] .- 1) .÷ 32 .+ 1, _device_of(w.q))
     return _q8_planes(w.q[to_device(perm, _device_of(w.q)), :], w.scale[gd, :])
+end
+
+# Q5Weight / Q6Weight: planes `p` and `meta`, reordered like the other layouts
+_nat_like(w::Q5Weight, p, meta) = Q5Weight(p, _vview(p), meta)
+_nat_like(w::Q6Weight, p, meta) = Q6Weight(p, _vview(p), meta)
+_wrows(w::Union{Q5Weight, Q6Weight}, idx) = _nat_like(w, w.p[:, idx], w.meta[:, idx])
+_wvcat(a::T, b::T) where {T <: Union{Q5Weight, Q6Weight}} = _nat_like(a, hcat(a.p, b.p), hcat(a.meta, b.meta))
+function _wcols(w::Union{Q5Weight, Q6Weight}, perm::AbstractVector{Int})      # whole groups of 32
+    G, M = size(w.meta)
+    gd = to_device((perm[1:32:end] .- 1) .÷ 32 .+ 1, _device_of(w.meta))
+    p3 = Base.reshape(w.p, 16, G, M)[:, gd, :]
+    return _nat_like(w, Base.reshape(p3, 16 * G, M), w.meta[gd, :])
 end
