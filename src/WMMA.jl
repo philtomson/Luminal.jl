@@ -705,31 +705,37 @@ end
 
 @inline _sched_barrier() = ccall("llvm.amdgcn.sched.barrier", llvmcall, Cvoid, (Int32,), Int32(0))
 # The same kernel for the other native formats (`F`): :q5 (`Q5Weight`), :q6 (`Q6Weight`) and :iq4 (`IQ4Weight`: the 4-bit codes index a table of 16 values).
-# `Meta` (K/32, M) is each group's record: one load per K16 step (an 8-byte word for :q5, three words for :q6, the Float16 step for :iq4).
-@inline function _gx_load(::Val{F}, Pw, Meta, Bv, grow, tok, kk, q) where {F}
+# `Meta` (K/32, M) is each group's record (the fifth bits for :q5, three words for :q6, the Float16 step for :iq4), `Blk` (K/256, M) the block headers of :q5.
+@inline function _gx_load(::Val{F}, Pw, Meta, Blk, Bv, grow, tok, kk, q) where {F}
     g = 2q + (kk >> 1) + 1                                      # the K32 group of this thread's K16 step
     m = Meta[g, grow + 1]
     return (Pw[8q + 2kk + 1, grow + 1], Pw[8q + 2kk + 2, grow + 1], m, Bv[8q + 2kk + 1, tok + 1], Bv[8q + 2kk + 2, tok + 1])
 end
+@inline function _gx_load(::Val{:q5}, Pw, Meta, Blk, Bv, grow, tok, kk, q)
+    g = 2q + (kk >> 1) + 1
+    hi = Meta[g, grow + 1]                                      # fifth bits
+    r1, r2, r3, r4 = Blk[((g - 1) >> 3) + 1, grow + 1]          # the block header
+    return (Pw[8q + 2kk + 1, grow + 1], Pw[8q + 2kk + 2, grow + 1], hi, r1, r2, r3, r4, Bv[8q + 2kk + 1, tok + 1], Bv[8q + 2kk + 2, tok + 1])
+end
 @inline _f16lo_(u::UInt32) = Float32(reinterpret(Float16, UInt16(u & 0xffff)))
 @inline _f16hi_(u::UInt32) = Float32(reinterpret(Float16, UInt16(u >> 16)))
-@inline function _gx_decode(::Val{:q5}, ld, half)
-    w1, w2, m, b1, b2 = ld
-    lo = UInt32(m & 0xffffffff); hr = bitrotate(UInt32(m >> 32), -(8 * half))
-    sa = _f16lo_(lo); ma = _f16hi_(lo)
+@inline function _gx_decode(::Val{:q5}, ld, half, j)
+    w1, w2, hi, r1, r2, r3, r4, b1, b2 = ld
+    sa, ma = _kq_scale_min((r1, r2, r3, r4), j)
+    hr = bitrotate(hi, -(8 * half))
     return (_wmma_dq5w(w1, hr, Val(0), sa, ma), _wmma_dq5w(w2, hr, Val(4), sa, ma), b1, b2)
 end
-@inline function _gx_decode(::Val{:q6}, ld, half)
+@inline function _gx_decode(::Val{:q6}, ld, half, j)
     w1, w2, m, b1, b2 = ld
     sa = half == 0 ? _f16lo_(m[1]) : _f16hi_(m[1]); hw = half == 0 ? m[2] : m[3]
     return (_wmma_dq6w(w1, hw, Val(0), sa), _wmma_dq6w(w2, hw, Val(4), sa), b1, b2)
 end
-@inline function _gx_decode(::Val{:iq4}, ld, half)
+@inline function _gx_decode(::Val{:iq4}, ld, half, j)
     w1, w2, m, b1, b2 = ld
     sa = Float32(m)
     return (_wmma_dq_iq4w(w1, sa), _wmma_dq_iq4w(w2, sa), b1, b2)
 end
-function _wmma_gx_kernel!(C, Pw, Meta, Bv, K, N, R, hr::Val, fmt::Val)
+function _wmma_gx_kernel!(C, Pw, Meta, Blk, Bv, K, N, R, hr::Val, fmt::Val)
     @inbounds begin
     tid = workitemIdx().x - 1
     wave = tid ÷ 32; lane = tid % 32; sl = lane % 16; h = lane ÷ 16
@@ -745,8 +751,8 @@ function _wmma_gx_kernel!(C, Pw, Meta, Bv, K, N, R, hr::Val, fmt::Val)
     pos = ((inr + 2 * kk) & 15) + 1
     half = kk & 1
     nk = K ÷ 64
-    ld = _gx_load(fmt, Pw, Meta, Bv, grow, tok, kk, 0)
-    dec = _gx_decode(fmt, ld, half)
+    ld = _gx_load(fmt, Pw, Meta, Blk, Bv, grow, tok, kk, 0)
+    dec = _gx_decode(fmt, ld, half, (kk >> 1) & 7)
     for q in 0:nk-1
         a1, a2, b1, b2 = dec
         As[pos, tile + 1, kk + 1, 1] = a1
@@ -754,12 +760,12 @@ function _wmma_gx_kernel!(C, Pw, Meta, Bv, K, N, R, hr::Val, fmt::Val)
         Bs[pos, tile + 1, kk + 1, 1] = b1
         Bs[pos, tile + 1, kk + 1, 2] = b2
         sync_workgroup()
-        ld = _gx_load(fmt, Pw, Meta, Bv, grow, tok, kk, min(q + 1, nk - 1))
+        ld = _gx_load(fmt, Pw, Meta, Blk, Bv, grow, tok, kk, min(q + 1, nk - 1))
         _sched_barrier()          # keep the loads here, in flight during the MMAs (the scheduler otherwise sinks them below the MMAs)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 0)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 1)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 2)
-        dec = _gx_decode(fmt, ld, half)
+        dec = _gx_decode(fmt, ld, half, (2 * min(q + 1, nk - 1) + (kk >> 1)) & 7)
         acc = _g_ks(acc, As, Bs, wr, wt, sl, 3)
         sync_workgroup()
     end
@@ -769,7 +775,7 @@ function _wmma_gx_kernel!(C, Pw, Meta, Bv, K, N, R, hr::Val, fmt::Val)
 end
 # C (M, N) = W * B for a native-format weight (`fmt`: :q5, :q6, :iq4; `Pv` (K/32, M) of 16 code bytes, `Meta` (K/32, M) its records),
 # B (K, Npad) Float16; M % 256 == 0, K % 64 == 0, padded N % 256 == 0 (the 256 x 256 kernel only).
-function wmma_nat_gemm!(C::ROCArray{T,2}, Pv, Meta, B::ROCArray{Float16,2}, N::Int; fmt::Symbol, residual = nothing) where {T<:Union{Float32,Float16}}
+function wmma_nat_gemm!(C::ROCArray{T,2}, Pv, Meta, Blk, B::ROCArray{Float16,2}, N::Int; fmt::Symbol, residual = nothing) where {T<:Union{Float32,Float16}}
     K32, M = size(Pv); K = 32 * K32; Npad = size(B, 2)
     (M % 256 == 0 && K % 64 == 0 && Npad % 256 == 0 && size(B, 1) == K && N <= Npad && size(C) == (M, N) && size(Meta) == (K32, M)) ||
         throw(ArgumentError("wmma_nat_gemm!: need M % 256 == 0, K % 64 == 0, padded N % 256 == 0"))
@@ -778,7 +784,7 @@ function wmma_nat_gemm!(C::ROCArray{T,2}, Pv, Meta, B::ROCArray{Float16,2}, N::I
     T === Float16 && R !== nothing && throw(ArgumentError("wmma_nat_gemm!: no residual with a Float16 output"))
     Cv = T === Float16 ? reinterpret(NTuple{8,VecElement{Float16}}, C) : reinterpret(WMMA_V4F, C)
     Rv = R === nothing ? Cv : reinterpret(WMMA_V4F, R)
-    _launch_q4(_wmma_gx_kernel!, (Cv, reinterpret(UInt32, Pv), Meta, reinterpret(WMMA_V8H, B), K, N, Rv, Val(R !== nothing), Val(fmt)),
+    _launch_q4(_wmma_gx_kernel!, (Cv, reinterpret(UInt32, Pv), Meta, Blk, reinterpret(WMMA_V8H, B), K, N, Rv, Val(R !== nothing), Val(fmt)),
                1024, (Npad ÷ 256, M ÷ 256), WMMA_Q4_WPE[])
     return C
 end

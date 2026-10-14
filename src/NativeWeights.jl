@@ -36,22 +36,15 @@
 end
 
 # Q5_K: 176-byte blocks, d, dmin, 12 scale bytes, 32 bytes qh (bit j of qh[l] = fifth bit of code l of sub-block j), 128 bytes qs.
-@kernel function _repack_q5k_kernel!(p, meta, @Const(raw))
+@kernel function _repack_q5k_kernel!(p, hi, blk, @Const(raw))
     i = @index(Global, Linear)
     g0 = i - 1
-    blk = g0 >> 3; j = g0 & 7
-    o = blk * 176
-    d = Float32(reinterpret(Float16, UInt16(raw[o + 1]) | UInt16(raw[o + 2]) << 8))
-    dmin = Float32(reinterpret(Float16, UInt16(raw[o + 3]) | UInt16(raw[o + 4]) << 8))
-    sc = o + 4
-    if j < 4
-        s = raw[sc + j + 1] & 0x3f; m = raw[sc + j + 5] & 0x3f
-    else
-        s = (raw[sc + j + 5] & 0x0f) | ((raw[sc + j - 3] >> 0x06) << 0x04)
-        m = (raw[sc + j + 5] >> 0x04) | ((raw[sc + j + 1] >> 0x06) << 0x04)
+    b = g0 >> 3; j = g0 & 7
+    o = b * 176
+    if j == 0                                       # the block header: the first 16 bytes of the file block
+        w = ntuple(k -> UInt32(raw[o + 4k - 3]) | (UInt32(raw[o + 4k - 2]) << 8) | (UInt32(raw[o + 4k - 1]) << 16) | (UInt32(raw[o + 4k]) << 24), Val(4))
+        blk[b + 1] = w
     end
-    sb = UInt64(reinterpret(UInt16, Float16(d * Float32(s))))
-    mb = UInt64(reinterpret(UInt16, Float16(-dmin * Float32(m))))
     q = o + 48 + (j >> 1) * 32
     qh = o + 16
     sh = UInt8(4) * UInt8(j & 1)
@@ -65,7 +58,7 @@ end
         bh = UInt32((raw[qh + 2t + 2] >> jj) & 0x01)
         w |= (bl << UInt32(4 + t)) | (bh << UInt32((20 + t) & 31))
     end
-    meta[i] = sb | (mb << 16) | (UInt64(w) << 32)
+    hi[i] = w
 end
 
 # IQ4_XS: 136-byte blocks: d (f16), scales_h (u16), scales_l (4 bytes), 128 bytes qs; sub-block ib (32 values) has the 6-bit scale
@@ -176,10 +169,10 @@ function native_weight(f::GGUFFile, name::String, device)
         K % 256 == 0 || return nothing
         raw = to_device(gguf_raw(f, name), device)
         G = K ÷ 32
-        p = similar(raw, UInt8, K ÷ 2, M); meta = similar(raw, UInt64, G, M)
-        _repack_q5k_kernel!(KernelAbstractions.get_backend(raw), 256)(p, meta, raw; ndrange = G * M)
+        p = similar(raw, UInt8, K ÷ 2, M); hi = similar(raw, UInt32, G, M); blk = similar(raw, NTuple{4, UInt32}, K ÷ 256, M)
+        _repack_q5k_kernel!(KernelAbstractions.get_backend(raw), 256)(p, hi, blk, raw; ndrange = G * M)
         _free_now!(raw)
-        return Q5Weight(p, _vview(p), meta)
+        return Q5Weight(p, _vview(p), hi, blk)
     end
     if ty === :IQ4_XS
         K % 256 == 0 || return nothing
@@ -247,14 +240,18 @@ function _wcols(w::QuantWeight, perm::AbstractVector{Int})
     return _q8_planes(w.q[to_device(perm, _device_of(w.q)), :], w.scale[gd, :])
 end
 
-# Q5Weight / Q6Weight: planes `p` and `meta`, reordered like the other layouts
-_nat_like(w::Q5Weight, p, meta) = Q5Weight(p, _vview(p), meta)
+# Q6Weight: planes `p` and `meta`, reordered like the other layouts
 _nat_like(w::Q6Weight, p, meta) = Q6Weight(p, _vview(p), meta)
-_wrows(w::Union{Q5Weight, Q6Weight}, idx) = _nat_like(w, w.p[:, idx], w.meta[:, idx])
-_wvcat(a::T, b::T) where {T <: Union{Q5Weight, Q6Weight}} = _nat_like(a, hcat(a.p, b.p), hcat(a.meta, b.meta))
-function _wcols(w::Union{Q5Weight, Q6Weight}, perm::AbstractVector{Int})      # whole groups of 32
+_wrows(w::Q6Weight, idx) = _nat_like(w, w.p[:, idx], w.meta[:, idx])
+_wvcat(a::Q6Weight, b::Q6Weight) = _nat_like(a, hcat(a.p, b.p), hcat(a.meta, b.meta))
+function _wcols(w::Q6Weight, perm::AbstractVector{Int})      # whole groups of 32
     G, M = size(w.meta)
     gd = to_device((perm[1:32:end] .- 1) .÷ 32 .+ 1, _device_of(w.meta))
     p3 = Base.reshape(w.p, 16, G, M)[:, gd, :]
     return _nat_like(w, Base.reshape(p3, 16 * G, M), w.meta[gd, :])
 end
+
+# Q5Weight: the block headers (one per 256 inputs) go with their rows; the input columns cannot be reordered finer than a block
+_wrows(w::Q5Weight, idx) = (p = w.p[:, idx]; Q5Weight(p, _vview(p), w.hi[:, idx], w.blk[:, idx]))
+_wvcat(a::Q5Weight, b::Q5Weight) = (p = hcat(a.p, b.p); Q5Weight(p, _vview(p), hcat(a.hi, b.hi), hcat(a.blk, b.blk)))
+_wcols(::Q5Weight, perm) = throw(ArgumentError("Q5Weight keeps the file's 256-input blocks: its input columns cannot be permuted (use `out_tiled`)"))

@@ -586,7 +586,9 @@ function release!(cg::CompiledGraph)
             free!(x.q); free!(x.scale)
         elseif x isa Luminal.Q4Weight
             free!(x.p); free!(x.scale); x.mn === nothing || free!(x.mn)
-        elseif x isa Luminal.Q5Weight || x isa Luminal.Q6Weight
+        elseif x isa Luminal.Q5Weight
+            free!(x.p); free!(x.hi); free!(x.blk)
+        elseif x isa Luminal.Q6Weight
             free!(x.p); free!(x.meta)
         elseif x isa Luminal.IQ4Weight
             free!(x.q.p); free!(x.q.scale)

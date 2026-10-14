@@ -1119,3 +1119,17 @@ Float16 min << 16 | fifth bits << 32; `Q6Weight.meta`: 3 words = two Float16 ste
 - GEMM (`wmma_nat_gemm!`, `_wmma_gx_kernel!`): after the refactor the scheduler sank the global loads below the 32 WMMAs (IQ4 -12%, Q6 -17%);
   `llvm.amdgcn.sched.barrier(0)` after the loads restores them: Q5_K 33.2-34.4, Q6_K 34.5, IQ4_XS 35.1-35.2 TFLOP/s against 33.6-34.6 for 4-bit.
 - Whole model (Qwen3.8-27B Q4_K_XL, native): decode 117.8 -> 100.4 ms/token (8.5 -> 10.0 tok/s; int4 77.8, gufo 82); prefill 2048: 594 tok/s (int4 642).
+
+Stage 5 (file-sized Q5_K, out_tiled): Q5Weight is now p / v (low 4 bits), `hi` (a UInt32 of fifth bits per K32 group) and `blk` (the file's own 16-byte header per
+256 inputs: d, dmin, 12 bytes of 6-bit scales and minimums; `_kq_scale_min` decodes sub-block j): 0.6875 bytes/weight like the file, values exact (dequantize error
+0.0; the earlier per-group layout rounded d * sc to Float16). A 256-input block cannot be split, so `ssm_out` stays in the file's column order (`out_tiled`: the
+model's gated norm writes the value heads in llama.cpp's tiled slots; `GatedRMSNormOp(eps, tiled_nk, nv)`; cfg from a GGUF sets it, `LUMINAL_OUT_TILED=0` turns it off
+and restores the loader's column permutation for non-block formats). Lessons: the scale decode first used Int64 shifts and spilled 289 VGPRs (GEMM 8 TFLOP/s): 32-bit
+arithmetic and `ifelse` give 143 VGPRs, no spills, 33.9 TFLOP/s; `(@inbounds a, @inbounds b, @inbounds c)` nests the later elements inside the first macro (a 3-tuple became
+(a, (b, c))): put the loads in an `@inbounds begin ... end` block; a model that rebuilds its graphs from its stored `config` tuple must keep every flag in it.
+Measured: Q5 GEMV 307 -> 301 us (17408 x 5120), GEMM unchanged, decode 102.7 ms/token (100.4 before: noise), prefill 607 tok/s, KL 0.0056 unchanged. The 0.72 GB saved is
+~3 ms at the GEMV rate but the GEMV is not purely byte-bound (scale unpacking), so the saving did not show. Q4_K / IQ4_XS / Q6_K keep their per-group records (0.4 GB more
+to gain, expected to show even less). Next for decode: deeper MTP drafting (kyojin: 2-3 draft tokens, dynamic stop on confidence), launch gaps and small kernels.
+Kyojin (~/devel/AI/kyojin, an ExLlamaV3 fork for gfx1151, its own ~3 bpw EXL3 quantization, MoE models): decode is bytes-bound there too; its notes' transferable parts are the cost
+model ms/forward = a + b * rows (extra verify rows are free for a dense model, 9 ms each for its MoE), MTP depth sweeps with dynamic drafting, an LDS bank-conflict found by arithmetic
+(innermost extent of a one-dword shared array must be coprime with 32), and the warning that run-to-run drift is > 1 tok/s so claims under ~2 tok/s need repeats.

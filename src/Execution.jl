@@ -1672,46 +1672,64 @@ end
 """
     Q5Weight
 
-GGUF's Q5_K in the file's own values: `p` / `v` are the low four bits of the codes in `Q4Weight`'s layout, and `meta` (In/32, Out) holds one
-`UInt64` per group of 32 inputs: the Float16 step (d * sc) in bits 0-15, the Float16 minimum (-dmin * m) in bits 16-31 and the codes' fifth bits
-in bits 32-63. Bit `4 + b` of that word is the fifth bit of the low-nibble code of byte `b` of the group's 16 code bytes and bit `(20 + b) % 32`
-that of the high-nibble code: a kernel masks `rotr(word, b) & 0x00100010` and ORs it into the code's Float16 bit pattern. (One 8-byte record per
-group instead of three separate arrays: the GEMV is bound by the number of small loads.)
+GGUF's Q5_K in the file's own values and size: `p` / `v` are the low four bits of the codes in `Q4Weight`'s layout, `hi` (In/32, Out) holds one
+`UInt32` of fifth bits per group of 32 inputs (bit `4 + b` is the fifth bit of the low-nibble code of byte `b` of the group's 16 code bytes and bit
+`(20 + b) % 32` that of the high-nibble code: a kernel masks `rotr(word, b) & 0x00100010` and ORs it into the code's Float16 bit pattern), and
+`blk` (In/256, Out) the file's own 16-byte block header: d and dmin as Float16 (word 1) and the twelve bytes of 6-bit scales and minimums
+(words 2-4), see `_kq_scale_min`.
 """
-struct Q5Weight{P, V, T} <: AbstractMatrix{Float32}
+struct Q5Weight{P, V, H, B} <: AbstractMatrix{Float32}
     p::P
     v::V
-    meta::T
+    hi::H
+    blk::B
 end
 Base.size(w::Q5Weight) = (size(w.p, 2), 2 * size(w.p, 1))
 @inline _q5_bitpos(l) = (b = l >> 1; iseven(l) ? 4 + b : (20 + b) & 31)    # l: 0-based code index in its group of 32
 @inline _f16lo(u::UInt32) = Float32(reinterpret(Float16, UInt16(u & 0xffff)))
 @inline _f16hi(u::UInt32) = Float32(reinterpret(Float16, UInt16(u >> 16)))
+# the step (d * sc) and minimum (-dmin * m) of sub-block j (0..7) of a Q4_K / Q5_K block header `rec` = (d | dmin << 16, bytes 0-3, 4-7, 8-11 of the scales)
+@inline function _kq_scale_min(rec::NTuple{4, UInt32}, j)
+    ju = UInt32(j)
+    w0, w1, w2 = rec[2], rec[3], rec[4]
+    sh = (ju & 0x03) << 0x03
+    a = (w0 >> sh) & 0xff; b = (w1 >> sh) & 0xff; c = (w2 >> sh) & 0xff
+    hiq = (ju & 0x04) != 0x00                                   # sub-blocks 4..7 take their low bits from w2 and their top two from w0 / w1
+    s = ifelse(hiq, (c & 0x0f) | ((a >> 0x06) << 0x04), a & 0x3f)
+    m = ifelse(hiq, (c >> 0x04) | ((b >> 0x06) << 0x04), b & 0x3f)
+    return _f16lo(rec[1]) * Float32(s), -_f16hi(rec[1]) * Float32(m)
+end
 function Base.getindex(w::Q5Weight, i::Int, j::Int)
     b = w.p[(j + 1) ÷ 2, i]
     c = isodd(j) ? b & 0x0f : b >> 0x04
-    m = w.meta[(j - 1) ÷ 32 + 1, i]
-    bit = (UInt32(m >> 32) >> _q5_bitpos((j - 1) % 32)) & 0x01
-    return Float32(c + 0x10 * bit) * _f16lo(UInt32(m & 0xffffffff)) + _f16hi(UInt32(m & 0xffffffff))
+    g = (j - 1) ÷ 32
+    s, m = _kq_scale_min(w.blk[g ÷ 8 + 1, i], g % 8)
+    bit = (w.hi[g + 1, i] >> _q5_bitpos((j - 1) % 32)) & 0x01
+    return Float32(c + 0x10 * bit) * s + m
 end
 function dequantize(w::Q5Weight)
     M, K = size(w); G = K ÷ 32
     codes = similar(w.p, UInt8, 2, K ÷ 2, M)
     view(codes, 1, :, :) .= w.p .& 0x0f
     view(codes, 2, :, :) .= w.p .>> 0x04
-    u = Base.reshape(reinterpret(UInt32, vec(w.meta)), 2, G, M)          # (scale | min, fifth bits)
-    sm = Base.reshape(u[1, :, :], 1, G, M); hi = Base.reshape(u[2, :, :], 1, G, M)
+    u = Base.reshape(reinterpret(UInt32, vec(w.blk)), 4, K ÷ 256, M)
+    jv = similar(w.p, Int, 8); copyto!(jv, collect(0:7))
+    u1, u2, u3, u4 = (Base.reshape(u[r, :, :], 1, K ÷ 256, M) for r in 1:4)
+    sm = _kq_sm_arr.(u1, u2, u3, u4, Base.reshape(jv, 8, 1, 1))          # (8, K/256, M) of (step, min)
+    sc = Base.reshape(first.(sm), 1, G, M); mn = Base.reshape(last.(sm), 1, G, M)
     pos = similar(w.p, UInt32, 32); copyto!(pos, UInt32[_q5_bitpos(l) for l in 0:31])
+    hi = Base.reshape(w.hi, 1, G, M)
     cg = Base.reshape(codes, 32, G, M)
-    x = (Float32.(cg) .+ 16f0 .* Float32.((hi .>> Base.reshape(pos, 32, 1, 1)) .& 0x01)) .* _f16lo.(sm) .+ _f16hi.(sm)
+    x = (Float32.(cg) .+ 16f0 .* Float32.((hi .>> Base.reshape(pos, 32, 1, 1)) .& 0x01)) .* sc .+ mn
     xr = Base.reshape(x, K, M)
     out = permutedims(xr, (2, 1))
-    foreach(_free_now!, (xr, x, cg, codes, pos, sm, hi))
+    foreach(_free_now!, (xr, x, cg, codes, pos, sm, hi, sc, mn, jv))
     return out
 end
+@inline _kq_sm_arr(u1::UInt32, u2::UInt32, u3::UInt32, u4::UInt32, j) = _kq_scale_min((u1, u2, u3, u4), j)
 _free_now!(w::QuantWeight) = (_free_now!(w.q); _free_now!(w.scale); nothing)
 _free_now!(w::Q4Weight) = (foreach(_free_now!, (w.p, w.scale)); w.mn === nothing || _free_now!(w.mn); nothing)
-_free_now!(w::Q5Weight) = (_free_now!(w.p); _free_now!(w.meta); nothing)
+_free_now!(w::Q5Weight) = (_free_now!(w.p); _free_now!(w.hi); _free_now!(w.blk); nothing)
 
 """
     IQ4Weight
@@ -1818,43 +1836,52 @@ end
 const IQ4NL_TUPLE = (-127f0, -104f0, -83f0, -65f0, -49f0, -35f0, -22f0, -10f0, 1f0, 13f0, 25f0, 38f0, 53f0, 69f0, 89f0, 113f0)
 # GEMV for the native formats: one wave computes 4 rows (the activation loads of a K32 group are shared by the 4 rows), its 32 lanes stride over
 # the row's K32 groups, and a shuffle reduction replaces the workgroup tree (no LDS, no barriers). 8 waves = 32 rows per workgroup of 256.
-@inline _gv_load(Wv, Meta, g, row) = (@inbounds Wv[g, row], @inbounds Meta[g, row])
-@inline function _gv_use(::Val{:q5}, ld, xa, xb, xc, xd, xs)
-    w, m = ld
-    lo = UInt32(m & 0xffffffff)
-    return _f16lo(lo) * _dot_q5(w, UInt32(m >> 32), xa, xb, xc, xd) + _f16hi(lo) * xs
+@inline function _gv_load(::Val, Wv, Meta, Blk, g, row)
+    @inbounds begin
+        return (Wv[g, row], Meta[g, row])
+    end
 end
-@inline function _gv_use(::Val{:iq4}, ld, xa, xb, xc, xd, xs)
+@inline function _gv_load(::Val{:q5}, Wv, Meta, Blk, g, row)
+    @inbounds begin
+        return (Wv[g, row], Meta[g, row], Blk[((g - 1) >> 3) + 1, row])
+    end
+end
+@inline function _gv_use(::Val{:q5}, ld, g, xa, xb, xc, xd, xs)
+    w, hi, rec = ld
+    s, m = _kq_scale_min(rec, (g - 1) & 7)
+    return s * _dot_q5(w, hi, xa, xb, xc, xd) + m * xs
+end
+@inline function _gv_use(::Val{:iq4}, ld, g, xa, xb, xc, xd, xs)
     w, m = ld
     return Float32(m) * _dot_iq4(w, xa, xb, xc, xd)
 end
-@inline function _gv_use(::Val{:q6}, ld, xa, xb, xc, xd, xs)
+@inline function _gv_use(::Val{:q6}, ld, g, xa, xb, xc, xd, xs)
     w, m = ld
     return _dot_q6(w, m[2], m[3], _f16lo(m[1]), _f16hi(m[1]), xa, xb, xc, xd)
 end
 # One wave computes 4 rows. The next K32 group's weights are loaded (unconditionally: the last group is re-read) before the current one is
 # used, so a group's loads are in flight during the previous group's decode and dot products.
-function _nat_gemv2_kernel!(Y, Wv, Meta, Xv, K32, M, N, Res, ::Val{RES}, ::Val{F}) where {RES, F}
+function _nat_gemv2_kernel!(Y, Wv, Meta, Blk, Xv, K32, M, N, Res, ::Val{RES}, ::Val{F}) where {RES, F}
     t = workitemIdx().x - 1; lane = t & 31; wave = t >> 5
     row0 = ((workgroupIdx().x - 1) * 8 + wave) * 4 + 1          # first of this wave's 4 rows (1-based)
     if row0 <= M
         for c in 1:N
             a1 = 0f0; a2 = 0f0; a3 = 0f0; a4 = 0f0
             g = lane + 1
-            l1 = _gv_load(Wv, Meta, g, row0); l2 = _gv_load(Wv, Meta, g, row0 + 1)
-            l3 = _gv_load(Wv, Meta, g, row0 + 2); l4 = _gv_load(Wv, Meta, g, row0 + 3)
+            l1 = _gv_load(Val(F), Wv, Meta, Blk, g, row0); l2 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 1)
+            l3 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 2); l4 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 3)
             while g <= K32
                 gn = min(g + 32, K32)
-                n1 = _gv_load(Wv, Meta, gn, row0); n2 = _gv_load(Wv, Meta, gn, row0 + 1)
-                n3 = _gv_load(Wv, Meta, gn, row0 + 2); n4 = _gv_load(Wv, Meta, gn, row0 + 3)
+                n1 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0); n2 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 1)
+                n3 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 2); n4 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 3)
                 kk = 4g
                 @inbounds xa = (Xv[kk - 3, c], Xv[kk - 2, c], Xv[kk - 1, c], Xv[kk, c])
                 xs = F === :q5 ? _sum32(xa...) : 0f0
                 xa1, xb1, xc1, xd1 = xa
-                a1 += _gv_use(Val(F), l1, xa1, xb1, xc1, xd1, xs)
-                a2 += _gv_use(Val(F), l2, xa1, xb1, xc1, xd1, xs)
-                a3 += _gv_use(Val(F), l3, xa1, xb1, xc1, xd1, xs)
-                a4 += _gv_use(Val(F), l4, xa1, xb1, xc1, xd1, xs)
+                a1 += _gv_use(Val(F), l1, g, xa1, xb1, xc1, xd1, xs)
+                a2 += _gv_use(Val(F), l2, g, xa1, xb1, xc1, xd1, xs)
+                a3 += _gv_use(Val(F), l3, g, xa1, xb1, xc1, xd1, xs)
+                a4 += _gv_use(Val(F), l4, g, xa1, xb1, xc1, xd1, xs)
                 l1 = n1; l2 = n2; l3 = n3; l4 = n4
                 g += 32
             end
@@ -2328,7 +2355,10 @@ _nat_p(w::Union{Q5Weight, Q6Weight}) = w.p
 _nat_p(w::IQ4Weight) = w.q.p
 _nat_v(w::Union{Q5Weight, Q6Weight}) = w.v
 _nat_v(w::IQ4Weight) = w.q.v
-_nat_meta(w::Union{Q5Weight, Q6Weight}) = w.meta
+_nat_meta(w::Q6Weight) = w.meta
+_nat_meta(w::Q5Weight) = w.hi                              # (the fifth bits)
+_nat_blk(w::Q5Weight) = w.blk
+_nat_blk(w) = _nat_meta(w)                                    # (unused by the other formats)
 _nat_meta(w::IQ4Weight) = w.q.scale                       # (the step per group: all it has)
 function _wmma_nat_gemm!(C, W::NativeWeight, B, residual)
     (C isa ROCArray{<:Union{Float32,Float16}} && _nat_p(W) isa ROCArray{UInt8} && wmma_enabled() && get(ENV, "LUMINAL_WMMA_G", "1") != "0") || return false
@@ -2339,7 +2369,7 @@ function _wmma_nat_gemm!(C, W::NativeWeight, B, residual)
     x16, Bc = _wmma_activations(B, K, N)
     C2 = Base.reshape(C, M, N)
     R = residual isa ROCArray{Float32} && length(residual) == M * N ? Base.reshape(residual, M, N) : nothing
-    wmma_nat_gemm!(C2, _nat_v(W), _nat_meta(W), x16, N; fmt = _nat_fmt(W), residual = R)
+    wmma_nat_gemm!(C2, _nat_v(W), _nat_meta(W), _nat_blk(W), x16, N; fmt = _nat_fmt(W), residual = R)
     R === nothing && _wmma_add_residual!(C2, residual, M, N)
     Bc === B || _free_now!(Bc)
     return true
@@ -2363,7 +2393,7 @@ function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R, RES = _residual_arg(residual, C, M, N)
     Wq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(_nat_p(W))), K ÷ 32, M)
-    @roc groupsize=256 gridsize=cld(M, 32) _nat_gemv2_kernel!(Base.reshape(C, M, N), Wq, _nat_meta(W), Xv, K ÷ 32, M, N, R, RES, Val(_nat_fmt(W)))
+    @roc groupsize=256 gridsize=cld(M, 32) _nat_gemv2_kernel!(Base.reshape(C, M, N), Wq, _nat_meta(W), _nat_blk(W), Xv, K ÷ 32, M, N, R, RES, Val(_nat_fmt(W)))
     return C
 end
 
