@@ -10,8 +10,9 @@ using ..Luminal.NN
 using ..Luminal.LlamaTokenization
 using AMDGPU
 using JSON3
+using Random
 
-export greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative
+export Sampler, sample_token, greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative
 
 """
     weight_preset(name) -> (weight name -> Type)
@@ -282,9 +283,9 @@ sequences.
 """
 generate(s::LlamaSession, prompt::String; kwargs...) = only(generate(s, [prompt]; kwargs...))
 
-function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=200)
+function generate(s::LlamaSession, prompts::Vector{String}; max_new_tokens::Int=200, sampler=nothing)
     prompt_ids = [LlamaTokenization.encode(s.tokenizer, p; bos=true) for p in prompts]
-    return [LlamaTokenization.decode(s.tokenizer, g) for g in generate_ids(s, prompt_ids; max_new_tokens)]
+    return [LlamaTokenization.decode(s.tokenizer, g) for g in generate_ids(s, prompt_ids; max_new_tokens, sampler)]
 end
 
 # --- Chunked prefill -------------------------------------------------------------------------------
@@ -373,15 +374,59 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     return logits, Hall
 end
 
+
+"""
+    Sampler(; temperature=1.0, top_p=1.0, top_k=0, rng=Random.default_rng())
+
+Token sampling for `generate_ids` / `generate` (`sampler=`; the default `nothing` is greedy): the `top_k` highest logits are kept (0: all),
+divided by `temperature`, softmaxed, cut to the smallest set whose probability reaches `top_p`, and a token is drawn from the renormalised
+rest. Qwen3.8's recommended settings for coding: `Sampler(temperature=1.0, top_p=0.95, top_k=20)`. `temperature == 0` is greedy.
+"""
+Base.@kwdef struct Sampler{R<:AbstractRNG}
+    temperature::Float64 = 1.0
+    top_p::Float64 = 1.0
+    top_k::Int = 0
+    rng::R = Random.default_rng()
+end
+
+"""The candidate tokens (1-based) and their probabilities after top-k, temperature and top-p, most probable first."""
+function _sampling_distribution(sm::Sampler, logits::AbstractVector{<:Real})
+    n = length(logits)
+    k = sm.top_k > 0 ? min(sm.top_k, n) : n
+    idx = k < n ? partialsortperm(logits, 1:k; rev = true) : sortperm(logits; rev = true)
+    z = Float64.(logits[idx]) ./ sm.temperature
+    z .-= maximum(z)
+    p = exp.(z); p ./= sum(p)
+    if sm.top_p < 1
+        c = cumsum(p)
+        keep = something(findfirst(>=(sm.top_p), c), length(p))
+        idx = idx[1:keep]; p = p[1:keep]; p ./= sum(p)
+    end
+    return idx, p
+end
+
+"""`sample_token(sampler, logits) -> Int`: a 0-indexed token drawn from `logits` (`nothing` or temperature 0: the argmax)."""
+sample_token(::Nothing, logits::AbstractVector) = argmax(logits) - 1
+function sample_token(sm::Sampler, logits::AbstractVector)
+    sm.temperature <= 0 && return argmax(logits) - 1
+    idx, p = _sampling_distribution(sm, logits)
+    r = rand(sm.rng); c = 0.0
+    for (i, pi) in zip(idx, p)
+        c += pi
+        r < c && return i - 1
+    end
+    return idx[end] - 1
+end
+
 """
     generate_ids(session, prompt_ids::Vector{Vector{Int}}; max_new_tokens=200,
-                 last_logits=nothing, step_logits=nothing) -> Vector{Vector{Int}}
+                 last_logits=nothing, step_logits=nothing, sampler=nothing) -> Vector{Vector{Int}}
 
 `generate` on token ids (0-indexed, BOS included as wanted): each prompt's
 generated ids, the end-of-sequence token included if one was produced. With a
 `last_logits` vector, each prompt's prefill logits at its last position are
 appended to it, and with `step_logits` each decode step's (vocab, B) logits
-(for validation).
+(for validation). `sampler` (a [`Sampler`](@ref)) draws each token instead of taking the argmax.
 """
 # Prefill `prompt_ids` into the session's decode cache for batch size B = length(prompt_ids): the K/V of
 # the full layers are copied in, the recurrent states are left at each prompt's end, and the cache
@@ -436,14 +481,14 @@ _store_kv!(dst, src, n::Int, b::Int) =
     eltype(dst) === Int8 ? Luminal.quantize_kv!(dst, src, n, b) : (view(dst, :, 1:n, :, b) .= view(src, :, 1:n, :, b); dst)
 
 function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
-                      last_logits=nothing, step_logits=nothing)
+                      last_logits=nothing, step_logits=nothing, sampler=nothing)
     B = length(prompt_ids)
     B >= 1 || error("no prompts")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids)
     cache = dc.cache
     lastpos(b) = pf.last_only ? 1 : plens[b]
     eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
-    generated = [[argmax(view(logits, :, lastpos(b), b)) - 1] for b in 1:B]   # 0-indexed
+    generated = [[sample_token(sampler, view(logits, :, lastpos(b), b))] for b in 1:B]   # 0-indexed
     last_logits === nothing || append!(last_logits, [logits[:, lastpos(b), b] for b in 1:B])
     done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
 
@@ -456,7 +501,7 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
         step_logits === nothing || push!(step_logits, host[:, 1, :])
         for b in 1:B
             done[b] && continue
-            next = argmax(view(host, :, 1, b)) - 1                          # 0-indexed
+            next = sample_token(sampler, view(host, :, 1, b))               # 0-indexed
             push!(generated[b], next)
             done[b] = next in eos_ids || length(generated[b]) >= max_new_tokens ||
                       cache.positions[b] >= s.max_seq

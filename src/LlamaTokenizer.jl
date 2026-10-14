@@ -420,11 +420,11 @@ end
 assistant's reply begins: Llama-3's header format (with the system header
 Llama-3.1 / 3.2's template adds, carrying the knowledge cutoff and `date`),
 ChatML for Qwen (with an empty think block unless `thinking`, as Qwen3's
-template does), Gemma's turn format, otherwise the Zephyr format TinyLlama-Chat
+template does; `reasoning_effort` ("medium", "low", "xhigh") is Qwen3.8's, "medium" adding nothing), Gemma's turn format, otherwise the Zephyr format TinyLlama-Chat
 uses. The BOS token is not included (`encode(...; bos=true)` and `generate` add
 it, for models that have one).
 """
-function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Bool=false, date::Date=today())
+function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Bool=false, reasoning_effort::Union{Nothing,AbstractString}=nothing, date::Date=today())
     if haskey(tok.vocab, "<start_of_turn>")                   # Gemma
         return "<start_of_turn>user\n$message<end_of_turn>\n<start_of_turn>model\n"
     end
@@ -432,7 +432,14 @@ function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Boo
         # ChatML (Qwen). Qwen3 thinks by default; with thinking off its template
         # opens the reply with an empty think block.
         think = haskey(tok.vocab, "<think>") && !thinking ? "<think>\n\n</think>\n\n" : ""
-        return "<|im_start|>user\n$message<|im_end|>\n<|im_start|>assistant\n" * think
+        # Qwen3.8's template puts a sentence on the effort in a system turn: "xhigh" (the default) and "low" have one, "medium" none
+        effort = reasoning_effort === nothing ? "xhigh" : reasoning_effort == "high" ? "xhigh" : reasoning_effort
+        effort in ("xhigh", "medium", "low") || error("Unexpected reasoning effort $reasoning_effort. Supported types are xhigh (default), medium, and low.")
+        sys = reasoning_effort === nothing || !thinking || !occursin("reasoning_effort", tok.chat_template) || effort == "medium" ? "" :
+            "<|im_start|>system\n" * (effort == "xhigh" ?
+                "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer." :
+                "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.") * "<|im_end|>\n"
+        return sys * "<|im_start|>user\n$message<|im_end|>\n<|im_start|>assistant\n" * think
     end
     if haskey(tok.vocab, "<|start_header_id|>")
         # Llama-3.1 / 3.2's template always opens with a system header stating the
