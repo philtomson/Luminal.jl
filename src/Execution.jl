@@ -1747,17 +1747,17 @@ function Base.getindex(w::IQ4Weight, i::Int, j::Int)
     c = isodd(j) ? b & 0x0f : b >> 0x04
     return IQ4NL_VALUES[Int(c) + 1] * Float32(w.q.scale[(j - 1) ÷ 32 + 1, i])
 end
-function dequantize(w::IQ4Weight)
+const IQ4NL_TUPLE = Tuple(IQ4NL_VALUES)
+@inline _iq4_val(c::UInt8) = @inbounds IQ4NL_TUPLE[Int(c) + 1]
+function dequantize(w::IQ4Weight)                              # kernels only (no host reads: it runs inside graph capture)
     M, K = size(w); G = K ÷ 32
-    codes = similar(w.q.p, UInt8, 2, K ÷ 2, M)
-    view(codes, 1, :, :) .= w.q.p .& 0x0f
-    view(codes, 2, :, :) .= w.q.p .>> 0x04
-    lut = similar(w.q.p, Float32, 16); copyto!(lut, IQ4NL_VALUES)
-    v = lut[Int.(vec(codes)) .+ 1]
+    lo = Base.reshape(_iq4_val.(w.q.p .& 0x0f), 1, K ÷ 2, M)
+    hi = Base.reshape(_iq4_val.(w.q.p .>> 0x04), 1, K ÷ 2, M)
+    v = cat(lo, hi; dims = 1)
     x = Base.reshape(v, 32, G, M) .* Base.reshape(Float32.(w.q.scale), 1, G, M)
     xr = Base.reshape(x, K, M)
     out = permutedims(xr, (2, 1))
-    foreach(_free_now!, (xr, x, v, lut, codes))
+    foreach(_free_now!, (xr, x, v, lo, hi))
     return out
 end
 _free_now!(w::IQ4Weight) = (_free_now!(w.q); nothing)
@@ -1892,6 +1892,87 @@ function _nat_gemv2_kernel!(Y, Wv, Meta, Blk, Xv, K32, M, N, Res, ::Val{RES}, ::
             if lane < 4
                 v = lane == 0 ? a1 : lane == 1 ? a2 : lane == 2 ? a3 : a4
                 @inbounds Y[row0 + lane, c] = RES ? v + Res[row0 + lane, c] : v
+            end
+        end
+    end
+    return
+end
+
+# The same for C (2..4) columns c0 + 1 .. c0 + C at once: each K32 group's weights are loaded once and used for every column (the speculative
+# verify steps run 2..4 columns; the per-column loop above re-reads and re-decodes the weights for each). The decode is streamed in four
+# chunks of 8 inputs (one 32-bit word of codes each), every chunk applied to all columns before the next: a whole group decoded at once
+# stays live across the columns and spills.
+@inline _gv_pre(::Val{:iq4}, ld, g) = (ld[1], Float32(ld[2]))
+@inline function _gv_pre(::Val{:q5}, ld, g)
+    s, m = _kq_scale_min(ld[3], (g - 1) & 7)
+    return (ld[1], ld[2], s, m)
+end
+@inline _gv_pre(::Val{:q6}, ld, g) = (ld[1], ld[2][2], ld[2][3], _f16lo(ld[2][1]), _f16hi(ld[2][1]))
+@inline _byte(w::NTuple{4, UInt32}, ::Val{S}, bi::Int) where {S} = UInt8((w[S] >> UInt32(8 * (bi - 1))) & 0xff)
+@inline function _dotc(::Val{:iq4}, pre, ::Val{S}, x) where {S}
+    w, m = pre
+    return m * sum(ntuple(bi -> (b = _byte(w, Val(S), bi); IQ4NL_TUPLE[Int(b & 0x0f) + 1] * x[2bi - 1] + IQ4NL_TUPLE[Int(b >> 0x04) + 1] * x[2bi]), Val(4)))
+end
+@inline function _dotc(::Val{:q5}, pre, ::Val{S}, x) where {S}
+    w, hi, s, m = pre
+    q = sum(ntuple(Val(4)) do bi
+        b = 4 * (S - 1) + bi
+        by = _byte(w, Val(S), bi)
+        Float32((by & 0x0f) + 0x10 * UInt8((hi >> UInt32(4 + b - 1)) & 0x01)) * x[2bi - 1] +
+            Float32((by >> 0x04) + 0x10 * UInt8((hi >> UInt32((20 + b - 1) & 31)) & 0x01)) * x[2bi]
+    end)
+    return s * q + m * sum(x)
+end
+@inline function _dotc(::Val{:q6}, pre, ::Val{S}, x) where {S}
+    w, h, h2, s1, s2 = pre
+    hw = S <= 2 ? h : h2; st = S <= 2 ? s1 : s2
+    q = sum(ntuple(Val(4)) do bi
+        r = 4 * ((S - 1) & 1) + bi - 1
+        by = _byte(w, Val(S), bi)
+        Float32(Int(by & 0x0f) + 16 * Int(bitrotate(hw, -(4 + 2r)) & 0x03) - 32) * x[2bi - 1] +
+            Float32(Int(by >> 0x04) + 16 * Int(bitrotate(hw, -(20 + 2r)) & 0x03) - 32) * x[2bi]
+    end)
+    return st * q
+end
+@inline function _gv_chunk(::Val{F}, ::Val{S}, acc::NTuple{C, NTuple{4, Float32}}, p1, p2, p3, p4, Xv, g, c0) where {F, S, C}
+    return ntuple(Val(C)) do j
+        x = @inbounds Xv[4g - 4 + S, c0 + j]
+        a1, a2, a3, a4 = acc[j]
+        (a1 + _dotc(Val(F), p1, Val(S), x), a2 + _dotc(Val(F), p2, Val(S), x), a3 + _dotc(Val(F), p3, Val(S), x), a4 + _dotc(Val(F), p4, Val(S), x))
+    end
+end
+@inline function _gv_group(::Val{F}, acc, l1, l2, l3, l4, Xv, g, c0) where {F}
+    p1 = _gv_pre(Val(F), l1, g); p2 = _gv_pre(Val(F), l2, g); p3 = _gv_pre(Val(F), l3, g); p4 = _gv_pre(Val(F), l4, g)
+    acc = _gv_chunk(Val(F), Val(1), acc, p1, p2, p3, p4, Xv, g, c0)
+    acc = _gv_chunk(Val(F), Val(2), acc, p1, p2, p3, p4, Xv, g, c0)
+    acc = _gv_chunk(Val(F), Val(3), acc, p1, p2, p3, p4, Xv, g, c0)
+    return _gv_chunk(Val(F), Val(4), acc, p1, p2, p3, p4, Xv, g, c0)
+end
+function _nat_gemvN_kernel!(Y, Wv, Meta, Blk, Xv, K32, M, c0, Res, ::Val{RES}, ::Val{F}, ::Val{C}) where {RES, F, C}
+    t = workitemIdx().x - 1; lane = t & 31; wave = t >> 5
+    row0 = ((workgroupIdx().x - 1) * 8 + wave) * 4 + 1
+    if row0 <= M
+        acc = ntuple(_ -> (0f0, 0f0, 0f0, 0f0), Val(C))
+        g = lane + 1
+        l1 = _gv_load(Val(F), Wv, Meta, Blk, g, row0); l2 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 1)
+        l3 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 2); l4 = _gv_load(Val(F), Wv, Meta, Blk, g, row0 + 3)
+        while g <= K32
+            gn = min(g + 32, K32)
+            n1 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0); n2 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 1)
+            n3 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 2); n4 = _gv_load(Val(F), Wv, Meta, Blk, gn, row0 + 3)
+            acc = _gv_group(Val(F), acc, l1, l2, l3, l4, Xv, g, c0)
+            l1 = n1; l2 = n2; l3 = n3; l4 = n4
+            g += 32
+        end
+        for j in 1:C
+            a1, a2, a3, a4 = acc[j]
+            for off in (16, 8, 4, 2, 1)
+                a1 += AMDGPU.Device.shfl_xor(a1, Cint(off)); a2 += AMDGPU.Device.shfl_xor(a2, Cint(off))
+                a3 += AMDGPU.Device.shfl_xor(a3, Cint(off)); a4 += AMDGPU.Device.shfl_xor(a4, Cint(off))
+            end
+            if lane < 4
+                v = lane == 0 ? a1 : lane == 1 ? a2 : lane == 2 ? a3 : a4
+                @inbounds Y[row0 + lane, c0 + j] = RES ? v + Res[row0 + lane, c0 + j] : v
             end
         end
     end
@@ -2297,8 +2378,8 @@ const _WMMA_WORKSPACE = Dict{Any, Any}()
 
 # B (K, N) rounded to Float16 in the zero-padded workspace; returns (x16, Bc), Bc being
 # the dense copy to free afterwards when B had to be copied.
-function _wmma_activations(B, K, N)
-    blk = N >= 384 ? 256 : N >= 192 ? 128 : 64   # the int4 kernels' block widths: 128x256, 128x128, 64x64
+function _wmma_activations(B, K, N; wide::Bool=false)
+    blk = wide || N >= 384 ? 256 : N >= 192 ? 128 : 64   # the int4 kernels' block widths: 128x256, 128x128, 64x64 (wide: the 256 x 256 format kernel only)
     Npad = cld(N, blk) * blk
     # already Float16 and a whole number of blocks wide (the compiler computed it that way, see `dty` in compile): no copy
     eltype(B) === Float16 && B isa DenseArray && Npad == N && return Base.reshape(B, K, N), B
@@ -2364,9 +2445,9 @@ function _wmma_nat_gemm!(C, W::NativeWeight, B, residual)
     (C isa ROCArray{<:Union{Float32,Float16}} && _nat_p(W) isa ROCArray{UInt8} && wmma_enabled() && get(ENV, "LUMINAL_WMMA_G", "1") != "0") || return false
     M, K = size(W)
     N = length(B) ÷ K
-    (M % 256 == 0 && K % 64 == 0 && (N % 256 == 0 || N >= 384) && (residual === nothing || C isa ROCArray{Float32})) || return false
+    (M % 256 == 0 && K % 64 == 0 && (residual === nothing || C isa ROCArray{Float32})) || return false   # (any N: the activations are padded to 256 columns)
     C isa ROCArray{Float16} && residual !== nothing && return false
-    x16, Bc = _wmma_activations(B, K, N)
+    x16, Bc = _wmma_activations(B, K, N; wide = true)
     C2 = Base.reshape(C, M, N)
     R = residual isa ROCArray{Float32} && length(residual) == M * N ? Base.reshape(residual, M, N) : nothing
     wmma_nat_gemm!(C2, _nat_v(W), _nat_meta(W), _nat_blk(W), x16, N; fmt = _nat_fmt(W), residual = R)
@@ -2393,7 +2474,18 @@ function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
     Xv = Base.reshape(reinterpret(NTuple{8, Float32}, vec(Bc)), K ÷ 8, N)
     R, RES = _residual_arg(residual, C, M, N)
     Wq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(_nat_p(W))), K ÷ 32, M)
-    @roc groupsize=256 gridsize=cld(M, 32) _nat_gemv2_kernel!(Base.reshape(C, M, N), Wq, _nat_meta(W), _nat_blk(W), Xv, K ÷ 32, M, N, R, RES, Val(_nat_fmt(W)))
+    Y = Base.reshape(C, M, N)
+    if N == 1 || get(ENV, "LUMINAL_NAT_GEMV_COLS", "1") == "0"
+        @roc groupsize=256 gridsize=cld(M, 32) _nat_gemv2_kernel!(Y, Wq, _nat_meta(W), _nat_blk(W), Xv, K ÷ 32, M, N, R, RES, Val(_nat_fmt(W)))
+        return C
+    end
+    c0 = 0
+    while c0 < N                                              # up to 4 columns per pass over the weights
+        nc = min(4, N - c0)
+        vc = nc == 4 ? Val(4) : nc == 3 ? Val(3) : nc == 2 ? Val(2) : Val(1)
+        @roc groupsize=256 gridsize=cld(M, 32) _nat_gemvN_kernel!(Y, Wq, _nat_meta(W), _nat_blk(W), Xv, K ÷ 32, M, c0, R, RES, Val(_nat_fmt(W)), vc)
+        c0 += nc
+    end
     return C
 end
 
