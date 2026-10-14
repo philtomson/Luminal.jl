@@ -190,13 +190,13 @@ end
     generate_ids_speculative(session, drafter, prompt; max_new_tokens=200, stats=nothing, draft_hook=nothing)
         -> Vector{Int}
 
-Greedy generation for one prompt with MTP speculative decoding (0-indexed token ids, like `generate_ids`).
+Generation for one prompt with MTP speculative decoding (greedy, or sampled with `sampler`, a [`Sampler`](@ref): the drafts are then accepted by rejection sampling, which keeps the output distribution exactly the sampler's) (0-indexed token ids, like `generate_ids`).
 `stats`, a `Dict`, receives `:cycles`, `:accepted` (drafts the base model confirmed) and `:emitted`.
 `draft_hook(n_emitted, draft) -> token` may replace the drafted token (tests use it to force accepts
 and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
-                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3)
+                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3, sampler=nothing)
     ndraft in 0:7 || error("ndraft must be 1..7, or 0 (adaptive: 1 to `maxdraft` drafts per cycle from the recent acceptance rate)")
     maxdraft in 1:7 || error("maxdraft must be 1..7")
     d.session === s || error("the drafter belongs to another session")
@@ -205,14 +205,15 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     cache = dc.cache
     n = length(prompt)
     eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
-    y = argmax(view(logits, :, pf.last_only ? 1 : n, 1)) - 1
+    sampler isa Sampler && sampler.temperature <= 0 && (sampler = nothing)
+    y = sample_token(sampler, view(logits, :, pf.last_only ? 1 : n, 1))
     out = [y]
     (y in eos_ids || max_new_tokens <= 1) && return out
     H = res[pf.hidden_id]                                         # (Hidden, slen, 1)
     _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
-    ndraft != 1 && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
+    (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -286,7 +287,40 @@ function _best_ndraft(q, ND, costs=(_SPEC_COST_VERIFY, _SPEC_COST_MTP))
     bn
 end
 
-function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false)
+
+# Sampled verification. The MTP head's draft is a point mass (its argmax), so draft d_i is accepted with probability p_i(d_i), p_i being the
+# base model's sampling distribution (temperature, top-k, top-p) after the i-th fed token; a rejected draft is replaced by a draw from p_i
+# without d_i (the residual max(0, p_i - delta_d), renormalised). All drafts accepted: one more draw from the last column's p. The emitted
+# tokens are then exactly distributed as `sample_token` step by step. Returns the accepted draft count m and the emitted tokens (m + 1).
+function _sampled_verify(sm::Sampler, logits, ds::Vector{Int})
+    host = Array{Float32}(logits)                                    # (vocab, K, 1)
+    m = 0
+    for j in 1:length(ds)
+        idx, p = _sampling_distribution(sm, view(host, :, j, 1))
+        pos = findfirst(==(ds[j] + 1), idx)
+        if pos !== nothing && rand(sm.rng) < p[pos]
+            m += 1
+            continue
+        end
+        if pos !== nothing                                           # the residual: p without the draft
+            keep = [i for i in eachindex(idx) if i != pos]
+            idx = idx[keep]; p = p[keep]; p ./= sum(p)
+        end
+        return m, [ds[1:m]; _draw(sm, idx, p)]
+    end
+    idx, p = _sampling_distribution(sm, view(host, :, length(ds) + 1, 1))
+    return m, [ds; _draw(sm, idx, p)]
+end
+function _draw(sm::Sampler, idx, p)
+    r = rand(sm.rng) * sum(p); c = 0.0
+    for (i, pi) in zip(idx, p)
+        c += pi
+        r < c && return i - 1
+    end
+    return idx[end] - 1
+end
+
+function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false, sampler=nothing)
     K = ND + 1
     q = fill(0.7, ND)                                                 # conditional acceptance of draft j given 1..j-1 were
     sel = zeros(Int, ND)                                              # cycles run with each draft count
@@ -317,18 +351,23 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         cache.positions[1] + K <= s.max_seq || break
         ND_c = K - 1; sel[ND_c] += 1
         t0 = time_ns()
-        _, hid, am = _verify_step!(s, vg, [y; ds;;])
-        t1 = time_ns(); tm[1] += (t1 - t0) / 1e9
+        lg, hid, am = _verify_step!(s, vg, [y; ds;;])
         cycles += 1
-        m = 0                                                         # leading drafts the base model confirmed
-        while m < ND_c && am[m + 1] == ds[m + 1]
-            m += 1
+        if sampler === nothing
+            t1 = time_ns(); tm[1] += (t1 - t0) / 1e9
+            m = 0                                                     # leading drafts the base model confirmed
+            while m < ND_c && am[m + 1] == ds[m + 1]
+                m += 1
+            end
+            emitted = am[1:m + 1]
+        else
+            m, emitted = _sampled_verify(sampler, lg, ds)
+            t1 = time_ns(); tm[1] += (t1 - t0) / 1e9
         end
         acc[1:m] .+= 1
         for j in 1:min(m + 1, ND_c)                                   # draft j was tested iff 1..j-1 matched
             q[j] += 0.1 * ((j <= m) - q[j])
         end
-        emitted = am[1:m + 1]
         nreal = m + 1
         append!(out, emitted)
         cache.positions[1] += nreal
