@@ -226,6 +226,10 @@ end
 const PREFIX = PrefixCache()                    # the saved prefill states (see `PrefixCache`)
 const JOBS = Channel{Job}(64)
 
+# The part of `text` after byte `sent`, cut by bytes (a decoded token list may hold a lone byte of an unfinished character, which is not valid
+# UTF-8: indexing by characters would fail), with any invalid byte shown as U+FFFD.
+tail_text(text::String, sent::Int) = (t = String(codeunits(text)[sent+1:end]); isvalid(t) ? t : join(c isa Char && isvalid(c) ? c : '\ufffd' for c in t))
+
 function run_job!(s, d, tok, job::Job, use_spec::Bool)
     te = time(); ids = Int.(LT.encode(tok, job.prompt; bos = false)); t_enc = time() - te
     t0 = time()
@@ -268,8 +272,8 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         end
         job.cancel[] && (reason = :cancel; return true)
         text = LT.decode(tok, gen)
-        endswith(text, '�') && reason != :length && return false           # an incomplete UTF-8 sequence: wait for its rest
-        emit(text[sent+1:end]); sent = ncodeunits(text)
+        (endswith(text, '\ufffd') || !isvalid(text)) && reason != :length && return false     # an incomplete UTF-8 sequence: wait for its rest
+        emit(tail_text(text, sent)); sent = ncodeunits(text)
         if !isempty(job.stop) && any(st -> occursin(st, visible), job.stop)
             reason = :stop; return true
         end
@@ -282,7 +286,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
             generate_ids(s, [ids]; max_new_tokens = job.max_tokens + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at)
         end
         text = LT.decode(tok, gen)
-        emit(text[sent+1:end]; final = true)
+        emit(tail_text(text, sent); final = true)
         length(gen) >= job.max_tokens && reason == :stop && !isempty(gen) && !(gen[end] in eos) && (reason = :length)
         t1 = time()
         cached = get(stats, :prefill_reused, 0); tf = t_first[] == 0.0 ? t1 : t_first[]
@@ -414,7 +418,7 @@ function route(http::HTTP.Stream, name::String)
             err_response(http, 404, "not found: $(req.method) $path")
         end
     catch e
-        e isa Base.IOError || e isa HTTP.Exceptions.HTTPError || @error "request failed" exception = (e, catch_backtrace())
+        e isa Base.IOError || e isa EOFError || e isa HTTP.Exceptions.HTTPError || @error "request failed" exception = (e, catch_backtrace())
         try; err_response(http, 500, sprint(showerror, e)); catch; end
     end
 end
@@ -442,6 +446,12 @@ function main()
     for sm in (nothing, Sampler(temperature = 1.0, top_p = 0.95, top_k = 20))
         use_spec ? (generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm); generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm)) :
                    generate_ids(s, [wid]; max_new_tokens = 8, sampler = sm)
+    end
+    if use_spec                                    # compile the short-chunk prefill graphs (64 and 256 tokens) and the 512 one, through a throwaway cache
+        scratch = PrefixCache(min_tokens = typemax(Int))
+        for len in (20, 150, 700)
+            generate_ids_speculative(s, d, repeat(wid, cld(len, length(wid)))[1:len]; max_new_tokens = 4, ndraft = 0, prefix = scratch)
+        end
     end
     server = HTTP.serve!(http -> route(http, name), host, port; stream = true)
     logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec, context $(s.max_seq))")

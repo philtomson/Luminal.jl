@@ -235,7 +235,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     (y in eos_ids || max_new_tokens <= 1) && return out
     H = res[pf.hidden_id]                                         # (Hidden, slen, 1)
     t_mtp = _tic()
-    if prefix !== nothing && prefix.resumed !== nothing        # the MTP cache below the resumed position: the entry's copy
+    if prefix !== nothing && prefix.resumed !== nothing && !prefix.mtp_live        # the MTP cache below the resumed position: the entry's copy
         L = length(prefix.resumed.ids) - 1
         view(d.k, :, 1:L, :, :) .= prefix.resumed.mtp[1]; view(d.v, :, 1:L, :, :) .= prefix.resumed.mtp[2]
     end
@@ -249,6 +249,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
             e.mtp[1] .= view(d.k, :, 1:L, :, :); e.mtp[2] .= view(d.v, :, 1:L, :, :)
         end
     end
+    prefix === nothing || (prefix.live_mtp = n - 1)               # the MTP pairs 0 .. n-2 of this prompt are in the live cache
     PREFILL_TIMES[:mtp_prime_save] = _tic() - t_mtp; PREFILL_TIMES[:prefill_total] = t_pf
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n-off:n-off, :]

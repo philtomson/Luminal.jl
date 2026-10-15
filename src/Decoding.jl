@@ -372,8 +372,11 @@ mutable struct PrefixCache
     pending::Vector{PrefixEntry}      # entries saved by the last prefill (the MTP part is added after its priming)
     resumed::Union{Nothing,PrefixEntry}
     stale::Vector{PrefixEntry}        # replaced entries, freed at the next prefill (the resumed one is still read after this one)
+    live::Vector{Int}                 # the prompt whose K/V (below its length) the live cache holds: an entry that it starts with needs no K/V copied back
+    live_mtp::Int                     # how many MTP pairs (positions) of the live MTP cache are valid for `live`
+    mtp_live::Bool                    # the entry resumed by the last prefill needs no MTP K/V copied back either
 end
-PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024) = PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[])
+PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024) = PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, false)
 
 _prefix_points(x::Integer) = Pair{Symbol,Int}[:turn => Int(x)]
 _prefix_points(x::AbstractVector{<:Integer}) = Pair{Symbol,Int}[:turn => Int(v) for v in x]
@@ -419,8 +422,9 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
     s.kv_dtype === Float16 || (prefix = nothing)
     empty!(PREFILL_TIMES); t_start = _tic()
-    gr = _chunk_graph(s, chunk)
-    idg = gr.idg; cache = gr.cache
+    gr0 = _chunk_graph(s, chunk)
+    cache = gr0.cache
+    tails = get(ENV, "LUMINAL_TAIL_CHUNKS", "1") == "0" ? () : Tuple(c for c in (64, 256) if c < chunk)     # smaller graphs for a short last chunk (a padded 512-token one costs ~2 s at 120k context)
     Hd = s.model.config.hidden
     best = nothing
     if prefix !== nothing
@@ -433,6 +437,9 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     end
     resume = best !== nothing
     a = resume ? length(best.ids) : 0; off = resume ? a - 1 : 0
+    skip_kv = resume && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0" && length(prefix.live) >= a && view(prefix.live, 1:a) == best.ids   # the live K/V already is the entry's
+    mtp_live = skip_kv && prefix.live_mtp >= a - 1
+    prefix === nothing || (prefix.live = Int[]; prefix.live_mtp = 0)           # (until this prefill is done)
     Hall = Luminal.zero_tensor(s.device, Float32, Hd, n - off, 1)
     logits = nothing
     j = 0
@@ -445,15 +452,17 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
             fill!(cache.self_cache[i][1], 0); fill!(cache.self_cache[i][2], 0)
         end
     end
-    if resume
+    if resume && !skip_kv
         j = 0
         for (i, l) in enumerate(s.model.layers)
             NN._is_state_layer(l) && continue
             j += 1
             view(cache.self_cache[i][1], :, 1:a, :, :) .= best.kv[j][1]; view(cache.self_cache[i][2], :, 1:a, :, :) .= best.kv[j][2]
         end
+    end
+    if resume
         view(Hall, :, 1:1, :) .= best.h
-        prefix.resumed = best
+        prefix.resumed = best; prefix.mtp_live = mtp_live
     end
     PREFILL_TIMES[:restore] = _tic() - t_start; t_chunks = time()
     points = prefix === nothing || n < prefix.min_tokens ? Pair{Symbol,Int}[] :
@@ -463,7 +472,9 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         for (_, p) in points
             p > a && (m = min(m, p - a); break)              # chunks end at the positions to save
         end
-        toks = zeros(Float32, chunk, 1); toks[1:m, 1] .= prompt[a+1:a+m]
+        Cc = something(findfirst(c -> m <= c, tails), 0) == 0 ? chunk : tails[findfirst(c -> m <= c, tails)]
+        gr = Cc == chunk ? gr0 : _chunk_graph(s, Cc); idg = gr.idg
+        toks = zeros(Float32, Cc, 1); toks[1:m, 1] .= prompt[a+1:a+m]
         inputs = Dict{Int, Any}(idg.token_input_id => toks, idg.pos_input_id => Float32[a], idg.lens_input_id => Float32[m])
         for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
             inputs[k_id] = cache.self_cache[i][1]; inputs[v_id] = cache.self_cache[i][2]
@@ -494,9 +505,10 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per
         # token they would pile up (24 GB per 1024 tokens on the 27B) until it ran
         res = nothing
-        _chunk_reuse() || _chunk_reclaim!(s.device)
+        a < n && (_chunk_reuse() || _chunk_reclaim!(s.device))      # (not after the last chunk: no more garbage to pile up, and the server collects between requests)
     end
     cache.positions .= n
+    prefix === nothing || (prefix.live = copy(prompt))                       # the live K/V below n is this prompt's (MTP: set once primed)
     PREFILL_TIMES[:chunks] = _tic() - t_chunks - get(PREFILL_TIMES, :save, 0.0)
     t_reg = time()
     prefix === nothing || _register!(prefix, prefix.pending, best)
