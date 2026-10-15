@@ -387,6 +387,9 @@ function _free_entry!(e::PrefixEntry)
     return nothing
 end
 
+# The replaced entries (kept until now because the resumed one is read after the prefill: its MTP K/V).
+_release_stale!(pc::Union{Nothing,PrefixCache}) = pc === nothing || (foreach(_free_entry!, pc.stale); empty!(pc.stale); nothing)
+
 function _register!(pc::PrefixCache, new::Vector{PrefixEntry}, used::Union{Nothing,PrefixEntry})
     used === nothing || (i = findfirst(e -> e === used, pc.entries); i === nothing || push!(pc.entries, popat!(pc.entries, i)))
     for e in new
@@ -613,6 +616,7 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
     B = length(prompt_ids)
     B >= 1 || error("no prompts")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids; prefix, prefix_at)
+    _release_stale!(prefix)
     cache = dc.cache
     lastpos(b) = pf.last_only ? 1 : plens[b]
     eos_ids = s.tokenizer === nothing ? Int[] : s.tokenizer.eos_ids
