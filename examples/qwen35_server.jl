@@ -428,7 +428,8 @@ function chat_handler(http::HTTP.Stream, name::String)
                     sse(chunk((content = val,)))
                 elseif kind == :progress
                     write(http, val[2] == 0 ? ": generating, $(val[1]) tokens so far" : ": prefill $(val[1])/$(val[2]) tokens", "\n\n")   # an SSE comment: no "data:" prefix
-                    sse(chunk((content = "",)))                 # an empty delta: a chunk any client counts as activity
+                    sse(chunk((;)))                             # an empty delta ({}): a chunk any client counts as activity, and changes no client state
+                                                                # (an empty `content` string may end the client's open reasoning block: later thinking was not shown)
                 elseif kind == :tool_call
                     sse(chunk((tool_calls = [(index = ncall, id = "call_" * randstring(12), type = "function",
                                               var"function" = (name = val[1], arguments = val[2]))],)))
