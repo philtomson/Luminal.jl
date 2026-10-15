@@ -227,7 +227,7 @@ const PREFIX = PrefixCache()                    # the saved prefill states (see 
 const JOBS = Channel{Job}(64)
 
 function run_job!(s, d, tok, job::Job, use_spec::Bool)
-    ids = Int.(LT.encode(tok, job.prompt; bos = false))
+    te = time(); ids = Int.(LT.encode(tok, job.prompt; bos = false)); t_enc = time() - te
     t0 = time()
     logline(@sprintf("request: %d prompt tokens, up to %d new", length(ids), job.max_tokens))
     try
@@ -289,6 +289,8 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
                                   prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = cached,
                                   prefill_s = tf - t0, total_s = t1 - t0,
+                                  phases = @sprintf("tokenize %.2f s, restore %.2f, chunks %.2f, save %.2f, register %.2f, mtp restore %.2f, mtp prime+save %.2f", t_enc,
+                                                    (get(Luminal.Decoding.PREFILL_TIMES, k, 0.0) for k in (:restore, :chunks, :save, :register, :mtp_restore, :mtp_prime_save))...),
                                   timings = (cache_n = cached, prompt_n = length(ids) - cached, prompt_ms = 1000 * (tf - t0),
                                              prompt_per_second = (length(ids) - cached) / max(tf - t0, 1e-6),
                                              predicted_n = length(gen), predicted_ms = 1000 * (t1 - tf),
@@ -314,6 +316,7 @@ function log_timings(val)
     t = val.timings
     logline(@sprintf("prompt processing: %d new tokens (+%d cached) in %.2f s = %.0f tok/s | generation: %d tokens in %.2f s = %.1f tok/s | %s",
                      t.prompt_n, t.cache_n, t.prompt_ms / 1000, t.prompt_per_second, t.predicted_n, t.predicted_ms / 1000, t.predicted_per_second, val.finish))
+    haskey(val, :phases) && logline("  time to first token: " * val.phases)
 end
 
 function chat_handler(http::HTTP.Stream, name::String)

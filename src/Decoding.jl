@@ -352,6 +352,10 @@ that prefixes the prompt is resumed; the rest is prefilled and the new entries r
 the least recently used beyond `max_sys` / `max_turn`). Prompts shorter than `min_tokens` are not saved. Chunked prefill only (Float16 KV,
 Qwen3.5), batch 1.
 """
+# seconds spent in the phases of the last chunked prefill / MTP priming (restore, chunks, save, mtp_restore, mtp_prime, mtp_save): for the server's log
+const PREFILL_TIMES = Dict{Symbol,Float64}()
+_tic() = (AMDGPU.synchronize(); time())
+
 mutable struct PrefixEntry
     kind::Symbol
     ids::Vector{Int}
@@ -411,6 +415,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     n < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
     s.kv_dtype === Float16 || (prefix = nothing)
+    empty!(PREFILL_TIMES); t_start = _tic()
     gr = _chunk_graph(s, chunk)
     idg = gr.idg; cache = gr.cache
     Hd = s.model.config.hidden
@@ -447,6 +452,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         view(Hall, :, 1:1, :) .= best.h
         prefix.resumed = best
     end
+    PREFILL_TIMES[:restore] = _tic() - t_start; t_chunks = time()
     points = prefix === nothing || n < prefix.min_tokens ? Pair{Symbol,Int}[] :
              sort!(Pair{Symbol,Int}[k => p for (k, p) in _prefix_points(prefix_at) if p > a && p < n], by = last)
     while a < n
@@ -466,6 +472,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         a += m
         for (kind, p) in points
             p == a || continue
+            t_sv = _tic()
             states = Any[]; kv = Any[]
             for (i, l) in enumerate(s.model.layers)
                 if NN._is_state_layer(l)
@@ -479,6 +486,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
             end
             hh = Luminal.zero_tensor(s.device, Float32, Hd, 1, 1); view(hh, :, 1:1, :) .= view(Hall, :, a-off:a-off, :)
             push!(prefix.pending, PrefixEntry(kind, prompt[1:a], states, kv, hh, nothing))
+            PREFILL_TIMES[:save] = get(PREFILL_TIMES, :save, 0.0) + (_tic() - t_sv)
         end
         # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per
         # token they would pile up (24 GB per 1024 tokens on the 27B) until it ran
@@ -486,7 +494,10 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         _chunk_reuse() || _chunk_reclaim!(s.device)
     end
     cache.positions .= n
+    PREFILL_TIMES[:chunks] = _tic() - t_chunks - get(PREFILL_TIMES, :save, 0.0)
+    t_reg = time()
     prefix === nothing || _register!(prefix, prefix.pending, best)
+    PREFILL_TIMES[:register] = time() - t_reg
     return logits, Hall, off
 end
 

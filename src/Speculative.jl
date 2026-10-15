@@ -219,7 +219,9 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     ndraft in 0:7 || error("ndraft must be 1..7, or 0 (adaptive: 1 to `maxdraft` drafts per cycle from the recent acceptance rate)")
     maxdraft in 1:7 || error("maxdraft must be 1..7")
     d.session === s || error("the drafter belongs to another session")
+    t_pf = time()
     pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt]; prefix, prefix_at, need_mtp=true)
+    t_pf = time() - t_pf
     off = get(pf, :off, 0)
     stats === nothing || (stats[:prefill_reused] = off == 0 ? 0 : off + 1)
     pf.hidden_id == 0 && error("this model's prefill does not return its hidden states")
@@ -232,11 +234,13 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     on_token !== nothing && on_token([y]) && return out
     (y in eos_ids || max_new_tokens <= 1) && return out
     H = res[pf.hidden_id]                                         # (Hidden, slen, 1)
+    t_mtp = _tic()
     if prefix !== nothing && prefix.resumed !== nothing        # the MTP cache below the resumed position: the entry's copy
         L = length(prefix.resumed.ids) - 1
         view(d.k, :, 1:L, :, :) .= prefix.resumed.mtp[1]; view(d.v, :, 1:L, :, :) .= prefix.resumed.mtp[2]
     end
     (off > 0 || (prefix !== nothing && get(pf, :chunked, false))) ? _mtp_prime_from!(d, prompt, H, off) : _mtp_prime!(d, prompt, H)
+    PREFILL_TIMES[:mtp_restore] = _tic() - t_mtp; t_mtp = time()
     if prefix !== nothing                                      # the entries saved by this prefill take the head's K/V below their position
         for e in prefix.pending
             L = length(e.ids) - 1
@@ -244,6 +248,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
             e.mtp[1] .= view(d.k, :, 1:L, :, :); e.mtp[2] .= view(d.v, :, 1:L, :, :)
         end
     end
+    PREFILL_TIMES[:mtp_prime_save] = _tic() - t_mtp; PREFILL_TIMES[:prefill_total] = t_pf
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n-off:n-off, :]
     (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, on_token, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
