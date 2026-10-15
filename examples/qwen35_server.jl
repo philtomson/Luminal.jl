@@ -497,6 +497,7 @@ function main()
         job = take!(JOBS)
         job.cancel[] && continue
         run_job!(s, d, tok, job, use_spec)
+        release_stale!(PREFIX)                       # (the replaced prefix entries: freed here, between requests, not before the first token)
         Luminal.reclaim!(s.device)
     end
 end

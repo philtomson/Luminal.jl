@@ -240,7 +240,6 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
         view(d.k, :, 1:L, :, :) .= prefix.resumed.mtp[1]; view(d.v, :, 1:L, :, :) .= prefix.resumed.mtp[2]
     end
     (off > 0 || (prefix !== nothing && get(pf, :chunked, false))) ? _mtp_prime_from!(d, prompt, H, off) : _mtp_prime!(d, prompt, H)
-    _release_stale!(prefix)                                    # (the resumed entry's copies are no longer read)
     PREFILL_TIMES[:mtp_restore] = _tic() - t_mtp; t_mtp = time()
     if prefix !== nothing                                      # the entries saved by this prefill take the head's K/V below their position
         for e in prefix.pending
