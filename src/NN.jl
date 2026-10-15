@@ -845,7 +845,7 @@ function llama_self_attn_cached(sa::SelfAttention,
                                  step_pos_tensor::Luminal.GraphTensor,
                                  past_k::Luminal.GraphTensor,
                                  past_v::Luminal.GraphTensor;
-                                 rope_base::Float32=500000f0)
+                                 rope_base::Float32=500000f0, kv_only::Bool=false)
     hidden, S, batch = Luminal.realized_dims(x.shape)    # S new tokens per sequence (1 for a plain decode step)
     D, KVH = sa.head_dim, sa.n_kv_heads
     G = div(sa.n_heads, KVH)              # query heads per KV head
@@ -884,6 +884,7 @@ function llama_self_attn_cached(sa::SelfAttention,
     # The op also writes the tokens' K/V into the cache slots (write_cache=true).
     out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(sa.scale, true, sa.window), ins,
                           Luminal.ShapeTracker(S == 1 ? [D, sa.n_heads, batch] : [D, sa.n_heads, S, batch]))
+    kv_only && return out, k_new, v_new                  # (only the cache write is wanted: the attention node itself, K and V)
     out = Luminal.reshape(out, [D * sa.n_heads, S, batch])
     out = prep ? Luminal.add_op!(x.graph_ref, Luminal.GatedAttnOut(D), [(out.id, 0, out.shape), (gate.id, 0, gate.shape)],
                                  Luminal.ShapeTracker([D * sa.n_heads, S, batch])) : _gate_output(sa, out, gate, S, batch)
@@ -1078,7 +1079,7 @@ export Gemma3, Gemma3Block, gemma3_config, model_template
 
 include("Qwen35.jl")
 export GatedDeltaNet, deltanet_state_shapes, qwen35_attention, Qwen35, Qwen35Block, qwen35_config, load_qwen35_gguf,
-       Qwen35MTP, load_qwen35_mtp, mtp_prefill, mtp_decode_step, mtp_decode_step_hidden
+       Qwen35MTP, load_qwen35_mtp, mtp_prefill, mtp_decode_step, mtp_decode_step_hidden, mtp_fill_step
 
 include("Whisper.jl")
 export WhisperAttention, WhisperSelfAttention, WhisperCrossAttention, EncoderTransformerBlock, AudioEncoder,

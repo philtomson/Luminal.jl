@@ -25,6 +25,7 @@ mutable struct MTPDrafter
     steps::Dict{Int,Any}      # pairs per step => compiled draft step, built on first use
     chains::Dict{Int,Any}     # chain length => compiled fused chain of single-pair steps
     prefill::Dict{Int,Any}    # padded length => compiled prefill
+    fills::Dict{Int,Any}      # pairs per step => compiled prompt-fill step (K/V only)
     draft_vocab::Int          # 0 = full vocabulary, else the head scores only token ids 0..draft_vocab-1
 end
 
@@ -37,7 +38,7 @@ function MTPDrafter(s::LlamaSession; draft_vocab::Int=0)
     shape = (c.head_dim, s.max_seq, c.n_kv_heads, 1)
     dt = _mtp_kv_dtype(s)
     MTPDrafter(s, Luminal.zero_tensor(s.device, dt, shape...), Luminal.zero_tensor(s.device, dt, shape...),
-               0, Dict{Int,Any}(), Dict{Int,Any}(), Dict{Int,Any}(), draft_vocab)
+               0, Dict{Int,Any}(), Dict{Int,Any}(), Dict{Int,Any}(), Dict{Int,Any}(), draft_vocab)
 end
 
 function _weight_dtype_for(s::LlamaSession, reg)
@@ -86,6 +87,33 @@ function _mtp_step_graph(d::MTPDrafter, np::Int=2)
                    weight_dtype=_weight_dtype_for(s, reg), capture=s.device isa Luminal.AMDDevice && np <= 16)
     d.steps[np] = (exec=exec, tok=tok.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id, logits=logits.id, argmax=am.id, xpre=xpre.id)
     return d.steps[np]
+end
+
+# The prompt fill's step: `_mtp_step_graph` without the output projection, MLP, vocabulary head and argmax (only the K/V written into the cache).
+function _mtp_fill_graph(d::MTPDrafter, np::Int)
+    haskey(d.fills, np) && return d.fills[np]
+    s = d.session; c = s.model.config
+    g = Base.invokelatest(Graph); reg = WeightRegistry()
+    m = Qwen35MTP(g, reg; c..., draft_vocab=d.draft_vocab)
+    tok = Luminal.tensor(g, [np, 1]); hid = Luminal.tensor(g, [c.hidden, np, 1]); pos = Luminal.tensor(g, [1])
+    pk = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=_mtp_kv_dtype(s))
+    pv = Luminal.tensor(g, [c.head_dim, s.max_seq, c.n_kv_heads, 1]; dtype=_mtp_kv_dtype(s))
+    a, nk, nv = mtp_fill_step(m, tok, hid, pos, pk, pv)
+    load_weights!(g, reg, s.weights; device=s.device)
+    @info "Compiling MTP prompt fill ($np pairs)..."
+    exec = compile(g; device=s.device, retain=[a.id, nk.id, nv.id, tok.id, hid.id, pos.id, pk.id, pv.id], free_intermediates=false,
+                   weight_dtype=_weight_dtype_for(s, reg))
+    d.fills[np] = (exec=exec, tok=tok.id, hid=hid.id, pos=pos.id, pk=pk.id, pv=pv.id)
+    return d.fills[np]
+end
+
+# One prompt-fill step: the pairs (tokens[j], hidden[:, j]) at the cache positions d.pos + j - 1; the first `advance` are real.
+function _mtp_fill!(d::MTPDrafter, tokens::Vector{Int}, hidden, advance::Int)
+    gr = _mtp_fill_graph(d, length(tokens))
+    gr.exec(Dict{Int,Any}(gr.tok => Float32.(Base.reshape(tokens, length(tokens), 1)), gr.hid => hidden, gr.pos => Float32[d.pos],
+                          gr.pk => d.k, gr.pv => d.v); device=d.session.device)
+    d.pos += advance
+    return nothing
 end
 
 # The chain of draft steps 2..ND as ONE graph: `n` single-pair steps whose token comes from the previous step's device-side argmax
@@ -144,6 +172,10 @@ function _mtp_prefill_graph(d::MTPDrafter, slen::Int)
     end
 end
 
+# One chunk of a prompt fill: the K/V-only step (LUMINAL_MTP_FILL=0: the full draft step, whose head and argmax are not needed).
+_mtp_prime_step!(d::MTPDrafter, toks, hbuf, m) = get(ENV, "LUMINAL_MTP_FILL", "1") == "0" ? (_mtp_step!(d, toks, hbuf, m); nothing) : _mtp_fill!(d, toks, hbuf, m)
+_mtp_fill_reclaim!(d::MTPDrafter) = get(ENV, "LUMINAL_MTP_FILL", "1") == "0" ? Luminal.reclaim!(d.session.device) : _chunk_reclaim!(d.session.device)
+
 # Fill the MTP cache for a prompt of n tokens from the base prefill's hidden states H (Hidden, slen >= n, 1):
 # the pairs (x[i+1], H[i]) for i = 0..n-2.
 function _mtp_prime!(d::MTPDrafter, prompt::Vector{Int}, H)
@@ -158,9 +190,9 @@ function _mtp_prime!(d::MTPDrafter, prompt::Vector{Int}, H)
             m = min(C, n - 1 - i)
             toks = zeros(Int, C); toks[1:m] .= prompt[i+2:i+m+1]
             view(hbuf, :, 1:m, :) .= view(H, :, i+1:i+m, :)
-            _mtp_step!(d, toks, hbuf, m)
+            _mtp_prime_step!(d, toks, hbuf, m)
             i += m
-            Luminal.reclaim!(d.session.device)
+            _mtp_fill_reclaim!(d)
         end
         return
     end
@@ -184,9 +216,9 @@ function _mtp_prime_from!(d::MTPDrafter, prompt::Vector{Int}, H, off::Int)
         m = min(C, n - 1 - i)
         toks = zeros(Int, C); toks[1:m] .= prompt[i+2:i+m+1]
         view(hbuf, :, 1:m, :) .= view(H, :, i-off+1:i-off+m, :)
-        _mtp_step!(d, toks, hbuf, m)
+        _mtp_prime_step!(d, toks, hbuf, m)
         i += m
-        Luminal.reclaim!(d.session.device)
+        _mtp_fill_reclaim!(d)
     end
 end
 

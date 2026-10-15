@@ -532,6 +532,14 @@ function mtp_decode_step_hidden(m::Qwen35MTP, tokens, hidden, step_pos, pos_tens
     return m.head(m.head_norm(x)), nk, nv, x
 end
 
+# Only the K/V of a batch of (token, hidden) pairs, written into the cache (a prompt fill): no output projection, MLP or head.
+# Returns the attention node (it does the cache write, so it must be retained) and the K and V.
+function mtp_fill_step(m::Qwen35MTP, tokens, hidden, pos_tensor, pk, pv)
+    x = _mtp_input(m, tokens, hidden)
+    a, nk, nv = llama_self_attn_cached(m.block.mixer, m.block.input_norm(x), 0, pos_tensor, pk, pv; rope_base=m.rope_base, kv_only=true)
+    return a, nk, nv
+end
+
 """
     load_qwen35_mtp(path, cfg; device, quantize, block=cfg.n_layers) -> Dict{String,Any}
 
