@@ -226,6 +226,7 @@ const JOBS = Channel{Job}(64)
 function run_job!(s, d, tok, job::Job, use_spec::Bool)
     ids = Int.(LT.encode(tok, job.prompt; bos = false))
     t0 = time()
+    logline(@sprintf("request: %d prompt tokens, up to %d new", length(ids), job.max_tokens))
     if length(ids) + job.max_tokens + 8 > s.max_seq
         put!(job.events, (:error, "the prompt has $(length(ids)) tokens and max_tokens is $(job.max_tokens); the server's context is $(s.max_seq)"))
         return
@@ -273,9 +274,14 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         emit(text[sent+1:end]; final = true)
         length(gen) >= job.max_tokens && reason == :stop && !isempty(gen) && !(gen[end] in eos) && (reason = :length)
         t1 = time()
+        cached = get(stats, :prefill_reused, 0); tf = t_first[] == 0.0 ? t1 : t_first[]
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
-                                  prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = get(stats, :prefill_reused, 0),
-                                  prefill_s = (t_first[] == 0.0 ? t1 : t_first[]) - t0, total_s = t1 - t0)))
+                                  prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = cached,
+                                  prefill_s = tf - t0, total_s = t1 - t0,
+                                  timings = (cache_n = cached, prompt_n = length(ids) - cached, prompt_ms = 1000 * (tf - t0),
+                                             prompt_per_second = (length(ids) - cached) / max(tf - t0, 1e-6),
+                                             predicted_n = length(gen), predicted_ms = 1000 * (t1 - tf),
+                                             predicted_per_second = max(length(gen) - 1, 0) / max(t1 - tf, 1e-6)))))
     catch err
         @error "generation failed" exception = (err, catch_backtrace())
         put!(job.events, (:error, sprint(showerror, err)))
@@ -292,6 +298,12 @@ json_response(http, status, obj) = begin
     HTTP.startwrite(http); write(http, body)
 end
 err_response(http, status, msg) = json_response(http, status, (error = (message = msg, type = "invalid_request_error", code = status),))
+
+function log_timings(val)
+    t = val.timings
+    logline(@sprintf("prompt processing: %d new tokens (+%d cached) in %.2f s = %.0f tok/s | generation: %d tokens in %.2f s = %.1f tok/s | %s",
+                     t.prompt_n, t.cache_n, t.prompt_ms / 1000, t.prompt_per_second, t.predicted_n, t.predicted_ms / 1000, t.predicted_per_second, val.finish))
+end
 
 function chat_handler(http::HTTP.Stream, name::String)
     req = JSON3.read(String(read(http)))
@@ -341,10 +353,9 @@ function chat_handler(http::HTTP.Stream, name::String)
                 elseif kind == :done
                     u = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
                          prompt_tokens_details = (cached_tokens = val.cached_tokens,))
-                    sse(chunk((;); finish = val.finish, usage = u))
+                    sse(merge(chunk((;); finish = val.finish, usage = u), (timings = val.timings,)))
                     sse("[DONE]")
-                    logline(@sprintf("%d prompt tokens (%d reused; first token after %.2f s), %d generated at %.1f tok/s", val.prompt_tokens, val.cached_tokens, val.prefill_s,
-                                   val.completion_tokens, val.completion_tokens / max(val.total_s - val.prefill_s, 1e-6)))
+                    log_timings(val)
                     break
                 else
                     sse((error = (message = val, type = "server_error"),)); sse("[DONE]"); break
@@ -354,14 +365,14 @@ function chat_handler(http::HTTP.Stream, name::String)
             job.cancel[] = true                                              # the client went away: stop generating
         end
     else
-        reasoning = IOBuffer(); content = IOBuffer(); calls = Any[]; fin = nothing; usage = nothing
+        reasoning = IOBuffer(); content = IOBuffer(); calls = Any[]; fin = nothing; usage = nothing; timings = nothing
         while true
             kind, val = take!(job.events)
             kind == :reasoning && print(reasoning, val)
             kind == :content && print(content, val)
             kind == :tool_call && push!(calls, (id = "call_" * randstring(12), type = "function", var"function" = (name = val[1], arguments = val[2])))
             if kind == :done
-                fin = val.finish; usage = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
+                fin = val.finish; timings = val.timings; log_timings(val); usage = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
                                            prompt_tokens_details = (cached_tokens = val.cached_tokens,)); break
             elseif kind == :error
                 return err_response(http, 500, val)
@@ -370,7 +381,7 @@ function chat_handler(http::HTTP.Stream, name::String)
         msg = (role = "assistant", content = String(take!(content)), reasoning_content = String(take!(reasoning)))
         isempty(calls) || (msg = merge(msg, (tool_calls = calls,)))
         json_response(http, 200, (id = id, object = "chat.completion", created = created, model = name,
-                                  choices = [(index = 0, message = msg, finish_reason = fin)], usage = usage))
+                                  choices = [(index = 0, message = msg, finish_reason = fin)], usage = usage, timings = timings))
     end
 end
 
