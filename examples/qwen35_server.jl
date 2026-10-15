@@ -323,6 +323,8 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         length(gen) >= job.max_tokens && reason == :stop && !isempty(gen) && !(gen[end] in eos) && (reason = :length)
         t1 = time()
         cached = get(stats, :prefill_reused, 0); tf = t_first[] == 0.0 ? t1 : t_first[]
+        spec = haskey(stats, :cycles) && stats[:cycles] > 0 ? spec_summary(stats) : ""
+        isempty(spec) || logline("  speculation: " * spec)
         reason == :cancel && logline(@sprintf("  cancelled: the client closed the connection after %d generated tokens (%.1f s)", length(gen), t1 - t0))
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
                                   prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = cached,
@@ -349,6 +351,20 @@ json_response(http, status, obj) = begin
     HTTP.startwrite(http); write(http, body)
 end
 err_response(http, status, msg) = json_response(http, status, (error = (message = msg, type = "invalid_request_error", code = status),))
+
+# One line on the MTP speculation of a request: tokens per cycle, how often drafts 1, 2, 3 were accepted (given the earlier ones were), the draft
+# counts the controller chose, and where the cycle time went (verify / drafting / rollback).
+function spec_summary(st)
+    c = st[:cycles]; acc = st[:acc_by_depth]
+    rate(j) = j == 1 ? acc[1] / c : acc[j - 1] > 0 ? acc[j] / acc[j - 1] : 0.0
+    nd = get(st, :cycles_nd, Int[])
+    ms(k) = get(st, k, 0)
+    tot = max(ms(:ms_verify) + ms(:ms_mtp) + ms(:ms_rollback), 1)
+    @sprintf("%d cycles, %.2f tokens/cycle | accepted: %s | drafts per cycle: %s | verify %.0f ms/cycle, draft %.0f, rollback %.0f",
+             c, st[:emitted] / c, join((@sprintf("d%d %.0f%%", j, 100 * rate(j)) for j in eachindex(acc)), ", "),
+             join((@sprintf("%d:%.0f%%", j, 100 * nd[j] / c) for j in eachindex(nd) if nd[j] > 0), " "),
+             ms(:ms_verify) / c, ms(:ms_mtp) / c, ms(:ms_rollback) / c)
+end
 
 function log_timings(val)
     t = val.timings
