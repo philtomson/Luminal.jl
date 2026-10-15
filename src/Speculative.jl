@@ -173,6 +173,23 @@ function _mtp_prime!(d::MTPDrafter, prompt::Vector{Int}, H)
     d.pos = n - 1
 end
 
+# `_mtp_prime!` for a prompt whose start was reused (see `PrefixCache`): the MTP cache already holds the pairs below position `off`;
+# H holds the residual streams of positions off .. n-1 (0-based), and the pairs off .. n-2 go through the head in chunks.
+function _mtp_prime_from!(d::MTPDrafter, prompt::Vector{Int}, H, off::Int)
+    n = length(prompt)
+    d.pos = off
+    C = prefill_chunk(); hbuf = Luminal.zero_tensor(d.session.device, Float32, size(H, 1), C, 1)
+    i = off
+    while i < n - 1
+        m = min(C, n - 1 - i)
+        toks = zeros(Int, C); toks[1:m] .= prompt[i+2:i+m+1]
+        view(hbuf, :, 1:m, :) .= view(H, :, i-off+1:i-off+m, :)
+        _mtp_step!(d, toks, hbuf, m)
+        i += m
+        Luminal.reclaim!(d.session.device)
+    end
+end
+
 # One draft step for the pairs (tokens[1], hidden[:, 1]) at the MTP cache's next position and
 # (tokens[2], hidden[:, 2]) at the one after; `advance` = how many of them are real (the cache position
 # moves by that). Returns the two greedy tokens (0-based, host).
@@ -197,11 +214,14 @@ and stops the generation by returning true. `draft_hook(n_emitted, draft) -> tok
 and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
-                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3, sampler=nothing, on_token=nothing)
+                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3, sampler=nothing, on_token=nothing,
+                                  prefix=nothing, prefix_at::Int=0)
     ndraft in 0:7 || error("ndraft must be 1..7, or 0 (adaptive: 1 to `maxdraft` drafts per cycle from the recent acceptance rate)")
     maxdraft in 1:7 || error("maxdraft must be 1..7")
     d.session === s || error("the drafter belongs to another session")
-    pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt])
+    pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt]; prefix, prefix_at)
+    off = get(pf, :off, 0)
+    stats === nothing || (stats[:prefill_reused] = off == 0 ? 0 : off + 1)
     pf.hidden_id == 0 && error("this model's prefill does not return its hidden states")
     cache = dc.cache
     n = length(prompt)
@@ -212,9 +232,9 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     on_token !== nothing && on_token([y]) && return out
     (y in eos_ids || max_new_tokens <= 1) && return out
     H = res[pf.hidden_id]                                         # (Hidden, slen, 1)
-    _mtp_prime!(d, prompt, H)
+    (off > 0 || (prefix !== nothing && get(pf, :chunked, false))) ? _mtp_prime_from!(d, prompt, H, off) : _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
-    h1 = H[:, n:n, :]
+    h1 = H[:, n-off:n-off, :]
     (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, on_token, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)

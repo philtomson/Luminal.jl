@@ -218,6 +218,7 @@ struct Job
     events::Channel{Any}
     cancel::Base.RefValue{Bool}
 end
+const PREFIX = PrefixCache()                    # the saved prefill state of the last conversation (see `PrefixCache`)
 const JOBS = Channel{Job}(64)
 
 function run_job!(s, d, tok, job::Job, use_spec::Bool)
@@ -231,6 +232,9 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     gen = Int[]; sent = 0                        # bytes of the decoded text already fed to the parser
     reason = :stop; visible = ""
     eos = Set(tok.eos_ids)
+    im_start = only(Int.(LT.encode(tok, "<|im_start|>"; bos = false)))
+    prefix_at = something(findlast(==(im_start), ids), 1) - 1      # the last turn header: everything before it is the same in the next prompt
+    stats = Dict{Symbol,Any}()
     t_first = Ref(0.0)
     function emit(text; final=false)
         for e in feed!(parser, text; final)
@@ -256,16 +260,16 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     end
     try
         if use_spec
-            generate_ids_speculative(s, d, ids; max_new_tokens = job.max_tokens + 8, ndraft = 0, sampler = job.sampler, on_token)
+            generate_ids_speculative(s, d, ids; max_new_tokens = job.max_tokens + 8, ndraft = 0, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at, stats)
         else
-            generate_ids(s, [ids]; max_new_tokens = job.max_tokens + 8, sampler = job.sampler, on_token)
+            generate_ids(s, [ids]; max_new_tokens = job.max_tokens + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at)
         end
         text = LT.decode(tok, gen)
         emit(text[sent+1:end]; final = true)
         length(gen) >= job.max_tokens && reason == :stop && !isempty(gen) && !(gen[end] in eos) && (reason = :length)
         t1 = time()
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
-                                  prompt_tokens = length(ids), completion_tokens = length(gen),
+                                  prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = get(stats, :prefill_reused, 0),
                                   prefill_s = (t_first[] == 0.0 ? t1 : t_first[]) - t0, total_s = t1 - t0)))
     catch err
         @error "generation failed" exception = (err, catch_backtrace())
@@ -330,10 +334,11 @@ function chat_handler(http::HTTP.Stream, name::String)
                                               var"function" = (name = val[1], arguments = val[2]))],)))
                     ncall += 1
                 elseif kind == :done
-                    u = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens)
+                    u = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
+                         prompt_tokens_details = (cached_tokens = val.cached_tokens,))
                     sse(chunk((;); finish = val.finish, usage = u))
                     sse("[DONE]")
-                    @info @sprintf("%d prompt tokens (first token after %.2f s), %d generated at %.1f tok/s", val.prompt_tokens, val.prefill_s,
+                    @info @sprintf("%d prompt tokens (%d reused; first token after %.2f s), %d generated at %.1f tok/s", val.prompt_tokens, val.cached_tokens, val.prefill_s,
                                    val.completion_tokens, val.completion_tokens / max(val.total_s - val.prefill_s, 1e-6))
                     break
                 else
@@ -351,7 +356,8 @@ function chat_handler(http::HTTP.Stream, name::String)
             kind == :content && print(content, val)
             kind == :tool_call && push!(calls, (id = "call_" * randstring(12), type = "function", var"function" = (name = val[1], arguments = val[2])))
             if kind == :done
-                fin = val.finish; usage = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens); break
+                fin = val.finish; usage = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
+                                           prompt_tokens_details = (cached_tokens = val.cached_tokens,)); break
             elseif kind == :error
                 return err_response(http, 500, val)
             end
