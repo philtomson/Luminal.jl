@@ -272,6 +272,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     stats = Dict{Symbol,Any}()
     t_first = Ref(0.0)
     last_ev = Ref(time()); last_log = Ref(time()); last_done = Ref(-1)
+    gen_log = Ref(0.0); gen_log_n = Ref(0); nreason = Ref(0); ncontent = Ref(0)      # the generation progress line (every 30 s)
     # during a long prefill: an event for the HTTP side every few seconds (it turns them into keep-alive chunks, so the client's idle
     # timeout does not fire) and a progress line in the log every 30 s
     function on_progress(done, total)
@@ -291,6 +292,8 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         for e in feed!(parser, text; final)
             put!(job.events, e)
             e[1] == :content && (visible *= e[2])
+            e[1] == :reasoning && (nreason[] += length(e[2]))
+            e[1] == :content && (ncontent[] += length(e[2]))
         end
     end
     function on_token(new)
@@ -303,6 +306,14 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         job.cancel[] && (reason = :cancel; return true)
         if time() - last_ev[] >= 8                      # a long tool call is held back until it is complete: keep the stream alive meanwhile
             put!(job.events, (:progress, (length(gen), 0))); last_ev[] = time()
+        end
+        if t_first[] > 0 && time() - max(gen_log[], t_first[]) >= 30      # what the model is doing, for the log: a tool call is not streamed until complete
+            now = time(); dt = now - max(gen_log[], t_first[])
+            held = parser.mode == :toolcall ? @sprintf(", tool call being written (%d chars held back%s)", length(parser.buf),
+                                                       (m = match(r"<function=([^>\n]+)>", parser.buf)) === nothing ? "" : ", " * m[1]) : ""
+            logline(@sprintf("  generating: %d tokens, %.1f tok/s over the last %.0f s | %s mode | %d chars of reasoning, %d of answer%s",
+                             length(gen), (length(gen) - gen_log_n[]) / dt, dt, parser.mode, nreason[], ncontent[], held))
+            gen_log[] = now; gen_log_n[] = length(gen)
         end
         text = LT.decode(tok, gen)
         (endswith(text, '\ufffd') || !isvalid(text)) && reason != :length && return false     # an incomplete UTF-8 sequence: wait for its rest
