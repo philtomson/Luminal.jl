@@ -16,6 +16,7 @@ using Luminal, Luminal.NN
 using HTTP, JSON3, Random, Printf, Dates
 
 const LT = Luminal.LlamaTokenization
+logline(msg) = (println(stderr, Dates.format(now(), "HH:MM:SS "), msg); flush(stderr))
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 # JSON the way Python's json.dumps writes it (the chat template's `tojson` does: ", " and ": " separators, no ASCII escaping)
@@ -338,8 +339,8 @@ function chat_handler(http::HTTP.Stream, name::String)
                          prompt_tokens_details = (cached_tokens = val.cached_tokens,))
                     sse(chunk((;); finish = val.finish, usage = u))
                     sse("[DONE]")
-                    @info @sprintf("%d prompt tokens (%d reused; first token after %.2f s), %d generated at %.1f tok/s", val.prompt_tokens, val.cached_tokens, val.prefill_s,
-                                   val.completion_tokens, val.completion_tokens / max(val.total_s - val.prefill_s, 1e-6))
+                    logline(@sprintf("%d prompt tokens (%d reused; first token after %.2f s), %d generated at %.1f tok/s", val.prompt_tokens, val.cached_tokens, val.prefill_s,
+                                   val.completion_tokens, val.completion_tokens / max(val.total_s - val.prefill_s, 1e-6)))
                     break
                 else
                     sse((error = (message = val, type = "server_error"),)); sse("[DONE]"); break
@@ -413,7 +414,7 @@ function main()
                    generate_ids(s, [wid]; max_new_tokens = 8, sampler = sm)
     end
     server = HTTP.serve!(http -> route(http, name), host, port; stream = true)
-    @info "serving $name on http://$host:$port/v1 (speculative decoding: $use_spec, context $(s.max_seq))"
+    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec, context $(s.max_seq))")
     while true
         job = take!(JOBS)
         job.cancel[] && continue
