@@ -13,9 +13,23 @@
 #
 # One GPU request at a time: all GPU work runs on the main task; HTTP handlers queue jobs for it and stream its events back.
 using Luminal, Luminal.NN
-using HTTP, JSON3, Random, Printf, Dates
+using HTTP, JSON3, Random, Printf, Dates, Logging
 
 const LT = Luminal.LlamaTokenization
+# HTTP.jl logs "handle_connection handler error ... EOFError" (a full stack trace) whenever a client closes a connection mid-request, which
+# opencode does on every abort or timeout; that is not an error of the server, so those records are dropped.
+struct QuietHTTP <: Logging.AbstractLogger
+    inner::Logging.AbstractLogger
+end
+Logging.min_enabled_level(l::QuietHTTP) = Logging.min_enabled_level(l.inner)
+Logging.shouldlog(l::QuietHTTP, args...) = Logging.shouldlog(l.inner, args...)
+Logging.catch_exceptions(l::QuietHTTP) = Logging.catch_exceptions(l.inner)
+function Logging.handle_message(l::QuietHTTP, level, message, _module, group, id, file, line; kwargs...)
+    msg = string(message)
+    occursin("handle_connection handler error", msg) && occursin("EOFError", msg) && return nothing
+    Logging.handle_message(l.inner, level, message, _module, group, id, file, line; kwargs...)
+end
+
 logline(msg) = (println(stderr, Dates.format(now(), "HH:MM:SS "), msg); flush(stderr))
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -306,6 +320,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         length(gen) >= job.max_tokens && reason == :stop && !isempty(gen) && !(gen[end] in eos) && (reason = :length)
         t1 = time()
         cached = get(stats, :prefill_reused, 0); tf = t_first[] == 0.0 ? t1 : t_first[]
+        reason == :cancel && logline(@sprintf("  cancelled: the client closed the connection after %d generated tokens (%.1f s)", length(gen), t1 - t0))
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
                                   prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = cached,
                                   prefill_s = tf - t0, total_s = t1 - t0,
@@ -445,6 +460,7 @@ end
 # ---------------------------------------------------------------------------------------------------------------------------------
 
 function main()
+    Logging.global_logger(QuietHTTP(Logging.global_logger()))
     args = filter(a -> !startswith(a, "--"), ARGS)
     flag(n, d) = (i = findfirst(a -> startswith(a, "--$n="), ARGS); i === nothing ? d : ARGS[i][length(n)+4:end])
     isempty(args) && error("usage: qwen35_server.jl <model.gguf> [--mtp=<gguf>] [--port=8080] [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=id]")
