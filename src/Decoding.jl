@@ -337,60 +337,121 @@ _can_chunk(s::LlamaSession) = s.device isa Luminal.AMDDevice && s.kv_dtype in (F
                               NN._prefill_hidden(s.model) && get(ENV, "LUMINAL_PREFILL_CHUNK", "") != "0"
 
 """
-    PrefixCache()
+    PrefixCache(; max_sys=2, max_turn=2, min_tokens=1024)
 
-A saved prefill state for reusing the start of the next prompt (a chat turn that continues the previous conversation): the token ids it covers,
-copies of the recurrent layers' states after them, and the residual stream at their last token (the MTP head's next pair needs it). The KV
-cache of the full-attention layers stays valid below that position by itself (generation only writes above the prompt). Pass it as
-`prefix=` (with `prefix_at`, the number of leading tokens to save a state for: the start of the last assistant header, which a later
-prompt shares however the reply is re-rendered) to `generate_ids` / `generate_ids_speculative`; a prompt that starts with the saved ids
-only prefills the rest. Chunked prefill only (Float16 / Int8 KV, Qwen3.5), batch 1.
+Saved prefill states for reusing the start of the next prompt: a chat turn that continues the previous conversation, or a new conversation
+that starts with the same system prompt (coding harnesses send ~10k tokens of it). An entry holds the token ids it covers and copies of
+everything a prompt that starts with them needs: the recurrent layers' states, the full-attention layers' K/V below that position, the
+residual stream at its last token and (for speculative decoding) the MTP head's K/V. Entries are independent of the live caches, which any
+other request may overwrite. Pass the cache as `prefix=` to `generate_ids` / `generate_ids_speculative`, and as `prefix_at` the places to save:
+`:sys => n` (the end of the system message: shared by every conversation with that system prompt) and `:turn => n` (the start of the last
+assistant header: a later prompt of the same conversation shares everything before it however the reply is re-rendered). The longest entry
+that prefixes the prompt is resumed; the rest is prefilled and the new entries replace older ones (a turn entry that the new one extends,
+the least recently used beyond `max_sys` / `max_turn`). Prompts shorter than `min_tokens` are not saved. Chunked prefill only (Float16 KV,
+Qwen3.5), batch 1.
 """
-mutable struct PrefixCache
+mutable struct PrefixEntry
+    kind::Symbol
     ids::Vector{Int}
     states::Vector{Any}
+    kv::Vector{Any}
     h::Any
+    mtp::Any
 end
-PrefixCache() = PrefixCache(Int[], Any[], nothing)
-_invalidate!(pc::PrefixCache) = (pc.ids = Int[]; pc.states = Any[]; pc.h = nothing; pc)
+mutable struct PrefixCache
+    entries::Vector{PrefixEntry}      # least recently used first
+    max_sys::Int
+    max_turn::Int
+    min_tokens::Int
+    pending::Vector{PrefixEntry}      # entries saved by the last prefill (the MTP part is added after its priming)
+    resumed::Union{Nothing,PrefixEntry}
+    stale::Vector{PrefixEntry}        # replaced entries, freed at the next prefill (the resumed one is still read after this one)
+end
+PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024) = PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[])
+
+_prefix_points(x::Integer) = Pair{Symbol,Int}[:turn => Int(x)]
+_prefix_points(x::AbstractVector{<:Integer}) = Pair{Symbol,Int}[:turn => Int(v) for v in x]
+_prefix_points(x::AbstractVector{<:Pair}) = Pair{Symbol,Int}[Symbol(k) => Int(v) for (k, v) in x]
+
+function _free_entry!(e::PrefixEntry)
+    for (a, b) in e.states; Luminal._free_now!(a); Luminal._free_now!(b); end
+    for (a, b) in e.kv; Luminal._free_now!(a); Luminal._free_now!(b); end
+    e.h === nothing || Luminal._free_now!(e.h)
+    e.mtp === nothing || (Luminal._free_now!(e.mtp[1]); Luminal._free_now!(e.mtp[2]))
+    return nothing
+end
+
+function _register!(pc::PrefixCache, new::Vector{PrefixEntry}, used::Union{Nothing,PrefixEntry})
+    used === nothing || (i = findfirst(e -> e === used, pc.entries); i === nothing || push!(pc.entries, popat!(pc.entries, i)))
+    for e in new
+        if e.kind == :turn                                    # the conversation moved on: the entry it extends is stale
+            for old in filter(o -> o.kind == :turn && length(o.ids) < length(e.ids) && view(e.ids, 1:length(o.ids)) == o.ids, pc.entries)
+                push!(pc.stale, old); filter!(o -> o !== old, pc.entries)
+            end
+        end
+        push!(pc.entries, e)
+    end
+    for (kind, mx) in ((:sys, pc.max_sys), (:turn, pc.max_turn))
+        while count(e -> e.kind == kind, pc.entries) > mx
+            i = findfirst(e -> e.kind == kind, pc.entries)
+            push!(pc.stale, pc.entries[i]); deleteat!(pc.entries, i)
+        end
+    end
+end
 
 # Prefill `prompt` (0-based ids) chunk by chunk into the decode cache; returns the last token's logits
 # (vocab, 1, 1) on the host, the final residual stream (Hidden, n - off, 1) on the device: the columns of positions off .. n-1 (off = 0
-# unless a `prefix` state was reused: then the saved state's last position is the first column), and off.
-# prefix / prefix_at: see `PrefixCache`; the state is restored when the prompt starts with its ids, and saved afresh at `prefix_at`.
-function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=prefill_chunk(), prefix::Union{Nothing,PrefixCache}=nothing, prefix_at::Int=0)
+# unless a `prefix` entry was resumed: then its last position is the first column), and off.
+# prefix / prefix_at: see `PrefixCache`; need_mtp: only resume entries that carry the MTP head's K/V.
+function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=prefill_chunk(), prefix::Union{Nothing,PrefixCache}=nothing, prefix_at=Int[],
+                           need_mtp::Bool=false)
     n = length(prompt)
     n < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
+    s.kv_dtype === Float16 || (prefix = nothing)
     gr = _chunk_graph(s, chunk)
     idg = gr.idg; cache = gr.cache
     Hd = s.model.config.hidden
-    a = 0; off = 0
-    old = prefix === nothing ? nothing : (pc = PrefixCache(prefix.ids, prefix.states, prefix.h); pc)
-    resume = old !== nothing && !isempty(old.ids) && length(old.ids) < n && view(prompt, 1:length(old.ids)) == old.ids
+    best = nothing
     if prefix !== nothing
-        resume || _invalidate!(prefix)                       # (a half-done prefill must not leave a state that no longer matches)
+        foreach(_free_entry!, prefix.stale); empty!(prefix.stale)
+        prefix.pending = PrefixEntry[]; prefix.resumed = nothing
+        for e in prefix.entries
+            L = length(e.ids)
+            L < n && (!need_mtp || e.mtp !== nothing) && (best === nothing || L > length(best.ids)) && view(prompt, 1:L) == e.ids && (best = e)
+        end
     end
-    Hall = Luminal.zero_tensor(s.device, Float32, Hd, resume ? n - length(old.ids) + 1 : n, 1)
+    resume = best !== nothing
+    a = resume ? length(best.ids) : 0; off = resume ? a - 1 : 0
+    Hall = Luminal.zero_tensor(s.device, Float32, Hd, n - off, 1)
     logits = nothing
     j = 0
     for (i, l) in enumerate(s.model.layers)
         NN._is_state_layer(l) || continue
         j += 1
         if resume                                            # continue from the saved recurrent states
-            copyto!(cache.self_cache[i][1], old.states[j][1]); copyto!(cache.self_cache[i][2], old.states[j][2])
+            copyto!(cache.self_cache[i][1], best.states[j][1]); copyto!(cache.self_cache[i][2], best.states[j][2])
         else                                                 # the recurrent layers start from empty states (the cache may hold a previous prompt's)
             fill!(cache.self_cache[i][1], 0); fill!(cache.self_cache[i][2], 0)
         end
     end
     if resume
-        a = length(old.ids); off = a - 1
-        view(Hall, :, 1:1, :) .= old.h
+        j = 0
+        for (i, l) in enumerate(s.model.layers)
+            NN._is_state_layer(l) && continue
+            j += 1
+            view(cache.self_cache[i][1], :, 1:a, :, :) .= best.kv[j][1]; view(cache.self_cache[i][2], :, 1:a, :, :) .= best.kv[j][2]
+        end
+        view(Hall, :, 1:1, :) .= best.h
+        prefix.resumed = best
     end
-    save_at = prefix !== nothing && prefix_at > a && prefix_at < n ? prefix_at : 0
+    points = prefix === nothing || n < prefix.min_tokens ? Pair{Symbol,Int}[] :
+             sort!(Pair{Symbol,Int}[k => p for (k, p) in _prefix_points(prefix_at) if p > a && p < n], by = last)
     while a < n
         m = min(chunk, n - a)
-        save_at > a && (m = min(m, save_at - a))             # chunks end at the position to save
+        for (_, p) in points
+            p > a && (m = min(m, p - a); break)              # chunks end at the positions to save
+        end
         toks = zeros(Float32, chunk, 1); toks[1:m, 1] .= prompt[a+1:a+m]
         inputs = Dict{Int, Any}(idg.token_input_id => toks, idg.pos_input_id => Float32[a], idg.lens_input_id => Float32[m])
         for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
@@ -401,13 +462,21 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         view(Hall, :, a+1-off:a+m-off, :) .= view(res[idg.hidden_id], :, 1:m, :)
         a + m == n && (logits = Array{Float32}(res[idg.logits_id]))
         a += m
-        if a == save_at
-            states = Any[]
+        for (kind, p) in points
+            p == a || continue
+            states = Any[]; kv = Any[]
             for (i, l) in enumerate(s.model.layers)
-                NN._is_state_layer(l) && push!(states, (copy(cache.self_cache[i][1]), copy(cache.self_cache[i][2])))
+                if NN._is_state_layer(l)
+                    push!(states, (copy(cache.self_cache[i][1]), copy(cache.self_cache[i][2])))
+                else
+                    K = cache.self_cache[i][1]
+                    kk = similar(K, size(K, 1), a, size(K, 3), size(K, 4)); vv = similar(kk)
+                    kk .= view(K, :, 1:a, :, :); vv .= view(cache.self_cache[i][2], :, 1:a, :, :)
+                    push!(kv, (kk, vv))
+                end
             end
             hh = Luminal.zero_tensor(s.device, Float32, Hd, 1, 1); view(hh, :, 1:1, :) .= view(Hall, :, a-off:a-off, :)
-            prefix.ids = prompt[1:a]; prefix.states = states; prefix.h = hh
+            push!(prefix.pending, PrefixEntry(kind, prompt[1:a], states, kv, hh, nothing))
         end
         # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per
         # token they would pile up (24 GB per 1024 tokens on the 27B) until it ran
@@ -415,8 +484,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         _chunk_reuse() || _chunk_reclaim!(s.device)
     end
     cache.positions .= n
-    prefix !== nothing && !resume && save_at == 0 && _invalidate!(prefix)
-    prefix !== nothing && resume && save_at == 0 && (prefix.ids = old.ids; prefix.states = old.states; prefix.h = old.h)
+    prefix === nothing || _register!(prefix, prefix.pending, best)
     return logits, Hall, off
 end
 
@@ -478,12 +546,12 @@ appended to it, and with `step_logits` each decode step's (vocab, B) logits
 # the full layers are copied in, the recurrent states are left at each prompt's end, and the cache
 # positions set. Returns (pf, res, dc, plens, logits): the prefill graph and its results, the decode
 # graph (and cache), the prompt lengths and the host logits ((vocab, slen, B), or (vocab, 1, B)).
-function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; prefix::Union{Nothing,PrefixCache}=nothing, prefix_at::Int=0)
+function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; prefix::Union{Nothing,PrefixCache}=nothing, prefix_at=Int[], need_mtp::Bool=false)
     B = length(prompt_ids)
     plens = length.(prompt_ids)
     maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     if B == 1 && (plens[1] > prefill_chunk() || prefix !== nothing) && _can_chunk(s)
-        logits, Hall, off = _prefill_chunked!(s, prompt_ids[1]; prefix, prefix_at)
+        logits, Hall, off = _prefill_chunked!(s, prompt_ids[1]; prefix, prefix_at, need_mtp)
         pf = (last_only=true, hidden_id=1, chunked=true, off=off)
         return pf, Dict{Any,Any}(1 => Hall), _decode_graph(s, 1), plens, logits
     end
@@ -528,7 +596,7 @@ _store_kv!(dst, src, n::Int, b::Int) =
 
 function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
                       last_logits=nothing, step_logits=nothing, sampler=nothing, on_token=nothing,
-                      prefix=nothing, prefix_at::Int=0)
+                      prefix=nothing, prefix_at=Int[])
     B = length(prompt_ids)
     B >= 1 || error("no prompts")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids; prefix, prefix_at)

@@ -215,11 +215,12 @@ struct Job
     sampler::Any
     tools::Any
     thinking::Bool
+    has_system::Bool
     stop::Vector{String}
     events::Channel{Any}
     cancel::Base.RefValue{Bool}
 end
-const PREFIX = PrefixCache()                    # the saved prefill state of the last conversation (see `PrefixCache`)
+const PREFIX = PrefixCache()                    # the saved prefill states (see `PrefixCache`)
 const JOBS = Channel{Job}(64)
 
 function run_job!(s, d, tok, job::Job, use_spec::Bool)
@@ -234,7 +235,10 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     reason = :stop; visible = ""
     eos = Set(tok.eos_ids)
     im_start = only(Int.(LT.encode(tok, "<|im_start|>"; bos = false)))
-    prefix_at = something(findlast(==(im_start), ids), 1) - 1      # the last turn header: everything before it is the same in the next prompt
+    starts = findall(==(im_start), ids)                            # turn headers: everything before the last one is the same in the next prompt of this
+    prefix_at = Pair{Symbol,Int}[]                                 # conversation, and before the second one (a system message ends there) in any with this system prompt
+    job.has_system && length(starts) >= 2 && push!(prefix_at, :sys => starts[2] - 1)
+    isempty(starts) || push!(prefix_at, :turn => starts[end] - 1)
     stats = Dict{Symbol,Any}()
     t_first = Ref(0.0)
     function emit(text; final=false)
@@ -309,7 +313,7 @@ function chat_handler(http::HTTP.Stream, name::String)
         Sampler(temperature = temperature, top_p = Float64(field(req, :top_p, 0.95)), top_k = Int(field(req, :top_k, 20)), rng = rng)
     stop = field(req, :stop, String[]); stop = stop isa AbstractString ? [String(stop)] : String.(stop)
     max_tokens = Int(something(field(req, :max_completion_tokens), field(req, :max_tokens), 4096))
-    job = Job(prompt, max_tokens, sampler, tools, thinking, stop, Channel{Any}(Inf), Ref(false))
+    job = Job(prompt, max_tokens, sampler, tools, thinking, String(field(messages[1], :role, "")) in ("system", "developer"), stop, Channel{Any}(Inf), Ref(false))
     put!(JOBS, job)
     id = "chatcmpl-" * randstring(16); created = Int(floor(time()))
     stream = field(req, :stream, false) === true
