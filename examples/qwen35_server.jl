@@ -400,7 +400,7 @@ function chat_handler(http::HTTP.Stream, name::String)
                 elseif kind == :content
                     sse(chunk((content = val,)))
                 elseif kind == :progress
-                    sse(val[2] == 0 ? ": generating, $(val[1]) tokens so far" : ": prefill $(val[1])/$(val[2]) tokens")
+                    write(http, val[2] == 0 ? ": generating, $(val[1]) tokens so far" : ": prefill $(val[1])/$(val[2]) tokens", "\n\n")   # an SSE comment: no "data:" prefix
                     sse(chunk((content = "",)))                 # an empty delta: a chunk any client counts as activity
                 elseif kind == :tool_call
                     sse(chunk((tool_calls = [(index = ncall, id = "call_" * randstring(12), type = "function",
