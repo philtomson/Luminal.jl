@@ -301,6 +301,9 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
             if length(gen) >= job.max_tokens; reason = :length; break; end
         end
         job.cancel[] && (reason = :cancel; return true)
+        if time() - last_ev[] >= 8                      # a long tool call is held back until it is complete: keep the stream alive meanwhile
+            put!(job.events, (:progress, (length(gen), 0))); last_ev[] = time()
+        end
         text = LT.decode(tok, gen)
         (endswith(text, '\ufffd') || !isvalid(text)) && reason != :length && return false     # an incomplete UTF-8 sequence: wait for its rest
         emit(tail_text(text, sent)); sent = ncodeunits(text)
@@ -397,7 +400,7 @@ function chat_handler(http::HTTP.Stream, name::String)
                 elseif kind == :content
                     sse(chunk((content = val,)))
                 elseif kind == :progress
-                    sse(": prefill $(val[1])/$(val[2]) tokens")
+                    sse(val[2] == 0 ? ": generating, $(val[1]) tokens so far" : ": prefill $(val[1])/$(val[2]) tokens")
                     sse(chunk((content = "",)))                 # an empty delta: a chunk any client counts as activity
                 elseif kind == :tool_call
                     sse(chunk((tool_calls = [(index = ncall, id = "call_" * randstring(12), type = "function",
