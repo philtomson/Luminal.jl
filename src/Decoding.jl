@@ -416,7 +416,7 @@ end
 # unless a `prefix` entry was resumed: then its last position is the first column), and off.
 # prefix / prefix_at: see `PrefixCache`; need_mtp: only resume entries that carry the MTP head's K/V.
 function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=prefill_chunk(), prefix::Union{Nothing,PrefixCache}=nothing, prefix_at=Int[],
-                           need_mtp::Bool=false)
+                           need_mtp::Bool=false, on_progress=nothing)
     n = length(prompt)
     n < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
@@ -506,6 +506,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         # token they would pile up (24 GB per 1024 tokens on the 27B) until it ran
         res = nothing
         a < n && (_chunk_reuse() || _chunk_reclaim!(s.device))      # (not after the last chunk: no more garbage to pile up, and the server collects between requests)
+        on_progress === nothing || on_progress(a, n)
     end
     cache.positions .= n
     prefix === nothing || (prefix.live = copy(prompt))                       # the live K/V below n is this prompt's (MTP: set once primed)
@@ -574,12 +575,12 @@ appended to it, and with `step_logits` each decode step's (vocab, B) logits
 # the full layers are copied in, the recurrent states are left at each prompt's end, and the cache
 # positions set. Returns (pf, res, dc, plens, logits): the prefill graph and its results, the decode
 # graph (and cache), the prompt lengths and the host logits ((vocab, slen, B), or (vocab, 1, B)).
-function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; prefix::Union{Nothing,PrefixCache}=nothing, prefix_at=Int[], need_mtp::Bool=false)
+function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; prefix::Union{Nothing,PrefixCache}=nothing, prefix_at=Int[], need_mtp::Bool=false, on_progress=nothing)
     B = length(prompt_ids)
     plens = length.(prompt_ids)
     maximum(plens) < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     if B == 1 && (plens[1] > prefill_chunk() || prefix !== nothing) && _can_chunk(s)
-        logits, Hall, off = _prefill_chunked!(s, prompt_ids[1]; prefix, prefix_at, need_mtp)
+        logits, Hall, off = _prefill_chunked!(s, prompt_ids[1]; prefix, prefix_at, need_mtp, on_progress)
         pf = (last_only=true, hidden_id=1, chunked=true, off=off)
         return pf, Dict{Any,Any}(1 => Hall), _decode_graph(s, 1), plens, logits
     end
@@ -624,10 +625,10 @@ _store_kv!(dst, src, n::Int, b::Int) =
 
 function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
                       last_logits=nothing, step_logits=nothing, sampler=nothing, on_token=nothing,
-                      prefix=nothing, prefix_at=Int[])
+                      prefix=nothing, prefix_at=Int[], on_progress=nothing)
     B = length(prompt_ids)
     B >= 1 || error("no prompts")
-    pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids; prefix, prefix_at)
+    pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids; prefix, prefix_at, on_progress)
     _release_stale!(prefix)
     cache = dc.cache
     lastpos(b) = pf.last_only ? 1 : plens[b]

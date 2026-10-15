@@ -257,6 +257,22 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     isempty(starts) || push!(prefix_at, :turn => starts[end] - 1)
     stats = Dict{Symbol,Any}()
     t_first = Ref(0.0)
+    last_ev = Ref(time()); last_log = Ref(time()); last_done = Ref(-1)
+    # during a long prefill: an event for the HTTP side every few seconds (it turns them into keep-alive chunks, so the client's idle
+    # timeout does not fire) and a progress line in the log every 30 s
+    function on_progress(done, total)
+        now = time()
+        if now - last_ev[] >= 5
+            put!(job.events, (:progress, (done, total))); last_ev[] = now
+        end
+        last_done[] < 0 && (last_done[] = done)                 # (the first chunk only sets the base: a resumed prompt starts at its cached length)
+        if now - last_log[] >= 30
+            logline(@sprintf("  prefill %d/%d tokens (%.0f%%), %.0f tok/s over the last %.0f s", done, total, 100 * done / total,
+                             (done - last_done[]) / max(now - last_log[], 1e-6), now - last_log[]))
+            last_log[] = now; last_done[] = done
+        end
+        return nothing
+    end
     function emit(text; final=false)
         for e in feed!(parser, text; final)
             put!(job.events, e)
@@ -281,9 +297,9 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     end
     try
         if use_spec
-            generate_ids_speculative(s, d, ids; max_new_tokens = job.max_tokens + 8, ndraft = 0, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at, stats)
+            generate_ids_speculative(s, d, ids; max_new_tokens = job.max_tokens + 8, ndraft = 0, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at, stats, on_progress)
         else
-            generate_ids(s, [ids]; max_new_tokens = job.max_tokens + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at)
+            generate_ids(s, [ids]; max_new_tokens = job.max_tokens + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at, on_progress)
         end
         text = LT.decode(tok, gen)
         emit(tail_text(text, sent); final = true)
@@ -365,6 +381,9 @@ function chat_handler(http::HTTP.Stream, name::String)
                     sse(chunk((reasoning_content = val,)))
                 elseif kind == :content
                     sse(chunk((content = val,)))
+                elseif kind == :progress
+                    sse(": prefill $(val[1])/$(val[2]) tokens")
+                    sse(chunk((content = "",)))                 # an empty delta: a chunk any client counts as activity
                 elseif kind == :tool_call
                     sse(chunk((tool_calls = [(index = ncall, id = "call_" * randstring(12), type = "function",
                                               var"function" = (name = val[1], arguments = val[2]))],)))

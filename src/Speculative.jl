@@ -215,12 +215,12 @@ and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
                                   stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3, sampler=nothing, on_token=nothing,
-                                  prefix=nothing, prefix_at=Int[])
+                                  prefix=nothing, prefix_at=Int[], on_progress=nothing)
     ndraft in 0:7 || error("ndraft must be 1..7, or 0 (adaptive: 1 to `maxdraft` drafts per cycle from the recent acceptance rate)")
     maxdraft in 1:7 || error("maxdraft must be 1..7")
     d.session === s || error("the drafter belongs to another session")
     t_pf = time()
-    pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt]; prefix, prefix_at, need_mtp=true)
+    pf, res, dc, plens, logits = _prefill_into_cache!(s, [prompt]; prefix, prefix_at, need_mtp=true, on_progress)
     t_pf = time() - t_pf
     off = get(pf, :off, 0)
     stats === nothing || (stats[:prefill_reused] = off == 0 ? 0 : off + 1)
