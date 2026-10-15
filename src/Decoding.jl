@@ -481,7 +481,7 @@ _store_kv!(dst, src, n::Int, b::Int) =
     eltype(dst) === Int8 ? Luminal.quantize_kv!(dst, src, n, b) : (view(dst, :, 1:n, :, b) .= view(src, :, 1:n, :, b); dst)
 
 function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_tokens::Int=200,
-                      last_logits=nothing, step_logits=nothing, sampler=nothing)
+                      last_logits=nothing, step_logits=nothing, sampler=nothing, on_token=nothing)
     B = length(prompt_ids)
     B >= 1 || error("no prompts")
     pf, res, dc, plens, logits = _prefill_into_cache!(s, prompt_ids)
@@ -491,6 +491,7 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
     generated = [[sample_token(sampler, view(logits, :, lastpos(b), b))] for b in 1:B]   # 0-indexed
     last_logits === nothing || append!(last_logits, [logits[:, lastpos(b), b] for b in 1:B])
     done = [g[1] in eos_ids || max_new_tokens <= 1 for g in generated]
+    on_token !== nothing && B == 1 && on_token([generated[1][1]]) && return generated
 
     # Decode. A finished sequence keeps being fed (its last token, at the same
     # position, so it never runs into max_seq) until every sequence is done.
@@ -503,6 +504,7 @@ function generate_ids(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; max_new_
             done[b] && continue
             next = sample_token(sampler, view(host, :, 1, b))               # 0-indexed
             push!(generated[b], next)
+            on_token !== nothing && B == 1 && on_token([next]) && return generated
             done[b] = next in eos_ids || length(generated[b]) >= max_new_tokens ||
                       cache.positions[b] >= s.max_seq
         end

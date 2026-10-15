@@ -192,11 +192,12 @@ end
 
 Generation for one prompt with MTP speculative decoding (greedy, or sampled with `sampler`, a [`Sampler`](@ref): the drafts are then accepted by rejection sampling, which keeps the output distribution exactly the sampler's) (0-indexed token ids, like `generate_ids`).
 `stats`, a `Dict`, receives `:cycles`, `:accepted` (drafts the base model confirmed) and `:emitted`.
-`draft_hook(n_emitted, draft) -> token` may replace the drafted token (tests use it to force accepts
+`on_token(new_ids) -> Bool` is called with each batch of emitted ids (the first token, then each cycle's; it may see ids after an end-of-sequence one)
+and stops the generation by returning true. `draft_hook(n_emitted, draft) -> token` may replace the drafted token (tests use it to force accepts
 and rejects).
 """
 function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector{Int}; max_new_tokens::Int=200,
-                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3, sampler=nothing)
+                                  stats=nothing, draft_hook=nothing, ndraft::Int=1, maxdraft::Int=3, sampler=nothing, on_token=nothing)
     ndraft in 0:7 || error("ndraft must be 1..7, or 0 (adaptive: 1 to `maxdraft` drafts per cycle from the recent acceptance rate)")
     maxdraft in 1:7 || error("maxdraft must be 1..7")
     d.session === s || error("the drafter belongs to another session")
@@ -208,12 +209,13 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     sampler isa Sampler && sampler.temperature <= 0 && (sampler = nothing)
     y = sample_token(sampler, view(logits, :, pf.last_only ? 1 : n, 1))
     out = [y]
+    on_token !== nothing && on_token([y]) && return out
     (y in eos_ids || max_new_tokens <= 1) && return out
     H = res[pf.hidden_id]                                         # (Hidden, slen, 1)
     _mtp_prime!(d, prompt, H)
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n:n, :]
-    (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
+    (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, on_token, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -320,7 +322,7 @@ function _draw(sm::Sampler, idx, p)
     return idx[end] - 1
 end
 
-function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false, sampler=nothing)
+function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false, sampler=nothing, on_token=nothing)
     K = ND + 1
     q = fill(0.7, ND)                                                 # conditional acceptance of draft j given 1..j-1 were
     sel = zeros(Int, ND)                                              # cycles run with each draft count
@@ -370,6 +372,7 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         end
         nreal = m + 1
         append!(out, emitted)
+        on_token !== nothing && on_token(emitted) && break
         cache.positions[1] += nreal
         nreal < K && _rollback_states!(s, vg; slot=nreal)
         y = emitted[end]

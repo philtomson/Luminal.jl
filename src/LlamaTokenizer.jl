@@ -431,7 +431,9 @@ function chat_prompt(tok::LlamaTokenizer, message::AbstractString; thinking::Boo
     if haskey(tok.vocab, "<|im_start|>")
         # ChatML (Qwen). Qwen3 thinks by default; with thinking off its template
         # opens the reply with an empty think block.
-        think = haskey(tok.vocab, "<think>") && !thinking ? "<think>\n\n</think>\n\n" : ""
+        # (templates of the Qwen3.5+ generation open the think block themselves)
+        opens = occursin("{{- '<think>\\n' }}", tok.chat_template)
+        think = haskey(tok.vocab, "<think>") ? (!thinking ? "<think>\n\n</think>\n\n" : opens ? "<think>\n" : "") : ""
         # Qwen3.8's template puts a sentence on the effort in a system turn: "xhigh" (the default) and "low" have one, "medium" none
         effort = reasoning_effort === nothing ? "xhigh" : reasoning_effort == "high" ? "xhigh" : reasoning_effort
         effort in ("xhigh", "medium", "low") || error("Unexpected reasoning effort $reasoning_effort. Supported types are xhigh (default), medium, and low.")
