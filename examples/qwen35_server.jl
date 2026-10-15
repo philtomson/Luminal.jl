@@ -416,13 +416,13 @@ function main()
     name = flag("name", splitext(basename(base))[1])
     T = "--int8" in ARGS ? Int8 : Luminal.Int4
     f = read_gguf(base); cfg = qwen35_config(f); tok = LlamaTokenizer(f)
-    @info "loading $base"
+    logline("loading $base")
     W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
     use_spec && merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = cfg.n_layers))
     s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = parse(Int, flag("max-seq", "16384")), weights = W, decode_weights = T,
                      kv_dtype = Float16)
     d = use_spec ? MTPDrafter(s) : nothing
-    @info "warming up (compiles the graphs)"
+    logline("loaded; warming up (compiles the graphs, about a minute)")
     wid = Int.(LT.encode(tok, render_chat([(role = "user", content = "Say hello.")], nothing); bos = false))
     for sm in (nothing, Sampler(temperature = 1.0, top_p = 0.95, top_k = 20))
         use_spec ? (generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm); generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm)) :
