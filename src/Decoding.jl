@@ -300,7 +300,9 @@ end
 # chunks. Otherwise (stock AMDGPU.jl) a young-generation GC is enough and ~10x cheaper than a full one.
 # LUMINAL_CHUNK_GC=none|young|full overrides.
 function _chunk_reclaim!(device)
-    mode = get(ENV, "LUMINAL_CHUNK_GC", isdefined(AMDGPU, :DERIVE_SCOPE) ? "none" : "young")
+    # (measured on the 27B with the launch-bounds branch too: "none" left ~0.4-0.9 MB per prompt token behind, 28 GB over a 32k prompt, until a GC
+    # happened to run; "young" after every chunk keeps the memory flat at the same speed)
+    mode = get(ENV, "LUMINAL_CHUNK_GC", "young")
     mode == "full" && return Luminal.reclaim!(device)
     mode == "none" && return nothing
     GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim()
