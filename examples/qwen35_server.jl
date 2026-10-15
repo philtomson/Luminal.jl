@@ -44,9 +44,11 @@ function content_text(c)
     error("Unexpected content type.")
 end
 
-function render_chat(messages, tools; thinking::Bool=true, effort::String="medium")
+function render_chat(messages, tools; thinking::Bool=true, effort::String="medium", parts=nothing)
     isempty(messages) && error("No messages provided.")
     io = IOBuffer()
+    # `parts`, a Dict{Symbol,IOBuffer}, receives the same text by kind (for the per-request token breakdown)
+    pr(kind::Symbol, xs...) = (print(io, xs...); parts === nothing || print(get!(parts, kind, IOBuffer()), xs...))
     nsys = 0; sys = String[]
     for m in messages
         String(m.role) in ("system", "developer") || break
@@ -59,19 +61,19 @@ function render_chat(messages, tools; thinking::Bool=true, effort::String="mediu
     effort in ("xhigh", "medium", "low") || error("Unexpected reasoning effort $effort. Supported types are xhigh (default), medium, and low.")
     ri = !thinking ? "" : effort == "xhigh" ? XHIGH_TEXT : effort == "low" ? LOW_TEXT : ""
     if tools !== nothing && !isempty(tools)
-        print(io, "<|im_start|>system\n")
-        isempty(ri) || print(io, ri, "\n\n")
-        print(io, "# Tools\n\nYou have access to the following functions:\n\n<tools>")
+        pr(:markup, "<|im_start|>system\n")
+        isempty(ri) || pr(:system, ri, "\n\n")
+        pr(:tools, "# Tools\n\nYou have access to the following functions:\n\n<tools>")
         for t in tools
-            print(io, "\n", pyjson(t))
+            pr(:tools, "\n", pyjson(t))
         end
-        print(io, "\n</tools>", TOOLS_TAIL)
-        isempty(merged) || print(io, "\n\n", merged)
-        print(io, "<|im_end|>\n")
+        pr(:tools, "\n</tools>", TOOLS_TAIL)
+        isempty(merged) || pr(:system, "\n\n", merged)
+        pr(:markup, "<|im_end|>\n")
     elseif !isempty(merged)
-        print(io, "<|im_start|>system\n", isempty(ri) ? "" : ri * "\n\n", merged, "<|im_end|>\n")
+        pr(:markup, "<|im_start|>system\n"); pr(:system, isempty(ri) ? "" : ri * "\n\n", merged); pr(:markup, "<|im_end|>\n")
     elseif !isempty(ri)
-        print(io, "<|im_start|>system\n", ri, "<|im_end|>\n")
+        pr(:markup, "<|im_start|>system\n"); pr(:system, ri); pr(:markup, "<|im_end|>\n")
     end
     n = length(messages)
     for i in nsys+1:n
@@ -80,38 +82,38 @@ function render_chat(messages, tools; thinking::Bool=true, effort::String="mediu
         if role in ("system", "developer")
             error("System message must be at the beginning.")
         elseif role == "user"
-            print(io, "<|im_start|>user\n", content, "<|im_end|>\n")
+            pr(:markup, "<|im_start|>user\n"); pr(:user, content); pr(:markup, "<|im_end|>\n")
         elseif role == "assistant"
             rc = field(m, :reasoning_content)
             rc = rc isa AbstractString ? strip(rc) : ""
-            print(io, "<|im_start|>assistant\n<think>\n", rc, "\n</think>\n\n", content)
+            pr(:markup, "<|im_start|>assistant\n<think>\n"); pr(:reasoning, rc); pr(:markup, "\n</think>\n\n"); pr(:assistant, content)
             tcs = field(m, :tool_calls)
             if tcs !== nothing
                 for (j, tc) in enumerate(tcs)
                     fn = field(tc, Symbol("function"), tc)
                     name = field(fn, :name)
                     name === nothing && error("Tool call is missing a function name.")
-                    print(io, j == 1 ? (isempty(content) ? "" : "\n\n") : "\n", "<tool_call>\n<function=", name, ">\n")
+                    pr(:toolcalls, j == 1 ? (isempty(content) ? "" : "\n\n") : "\n", "<tool_call>\n<function=", name, ">\n")
                     args = field(fn, :arguments)
                     args isa AbstractString && (args = isempty(strip(args)) ? nothing : JSON3.read(args))
                     if args !== nothing
                         for (k, v) in pairs(args)
-                            print(io, "<parameter=", k, ">\n", v isa AbstractString ? v : pyjson(v), "\n</parameter>\n")
+                            pr(:toolcalls, "<parameter=", k, ">\n", v isa AbstractString ? v : pyjson(v), "\n</parameter>\n")
                         end
                     end
-                    print(io, "</function>\n</tool_call>")
+                    pr(:toolcalls, "</function>\n</tool_call>")
                 end
             end
-            print(io, "<|im_end|>\n")
+            pr(:markup, "<|im_end|>\n")
         elseif role == "tool"
-            (i == nsys + 1 || String(messages[i-1].role) != "tool") && print(io, "<|im_start|>user")
-            print(io, "\n<tool_response>\n", content, "\n</tool_response>")
-            (i == n || String(messages[i+1].role) != "tool") && print(io, "<|im_end|>\n")
+            (i == nsys + 1 || String(messages[i-1].role) != "tool") && pr(:markup, "<|im_start|>user")
+            pr(:markup, "\n<tool_response>\n"); pr(:toolresults, content); pr(:markup, "\n</tool_response>")
+            (i == n || String(messages[i+1].role) != "tool") && pr(:markup, "<|im_end|>\n")
         else
             error("Unexpected message role.")
         end
     end
-    print(io, "<|im_start|>assistant\n", thinking ? "<think>\n" : "<think>\n\n</think>\n\n")
+    pr(:markup, "<|im_start|>assistant\n", thinking ? "<think>\n" : "<think>\n\n</think>\n\n")
     return String(take!(io))
 end
 
@@ -216,6 +218,7 @@ struct Job
     tools::Any
     thinking::Bool
     has_system::Bool
+    parts::Dict{Symbol,String}
     stop::Vector{String}
     events::Channel{Any}
     cancel::Base.RefValue{Bool}
@@ -227,6 +230,14 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     ids = Int.(LT.encode(tok, job.prompt; bos = false))
     t0 = time()
     logline(@sprintf("request: %d prompt tokens, up to %d new", length(ids), job.max_tokens))
+    try
+        names = ((:tools, "system prompt tools"), (:system, "system text"), (:user, "user"), (:reasoning, "earlier reasoning"), (:assistant, "earlier replies"),
+                 (:toolcalls, "tool calls"), (:toolresults, "tool results"), (:markup, "chat markup"))
+        cnt = [(label, length(LT.encode(tok, job.parts[k]; bos = false))) for (k, label) in names if haskey(job.parts, k) && !isempty(job.parts[k])]
+        logline("  breakdown: " * join(("$label $c" for (label, c) in cnt), ", ") * " (parts sum to $(sum(last, cnt)))")
+    catch e
+        logline("  breakdown unavailable: " * sprint(showerror, e))
+    end
     if length(ids) + job.max_tokens + 8 > s.max_seq
         put!(job.events, (:error, "the prompt has $(length(ids)) tokens and max_tokens is $(job.max_tokens); the server's context is $(s.max_seq)"))
         return
@@ -313,8 +324,9 @@ function chat_handler(http::HTTP.Stream, name::String)
     kwargs = field(req, :chat_template_kwargs, Dict())
     thinking = field(kwargs, :enable_thinking, true) !== false
     effort = String(something(field(req, :reasoning_effort), field(kwargs, :reasoning_effort), "medium"))
+    parts = Dict{Symbol,IOBuffer}()
     prompt = try
-        render_chat(messages, tools; thinking, effort)
+        render_chat(messages, tools; thinking, effort, parts)
     catch e
         return err_response(http, 400, sprint(showerror, e))
     end
@@ -325,7 +337,7 @@ function chat_handler(http::HTTP.Stream, name::String)
         Sampler(temperature = temperature, top_p = Float64(field(req, :top_p, 0.95)), top_k = Int(field(req, :top_k, 20)), rng = rng)
     stop = field(req, :stop, String[]); stop = stop isa AbstractString ? [String(stop)] : String.(stop)
     max_tokens = Int(something(field(req, :max_completion_tokens), field(req, :max_tokens), 4096))
-    job = Job(prompt, max_tokens, sampler, tools, thinking, String(field(messages[1], :role, "")) in ("system", "developer"), stop, Channel{Any}(Inf), Ref(false))
+    job = Job(prompt, max_tokens, sampler, tools, thinking, String(field(messages[1], :role, "")) in ("system", "developer"), Dict(k => String(take!(v)) for (k, v) in parts), stop, Channel{Any}(Inf), Ref(false))
     put!(JOBS, job)
     id = "chatcmpl-" * randstring(16); created = Int(floor(time()))
     stream = field(req, :stream, false) === true
