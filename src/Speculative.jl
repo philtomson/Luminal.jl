@@ -342,7 +342,7 @@ end
 const _SPEC_COST_VERIFY = (86.0, 91.5, 96.6, 101.7, 106.8, 111.9, 117.0)       # K = 2, 3, 4 columns (beyond: extrapolated)
 const _SPEC_COST_MTP = (5.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0)           # 1, 2, 3 drafts (beyond: extrapolated)
 # Native GGUF weights (27B Q4_K_XL, measured): the multi-column GEMV shares the weight decode but not all of its ALU work, so extra columns cost more.
-const _SPEC_COST_VERIFY_NATIVE = (109.0, 115.0, 127.0, 139.0, 151.0, 163.0, 175.0)      # K = 2..8 (K = 2..4 measured with the Float16 dot2 Q5/Q6 GEMV, the rest extrapolated)
+const _SPEC_COST_VERIFY_NATIVE = (106.5, 110.0, 119.0, 131.0, 143.0, 155.0, 167.0)      # K = 2..8 (K = 2..4 measured with the Float16 dot2 Q5/Q6/IQ4 GEMV, the rest extrapolated)
 const _SPEC_COST_MTP_NATIVE = (6.5, 15.0, 21.5, 28.0, 34.5, 41.0, 47.5)
 _spec_costs(s::LlamaSession) = any(w -> w isa Luminal.NativeWeight, values(s.weights)) ?
     (_SPEC_COST_VERIFY_NATIVE, _SPEC_COST_MTP_NATIVE) : (_SPEC_COST_VERIFY, _SPEC_COST_MTP)

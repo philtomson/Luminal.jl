@@ -1994,6 +1994,13 @@ end
     w = pre[1][S]; hw = S <= 2 ? pre[2] : pre[3]
     return ntuple(jj -> _d2_nib(w, Val(jj - 1)) | (bitrotate(hw, -2 * (4 * ((S - 1) & 1) + jj - 1)) & 0x00300030), Val(4))
 end
+# IQ4_XS / IQ4_NL: the four codes of each byte pair through the table lookup of the matrix-core path (`_lut_iq4`: KV + 128 as bytes), put in the
+# mantissa of 1024.0 as above; the group's 1024 + 128 offset (1152) leaves with its activation sum: s * (sum((1024 + u) x) - 1152 sum(x)).
+@inline function _d2_pairs(::Val{:iq4}, pre, ::Val{S}) where {S}
+    w = pre[1][S]
+    ul = _lut_iq4(w & 0x0f0f0f0f); uh = _lut_iq4((w >> 0x04) & 0x0f0f0f0f)
+    return ntuple(jj -> _perm(uh, ul, UInt32(jj - 1) | 0x00000c00 | (UInt32(jj + 3) << 16) | 0x0c000000) | 0x64006400, Val(4))
+end
 @inline function _d2_chunk(::Val{F}, ::Val{S}, d0, xs0, pres, Xq, g, c0, ::Val{C}) where {F, S, C}
     x = ntuple(j -> (@inbounds Xq[4g - 4 + S, c0 + j]), Val(C))
     ps = map(p -> _d2_pairs(Val(F), p, Val(S)), pres)
@@ -2009,6 +2016,14 @@ end
     d3, xs3 = _d2_chunk(Val(:q5), Val(3), d2, xs2, pres, Xq, g, c0, vc)
     d4, xs4 = _d2_chunk(Val(:q5), Val(4), d3, xs3, pres, Xq, g, c0, vc)
     return ntuple(j -> ntuple(r -> acc[j][r] + pres[r][3] * d4[r][j] + (pres[r][4] - 1024f0 * pres[r][3]) * xs4[j], Val(4)), Val(C))
+end
+@inline function _d2_group(::Val{:iq4}, acc, pres, Xq, g, c0, vc::Val{C}) where {C}
+    d0, xs0 = _d2_zero(vc)
+    d1, xs1 = _d2_chunk(Val(:iq4), Val(1), d0, xs0, pres, Xq, g, c0, vc)
+    d2, xs2 = _d2_chunk(Val(:iq4), Val(2), d1, xs1, pres, Xq, g, c0, vc)
+    d3, xs3 = _d2_chunk(Val(:iq4), Val(3), d2, xs2, pres, Xq, g, c0, vc)
+    d4, xs4 = _d2_chunk(Val(:iq4), Val(4), d3, xs3, pres, Xq, g, c0, vc)
+    return ntuple(j -> ntuple(r -> acc[j][r] + pres[r][2] * (d4[r][j] - 1152f0 * xs4[j]), Val(4)), Val(C))
 end
 @inline function _d2_group(::Val{:q6}, acc, pres, Xq, g, c0, vc::Val{C}) where {C}
     d0, xs0 = _d2_zero(vc)
@@ -2553,7 +2568,7 @@ function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
         return C
     end
     c0 = 0
-    if _nat_fmt(W) !== :iq4 && get(ENV, "LUMINAL_NAT_DOT2", "1") != "0"     # Float16 activations + packed dot products
+    if (_nat_fmt(W) !== :iq4 || get(ENV, "LUMINAL_NAT_DOT2_IQ4", "1") != "0") && get(ENV, "LUMINAL_NAT_DOT2", "1") != "0"     # Float16 activations + packed dot products
         X16 = get!(() -> similar(Bc, Float16, K, N), _Q4D_WORKSPACE, (:d2, typeof(Bc), K, N))
         X16 .= Base.reshape(Bc, K, N)
         Xq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(X16)), K ÷ 8, N)
