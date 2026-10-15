@@ -364,6 +364,13 @@ mutable struct PrefixEntry
     h::Any
     mtp::Any
 end
+# A recurrent-state checkpoint of the live prompt: the K/V it needs is the live cache itself (valid while `PrefixCache.live` starts with the
+# same tokens), so only the recurrent layers' states and the residual stream at the last token are kept (~150 MB on the 27B, whatever the position).
+mutable struct StateCkpt
+    pos::Int
+    states::Vector{Any}
+    h::Any
+end
 mutable struct PrefixCache
     entries::Vector{PrefixEntry}      # least recently used first
     max_sys::Int
@@ -375,8 +382,23 @@ mutable struct PrefixCache
     live::Vector{Int}                 # the prompt whose K/V (below its length) the live cache holds: an entry that it starts with needs no K/V copied back
     live_mtp::Int                     # how many MTP pairs (positions) of the live MTP cache are valid for `live`
     mtp_live::Bool                    # the entry resumed by the last prefill needs no MTP K/V copied back either
+    ckpts::Vector{StateCkpt}          # state checkpoints along the live prompt, ascending position
+    ckpt_every::Int                   # distance between checkpoints (0: none)
+    resumed_kind::Symbol              # what the last prefill resumed from: :sys, :turn, :ckpt or :none
 end
-PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024) = PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, false)
+PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024, ckpt_every::Int=parse(Int, get(ENV, "LUMINAL_CKPT_EVERY", "4096"))) =
+    PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, false, StateCkpt[], ckpt_every, :none)
+
+function _free_ckpt!(k::StateCkpt)
+    for (a, b) in k.states; Luminal._free_now!(a); Luminal._free_now!(b); end
+    Luminal._free_now!(k.h)
+    return nothing
+end
+function _lcp(a::AbstractVector, b::AbstractVector)
+    m = min(length(a), length(b)); i = 0
+    while i < m && a[i+1] == b[i+1]; i += 1; end
+    return i
+end
 
 _prefix_points(x::Integer) = Pair{Symbol,Int}[:turn => Int(x)]
 _prefix_points(x::AbstractVector{<:Integer}) = Pair{Symbol,Int}[:turn => Int(v) for v in x]
@@ -435,10 +457,20 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
             L < n && (!need_mtp || e.mtp !== nothing) && (best === nothing || L > length(best.ids)) && view(prompt, 1:L) == e.ids && (best = e)
         end
     end
-    resume = best !== nothing
-    a = resume ? length(best.ids) : 0; off = resume ? a - 1 : 0
-    skip_kv = resume && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0" && length(prefix.live) >= a && view(prefix.live, 1:a) == best.ids   # the live K/V already is the entry's
+    ck = nothing                                             # a state checkpoint of the live prompt further along than any entry
+    if prefix !== nothing
+        c = min(_lcp(prompt, prefix.live), n - 1)            # the live K/V holds this prompt's first c tokens
+        for k in filter(k -> k.pos > c, prefix.ckpts); _free_ckpt!(k); end
+        filter!(k -> k.pos <= c, prefix.ckpts); sort!(prefix.ckpts, by = k -> k.pos)
+        i = findlast(k -> (!need_mtp || prefix.live_mtp >= k.pos - 1) && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0", prefix.ckpts)
+        i !== nothing && (best === nothing || prefix.ckpts[i].pos > length(best.ids)) && (ck = prefix.ckpts[i])
+        prefix.resumed_kind = ck !== nothing ? :ckpt : best !== nothing ? best.kind : :none
+    end
+    resume = best !== nothing || ck !== nothing
+    a = ck !== nothing ? ck.pos : best !== nothing ? length(best.ids) : 0; off = resume ? a - 1 : 0
+    skip_kv = ck !== nothing || (best !== nothing && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0" && length(prefix.live) >= a && view(prefix.live, 1:a) == best.ids)   # the live K/V already is the entry's
     mtp_live = skip_kv && prefix.live_mtp >= a - 1
+    ck !== nothing && (best = nothing)
     prefix === nothing || (prefix.live = Int[]; prefix.live_mtp = 0)           # (until this prefill is done)
     Hall = Luminal.zero_tensor(s.device, Float32, Hd, n - off, 1)
     logits = nothing
@@ -447,7 +479,8 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         NN._is_state_layer(l) || continue
         j += 1
         if resume                                            # continue from the saved recurrent states
-            copyto!(cache.self_cache[i][1], best.states[j][1]); copyto!(cache.self_cache[i][2], best.states[j][2])
+            st = ck !== nothing ? ck.states[j] : best.states[j]
+            copyto!(cache.self_cache[i][1], st[1]); copyto!(cache.self_cache[i][2], st[2])
         else                                                 # the recurrent layers start from empty states (the cache may hold a previous prompt's)
             fill!(cache.self_cache[i][1], 0); fill!(cache.self_cache[i][2], 0)
         end
@@ -461,12 +494,19 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         end
     end
     if resume
-        view(Hall, :, 1:1, :) .= best.h
+        view(Hall, :, 1:1, :) .= (ck !== nothing ? ck.h : best.h)
         prefix.resumed = best; prefix.mtp_live = mtp_live
     end
     PREFILL_TIMES[:restore] = _tic() - t_start; t_chunks = time()
     points = prefix === nothing || n < prefix.min_tokens ? Pair{Symbol,Int}[] :
              sort!(Pair{Symbol,Int}[k => p for (k, p) in _prefix_points(prefix_at) if p > a && p < n], by = last)
+    if prefix !== nothing && n >= prefix.min_tokens && prefix.ckpt_every > 0
+        have = Set(k.pos for k in prefix.ckpts)
+        for p in (a ÷ prefix.ckpt_every + 1) * prefix.ckpt_every:prefix.ckpt_every:n - 1
+            p in have || push!(points, :ckpt => p)
+        end
+        sort!(points, by = last)
+    end
     while a < n
         m = min(chunk, n - a)
         for (_, p) in points
@@ -489,7 +529,9 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
             t_sv = _tic()
             states = Any[]; kv = Any[]
             for (i, l) in enumerate(s.model.layers)
-                if NN._is_state_layer(l)
+                if kind == :ckpt
+                    NN._is_state_layer(l) && push!(states, (copy(cache.self_cache[i][1]), copy(cache.self_cache[i][2])))
+                elseif NN._is_state_layer(l)
                     push!(states, (copy(cache.self_cache[i][1]), copy(cache.self_cache[i][2])))
                 else
                     K = cache.self_cache[i][1]
@@ -499,7 +541,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
                 end
             end
             hh = Luminal.zero_tensor(s.device, Float32, Hd, 1, 1); view(hh, :, 1:1, :) .= view(Hall, :, a-off:a-off, :)
-            push!(prefix.pending, PrefixEntry(kind, prompt[1:a], states, kv, hh, nothing))
+            kind == :ckpt ? push!(prefix.ckpts, StateCkpt(a, states, hh)) : push!(prefix.pending, PrefixEntry(kind, prompt[1:a], states, kv, hh, nothing))
             PREFILL_TIMES[:save] = get(PREFILL_TIMES, :save, 0.0) + (_tic() - t_sv)
         end
         # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per

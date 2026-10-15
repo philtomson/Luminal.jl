@@ -327,7 +327,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
                                   prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = cached,
                                   prefill_s = tf - t0, total_s = t1 - t0,
-                                  phases = @sprintf("tokenize %.2f s, restore %.2f, chunks %.2f, save %.2f, register %.2f, mtp restore %.2f, mtp prime+save %.2f", t_enc,
+                                  phases = @sprintf("resumed from %s, tokenize %.2f s, restore %.2f, chunks %.2f, save %.2f, register %.2f, mtp restore %.2f, mtp prime+save %.2f", PREFIX.resumed_kind, t_enc,
                                                     (get(Luminal.Decoding.PREFILL_TIMES, k, 0.0) for k in (:restore, :chunks, :save, :register, :mtp_restore, :mtp_prime_save))...),
                                   timings = (cache_n = cached, prompt_n = length(ids) - cached, prompt_ms = 1000 * (tf - t0),
                                              prompt_per_second = (length(ids) - cached) / max(tf - t0, 1e-6),
