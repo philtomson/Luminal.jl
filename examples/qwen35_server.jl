@@ -2,16 +2,16 @@
 #
 # Usage:
 #   LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl <model.gguf> [--mtp=<gguf with the MTP head>] [--port=8080]
-#       [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=<model id>] [--min-avail=20]
+#       [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=<model id>] [--min-avail=20] [--reasoning-budget=N]
 # Then point the harness at http://localhost:8080/v1 (model id: --name, default the file's name).
 #
 # Endpoints: GET /v1/models, GET /health, POST /v1/chat/completions ("stream": true gives server-sent events). Request fields used: messages
 # (system / user / assistant with tool_calls / tool), tools, stream, max_tokens (max_completion_tokens), temperature, top_p, top_k,
-# reasoning_effort ("medium", "low", "xhigh"), chat_template_kwargs.enable_thinking, stop (strings), seed. Defaults are Qwen's recommended
+# reasoning_effort ("medium", "low", "xhigh"), thinking_budget (or thinking.budget_tokens, reasoning_budget: reasoning tokens before the thinking is cut off), chat_template_kwargs.enable_thinking, stop (strings), seed. Defaults are Qwen's recommended
 # coding settings: temperature 1.0, top_p 0.95, top_k 20, medium reasoning. The reply's thinking is `reasoning_content`, its text `content`,
 # and <tool_call> blocks become OpenAI `tool_calls`.
 #
-# One GPU request at a time: all GPU work runs on the main task; HTTP handlers queue jobs for it and stream its events back.
+# One GPU request at a time: all GPU work runs in one task pinned off the main thread (hence -t auto,1); HTTP handlers queue jobs for it and stream its events back.
 using Luminal, Luminal.NN
 using HTTP, JSON3, Random, Printf, Dates, Logging
 
@@ -236,7 +236,11 @@ struct Job
     stop::Vector{String}
     events::Channel{Any}
     cancel::Base.RefValue{Bool}
+    budget::Int                  # reasoning tokens allowed before the thinking is cut off (0: no limit)
 end
+const REASONING_BUDGET = Ref(0)                 # the server's default (--reasoning-budget=N); a request's thinking_budget overrides it
+const BUDGET_WRAPUP = "\n\nConsidering the limited thinking budget, I have to give the answer based on the thinking so far now.\n</think>\n\n"
+
 const PREFIX = PrefixCache()                    # the saved prefill states (see `PrefixCache`)
 const JOBS = Channel{Job}(64)
 
@@ -270,6 +274,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
     job.has_system && length(starts) >= 2 && push!(prefix_at, :sys => starts[2] - 1)
     isempty(starts) || push!(prefix_at, :turn => starts[end] - 1)
     stats = Dict{Symbol,Any}()
+    budget_hit = Ref(false)
     t_first = Ref(0.0)
     last_ev = Ref(time()); last_log = Ref(time()); last_done = Ref(-1)
     gen_log = Ref(0.0); gen_log_n = Ref(0); nreason = Ref(0); ncontent = Ref(0)      # the generation progress line (every 30 s)
@@ -321,13 +326,32 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         if !isempty(job.stop) && any(st -> occursin(st, visible), job.stop)
             reason = :stop; return true
         end
+        if job.budget > 0 && !budget_hit[] && parser.mode == :reasoning && length(gen) >= job.budget      # still thinking at the budget: stop here, close the thinking, resume
+            budget_hit[] = true; return true
+        end
         return reason == :length
     end
-    try
+    function generate!(prompt, max_new, st, at)
         if use_spec
-            generate_ids_speculative(s, d, ids; max_new_tokens = job.max_tokens + 8, ndraft = 0, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at, stats, on_progress)
+            generate_ids_speculative(s, d, prompt; max_new_tokens = max_new + 8, ndraft = 0, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at = at, stats = st, on_progress)
         else
-            generate_ids(s, [ids]; max_new_tokens = job.max_tokens + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at, on_progress)
+            generate_ids(s, [prompt]; max_new_tokens = max_new + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at = at, on_progress)
+        end
+    end
+    try
+        generate!(ids, job.max_tokens, stats, prefix_at)
+        if budget_hit[] && reason == :stop && !job.cancel[]
+            spec1 = haskey(stats, :cycles) && stats[:cycles] > 0 ? spec_summary(stats) : ""
+            isempty(spec1) || logline("  speculation (reasoning): " * spec1)
+            logline(@sprintf("  reasoning budget reached (%d tokens, %.1f s): closing the thinking, answering", length(gen), time() - t0))
+            wrap = Int.(LT.encode(tok, BUDGET_WRAPUP; bos = false))
+            append!(gen, wrap)
+            text = LT.decode(tok, gen)
+            emit(tail_text(text, sent)); sent = ncodeunits(text)
+            cached1 = get(stats, :prefill_reused, 0)
+            stats = Dict{Symbol,Any}()
+            generate!(vcat(ids, gen), max(job.max_tokens - length(gen), 1), stats, Pair{Symbol,Int}[])
+            stats[:prefill_reused] = cached1
         end
         text = LT.decode(tok, gen)
         emit(tail_text(text, sent); final = true)
@@ -405,7 +429,12 @@ function chat_handler(http::HTTP.Stream, name::String)
         Sampler(temperature = temperature, top_p = Float64(field(req, :top_p, 0.95)), top_k = Int(field(req, :top_k, 20)), rng = rng)
     stop = field(req, :stop, String[]); stop = stop isa AbstractString ? [String(stop)] : String.(stop)
     max_tokens = Int(something(field(req, :max_completion_tokens), field(req, :max_tokens), 4096))
-    job = Job(prompt, max_tokens, sampler, tools, thinking, String(field(messages[1], :role, "")) in ("system", "developer"), Dict(k => String(take!(v)) for (k, v) in parts), stop, Channel{Any}(Inf), Ref(false))
+    # the reasoning budget: thinking_budget (Qwen's API), thinking.budget_tokens (Anthropic's), reasoning_budget, or the same in chat_template_kwargs
+    budget = something(field(req, :thinking_budget), (th = field(req, :thinking); th isa AbstractDict || th isa JSON3.Object ? field(th, :budget_tokens) : nothing), field(req, :reasoning_budget),
+                       field(kwargs, :thinking_budget), field(kwargs, :reasoning_budget), REASONING_BUDGET[])
+    budget = budget isa Number ? max(Int(budget), 0) : REASONING_BUDGET[]
+    logline("  request fields: " * join(string.(keys(req)), ", ") * (budget > 0 ? "; reasoning budget $budget tokens" : ""))
+    job = Job(prompt, max_tokens, sampler, tools, thinking, String(field(messages[1], :role, "")) in ("system", "developer"), Dict(k => String(take!(v)) for (k, v) in parts), stop, Channel{Any}(Inf), Ref(false), thinking ? budget : 0)
     put!(JOBS, job)
     id = "chatcmpl-" * randstring(16); created = Int(floor(time()))
     stream = field(req, :stream, false) === true
@@ -511,10 +540,11 @@ function main()
     Logging.global_logger(QuietHTTP(Logging.global_logger()))
     args = filter(a -> !startswith(a, "--"), ARGS)
     flag(n, d) = (i = findfirst(a -> startswith(a, "--$n="), ARGS); i === nothing ? d : ARGS[i][length(n)+4:end])
-    isempty(args) && error("usage: qwen35_server.jl <model.gguf> [--mtp=<gguf>] [--port=8080] [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=id]")
+    isempty(args) && error("usage: qwen35_server.jl <model.gguf> [--mtp=<gguf>] [--port=8080] [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=id] [--reasoning-budget=N]")
     base = args[1]; mtp = flag("mtp", base)
     port = parse(Int, flag("port", "8080")); host = flag("host", "127.0.0.1")
     use_spec = !("--no-spec" in ARGS)
+    REASONING_BUDGET[] = parse(Int, flag("reasoning-budget", "0"))
     name = flag("name", splitext(basename(base))[1])
     T = "--int8" in ARGS ? Int8 : Luminal.Int4
     # All GPU work (loading, warm-up, the generation loop) runs in one task off the main thread: the HTTP server's tasks stay on the main

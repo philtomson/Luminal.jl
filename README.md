@@ -85,6 +85,49 @@ julia --project=. examples/llama_chat.jl path/to/TinyLlama-1.1B-Chat --chat "Fir
 julia --project=. examples/llama_chat.jl path/to/TinyLlama-1.1B-Chat --chat --int8 "Hi" --interactive          # keep chatting
 ```
 
+### Serve Qwen3.8-27B (GGUF)
+
+`examples/qwen35_server.jl` serves a Qwen3.5 / 3.6 / 3.8 GGUF through an
+OpenAI-compatible API (streaming chat completions, tool calls, reasoning
+content), for harnesses such as opencode. Weights stay in the GGUF's own
+quantization on the GPU (`LUMINAL_GGUF_NATIVE=1`; Q4_K_XL, about 17 GB), and the
+model's MTP head drafts tokens for speculative decoding.
+
+```bash
+LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl \
+    /path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf --max-seq=262144 --port=8080
+```
+
+- Use `-t auto,1`: the server needs the extra interactive thread. The HTTP tasks
+  run on the main thread and the GPU work in a task pinned to another one;
+  without that, nothing is streamed while a prefill or a decode step blocks the
+  main thread.
+- The first start takes a few minutes (reading the GGUF, compiling the graphs).
+  The log prints `serving ...` when it is ready.
+- `--max-seq` sets the context and the KV cache allocated up front (Float16,
+  64 KB per token: 17 GB at 262144). Other flags: `--mtp=<gguf>` (a separate file
+  with the MTP head), `--host`, `--name` (the model id), `--no-spec`, `--int8`.
+- Point the client at `http://127.0.0.1:8080/v1` (`GET /v1/models`, `GET /health`,
+  `POST /v1/chat/completions`). For opencode, add an `@ai-sdk/openai-compatible`
+  provider with that `baseURL` and the `--name` as the model id. Long prompts can
+  take minutes before the first token, so raise or disable its request timeouts.
+- `--reasoning-budget=N` limits the thinking: after N reasoning tokens the server
+  closes the `<think>` block with a short wrap-up and the model answers from what
+  it has (the resume costs a re-prefill of the new turn, about 10-20 s at N = 4096).
+  A request overrides it with `thinking_budget` (also `thinking.budget_tokens`,
+  `reasoning_budget`; 0 = no limit). In opencode, put `"thinking_budget": N` in the
+  model's `options`.
+- Prompts are cached: the system prompt, each turn, and state checkpoints every
+  4096 tokens (`LUMINAL_CKPT_EVERY`), so a follow-up turn reprocesses only its
+  new tokens. A cold prefill runs at 330-480 tok/s (about 3 minutes for 75k
+  tokens); a warm turn answers in 3-25 s. Decode is 11-15 tok/s at 70-130k
+  tokens of context (2.3-2.9 tokens per speculation cycle).
+- It handles one request at a time, and it needs about 35-60 GB of unified memory
+  at the largest context, depending on how many prompts are cached.
+  The log reports prompt processing, generation speed and speculation per request.
+
+For a one-shot generation from a GGUF, `examples/qwen35_gguf.jl <file.gguf> "prompt"`.
+
 ## Installation
 
 ```bash
@@ -105,6 +148,8 @@ Requirements:
 | Example | What it does |
 |---------|--------------|
 | `examples/llama_chat.jl` | Text generation from a Llama-family checkpoint (TinyLlama, Llama-3-8B-Instruct): `--chat`, `--int8`, `--search=static\|measured`, extra `--prompt=` flags for a batch, `--interactive` |
+| `examples/qwen35_server.jl` | OpenAI-compatible server for a Qwen3.5/3.6/3.8 GGUF (streaming, tool calls, MTP speculative decoding, prompt caching) |
+| `examples/qwen35_gguf.jl` | One-shot text generation from a Qwen3.5/3.6/3.8 GGUF |
 | `examples/llama_reference.py` | Dumps Hugging Face reference logits and greedy continuations for a Llama checkpoint |
 | `examples/llama_validate.jl` | Compares a checkpoint's logits, greedy output and batched output with that reference, and times decode |
 | `examples/batched_decode.jl` | Decode throughput against batch size |
@@ -171,6 +216,20 @@ Decode started this work at 893 ms/token. It is now bound by memory bandwidth:
 the int8 GEMVs read weights at ~215-220 GB/s. On the 8B model they are ~34 of
 the ~38.5 ms per token; the rest is small kernels and launch gaps inside the
 HIP graph (~5.5 µs per kernel).
+
+Qwen3.8-27B (UD-Q4_K_XL GGUF, ~17 GB of weights) on the same GPU, through
+`examples/qwen35_server.jl`:
+
+| | |
+|-|-|
+| Cold prefill | 330-480 tok/s (75k tokens in about 3 minutes) |
+| Warm follow-up turn, first token | 3-25 s (only the new tokens are prefilled) |
+| Decode, short context | 15-20 tok/s |
+| Decode, 70-130k tokens of context | 11-15 tok/s (2.3-2.9 tokens per speculation cycle) |
+| Context | 262144 tokens (17 GB of Float16 KV) |
+
+Decode is bound by memory bandwidth: weights (~17 GB) plus the KV read (7 GB at
+110k tokens) per step.
 
 Whisper tiny, with a warm `WhisperSession`, spends ~17 ms computing the log-mel
 spectrogram (CPU) and ~35 ms in the encoder per clip, then ~2.5 ms per token. A
@@ -251,14 +310,25 @@ batch of 4 clips decodes in about the time of 2.
   (sliding-window, in prefill masks and the decode kernel) and global (scaled
   RoPE) layers. `model_template(dir)` picks Llama or Gemma3 from `config.json`, and
   `generate_ids` generates from token ids.
-- **Qwen3.5 / Qwen3.6 (dense; in progress)**: `Qwen35` (`qwen35_config`,
+- **Qwen3.5 / Qwen3.6 / Qwen3.8 (dense)**: `Qwen35` (`qwen35_config`,
   `model_template`) matches transformers on a tiny random model through
   `LlamaSession`, prefill and decode, batched. Its Gated DeltaNet layers
   (`GatedDeltaNet`; the `CausalConv` and `DeltaRule` ops keep the convolution and
   recurrent states in place, consuming each sequence up to its `lens`) and gated
   full attention (`qwen35_attention`: output gate, RoPE on a quarter of each head,
   (1 + w) QK-norm) share one decode step with a hybrid cache: K/V for the full
-  layers, states for the linear ones.
+  layers, states for the linear ones. Qwen3.8-27B runs from its llama.cpp GGUF
+  (`read_gguf`, `load_qwen35_gguf`; `LUMINAL_GGUF_NATIVE=1` keeps the file's own
+  Q4_K / Q5_K / Q6_K / IQ4 / Q8_0 blocks on the GPU, read by fused dequantizing
+  GEMV and WMMA GEMM kernels) with:
+  - MTP speculative decoding (`MTPDrafter`, `generate_ids_speculative`): an
+    adaptive 1-3 drafts per step, verified in one batched pass, with sampled
+    verification that keeps the output distribution exact;
+  - chunked prefill, split-K decode attention and flash prefill attention, with a
+    Float16 KV cache and contexts up to 262144 tokens;
+  - a prefix cache (`PrefixCache`: system prompt, turn and recurrent-state
+    checkpoints) so a follow-up turn only prefills its new tokens;
+  - the OpenAI-compatible server above, with a reasoning-token budget.
 - **Loading straight into reduced precision** (`LlamaSession(...; weight_storage=Luminal.Int4)`,
   or `load_weights_to_dict(...; quantize=...)`): each matmul weight is converted
   as it is read, so a model never sits in memory in Float32 (Qwen3.6-27B: ~15 GB
