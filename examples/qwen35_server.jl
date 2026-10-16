@@ -141,6 +141,12 @@ mutable struct OutParser
     lead::Bool                   # drop white space at the start of the content (the template puts "\n\n" after </think>)
     schema::Dict{String,Dict{String,String}}    # tool name -> parameter name -> JSON type
     ncalls::Int
+    tstate::Symbol               # inside a tool call: :head (before <function=>), :between (parameters), :value_str (streaming a string value), :value_hold (a typed value, emitted whole)
+    tname::String                # the tool being called
+    tparam::String               # the parameter being read
+    tfirst::Bool                 # no parameter written yet (no comma before the next one)
+    topen::Bool                  # the call's name has been sent and its arguments are not closed yet
+    nargs::Int                   # characters of arguments sent for the current call
 end
 function OutParser(thinking::Bool, tools)
     schema = Dict{String,Dict{String,String}}()
@@ -149,7 +155,7 @@ function OutParser(thinking::Bool, tools)
         props = field(field(fn, :parameters, Dict()), :properties, Dict())
         schema[String(name)] = Dict(String(k) => String(field(v, :type, "")) for (k, v) in pairs(props))
     end
-    OutParser(thinking ? :reasoning : :content, "", true, schema, 0)
+    OutParser(thinking ? :reasoning : :content, "", true, schema, 0, :head, "", "", true, false, 0)
 end
 
 partial_suffix(s::AbstractString, tag::AbstractString) = (for j in min(length(tag) - 1, length(s)):-1:1; endswith(s, tag[1:j]) && return j; end; 0)
@@ -168,7 +174,103 @@ function tool_arguments(p::OutParser, name::String, body::String)
     return "{" * join((JSON3.write(k) * ":" * (v isa AbstractString ? JSON3.write(String(v)) : JSON3.write(v)) for (k, v) in args), ",") * "}"
 end
 
-# -> a vector of (:reasoning | :content, text) and (:tool_call, (name, arguments_json))
+# s cut after its first n bytes (n is the end of a character: the held-back suffix is ASCII)
+split_bytes(s::String, n::Int) = (u = codeunits(s); (String(u[1:n]), String(u[n+1:end])))
+const PARAM_END = "\n</parameter>"
+json_fragment(x::AbstractString) = chop(JSON3.write(String(x)); head = 1, tail = 1)      # the inside of a JSON string, for a piece of a longer one
+
+# One step of the tool-call state machine on p.buf (see OutParser.tstate). True when it made progress (call again), false when it needs more text.
+function _feed_toolcall!(p::OutParser, ev, final::Bool)
+    args(t) = (push!(ev, (:tool_args, t)); p.nargs += ncodeunits(t); nothing)
+    function close_call!()
+        p.topen && (args("}"); push!(ev, (:tool_end, nothing)); p.topen = false)
+        p.tstate = :head; p.tname = ""; p.tfirst = true; p.nargs = 0
+    end
+    if p.tstate == :head
+        m = match(r"^\s*<function=([^>\n]+)>"s, p.buf)
+        i = findfirst("</tool_call>", p.buf)
+        if m === nothing
+            if i !== nothing                                         # a tool call without a function: hand it back as content
+                push!(ev, (:content, "<tool_call>" * p.buf[1:last(i)])); p.buf = p.buf[last(i)+1:end]; p.mode = :content; p.lead = true
+                return true
+            end
+            if final && !isempty(strip(p.buf))
+                push!(ev, (:content, "<tool_call>" * p.buf)); p.buf = ""
+            end
+            return false
+        end
+        p.tname = String(m[1]); p.ncalls += 1; p.topen = true; p.nargs = 0
+        push!(ev, (:tool_start, p.tname)); args("{")
+        p.buf = p.buf[m.match.ncodeunits+1:end]; p.tstate = :between
+        return true
+    elseif p.tstate == :between
+        b = lstrip(p.buf)
+        if final && isempty(b) && p.topen                           # the text ended inside the call: close it
+            close_call!(); p.mode = :content; p.buf = ""
+            return false
+        end
+        if startswith(b, "<parameter=")
+            m = match(r"^<parameter=([^>\n]+)>\n?"s, b)
+            (m === nothing || (m.match[end] == '>' && !final)) && return false      # (the tag, or the line break that may follow it, is not complete yet)
+            p.tparam = String(m[1])
+            str = get(get(p.schema, p.tname, Dict{String,String}()), p.tparam, "") == "string"
+            args((p.tfirst ? "" : ",") * JSON3.write(p.tparam) * ":" * (str ? "\"" : ""))
+            p.tfirst = false
+            p.buf = b[m.match.ncodeunits+1:end]; p.tstate = str ? :value_str : :value_hold
+            return true
+        elseif startswith(b, "</function>")
+            p.buf = b[ncodeunits("</function>")+1:end]
+            args("}"); push!(ev, (:tool_end, nothing)); p.topen = false
+            return true
+        elseif startswith(b, "</tool_call>")
+            p.buf = b[ncodeunits("</tool_call>")+1:end]
+            close_call!(); p.mode = :content; p.lead = true
+            return true
+        elseif isempty(b) || (!final && any(t -> startswith(t, b), ("<parameter=", "</function>", "</tool_call>")))
+            return false
+        elseif startswith(b, "<")                                    # (unknown tag, or the text ended inside one)
+            if final
+                close_call!(); p.mode = :content; p.buf = ""
+                return false
+            end
+            p.buf = b[nextind(b, 1):end]; return true
+        else
+            p.buf = b[nextind(b, 1):end]; return true                # stray text between parameters: dropped
+        end
+    else                                                             # a parameter's value
+        i = findfirst(PARAM_END, p.buf)
+        if p.tstate == :value_str
+            if i !== nothing
+                v = p.buf[1:first(i)-1]; isempty(v) || args(json_fragment(v)); args("\"")
+                p.buf = p.buf[last(i)+1:end]; p.tstate = :between
+                return true
+            end
+            k = final ? 0 : partial_suffix(p.buf, PARAM_END)
+            v, p.buf = split_bytes(p.buf, ncodeunits(p.buf) - k); isempty(v) || args(json_fragment(v))
+            if final
+                args("\""); close_call!(); p.mode = :content; p.buf = ""
+            end
+            return false
+        else
+            if i !== nothing
+                v = p.buf[1:first(i)-1]
+                val = v
+                try; val = JSON3.read(v); catch; end
+                args(JSON3.write(val isa AbstractString ? String(val) : val))
+                p.buf = p.buf[last(i)+1:end]; p.tstate = :between
+                return true
+            end
+            if final
+                args(JSON3.write(p.buf)); close_call!(); p.mode = :content; p.buf = ""
+            end
+            return false
+        end
+    end
+end
+
+# -> a vector of (:reasoning | :content, text) and, for a tool call, (:tool_start, name), then (:tool_args, fragment of the arguments JSON) as the
+# parameters are read (a string value streams character by character; any other type is sent once it is complete), then (:tool_end, nothing).
+# The fragments add up to what `tool_arguments` returns for the whole call.
 function feed!(p::OutParser, text::AbstractString; final::Bool=false)
     p.buf *= text
     ev = Tuple{Symbol,Any}[]
@@ -181,9 +283,7 @@ function feed!(p::OutParser, text::AbstractString; final::Bool=false)
                 continue
             end
             k = final ? 0 : partial_suffix(p.buf, "</think>")
-            cut = lastindex(p.buf) - k
-            r = p.buf[1:cut]; isempty(r) || push!(ev, (:reasoning, r))
-            p.buf = p.buf[cut+1:end]
+            r, p.buf = split_bytes(p.buf, ncodeunits(p.buf) - k); isempty(r) || push!(ev, (:reasoning, r))
             break
         elseif p.mode == :content
             p.lead && (p.buf = lstrip(p.buf); isempty(p.buf) || (p.lead = false))
@@ -194,29 +294,13 @@ function feed!(p::OutParser, text::AbstractString; final::Bool=false)
                 continue
             end
             k = final ? 0 : partial_suffix(p.buf, "<tool_call>")
-            head = p.buf[1:lastindex(p.buf)-k]
+            head = split_bytes(p.buf, ncodeunits(p.buf) - k)[1]
             c = final ? head : rstrip(head)                       # white space before a (possible) tag stays held back
             isempty(c) || push!(ev, (:content, String(c)))
             p.buf = p.buf[ncodeunits(c)+1:end]
             break
         else
-            i = findfirst("</tool_call>", p.buf)
-            if i === nothing
-                if final && !isempty(strip(p.buf))                      # unfinished: hand the text back as content
-                    push!(ev, (:content, "<tool_call>" * p.buf)); p.buf = ""
-                end
-                break
-            end
-            body = p.buf[1:first(i)-1]
-            p.buf = p.buf[last(i)+1:end]; p.mode = :content; p.lead = true
-            m = match(r"<function=([^>\n]+)>"s, body)
-            if m === nothing
-                push!(ev, (:content, "<tool_call>" * body * "</tool_call>"))
-            else
-                name = String(m[1]); p.ncalls += 1
-                push!(ev, (:tool_call, (name, tool_arguments(p, name, body))))
-            end
-            continue
+            _feed_toolcall!(p, ev, final) || break
         end
     end
     return ev
@@ -314,8 +398,8 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         end
         if t_first[] > 0 && time() - max(gen_log[], t_first[]) >= 30      # what the model is doing, for the log: a tool call is not streamed until complete
             now = time(); dt = now - max(gen_log[], t_first[])
-            held = parser.mode == :toolcall ? @sprintf(", tool call being written (%d chars held back%s)", length(parser.buf),
-                                                       (m = match(r"<function=([^>\n]+)>", parser.buf)) === nothing ? "" : ", " * m[1]) : ""
+            held = parser.mode == :toolcall ? @sprintf(", tool call being written (%s: %d chars of arguments sent, %d held back)", isempty(parser.tname) ? "?" : parser.tname,
+                                                       parser.nargs, ncodeunits(parser.buf)) : ""
             logline(@sprintf("  generating: %d tokens, %.1f tok/s over the last %.0f s | %s mode | %d chars of reasoning, %d of answer%s",
                              length(gen), (length(gen) - gen_log_n[]) / dt, dt, parser.mode, nreason[], ncontent[], held))
             gen_log[] = now; gen_log_n[] = length(gen)
@@ -459,9 +543,12 @@ function chat_handler(http::HTTP.Stream, name::String)
                     write(http, val[2] == 0 ? ": generating, $(val[1]) tokens so far" : ": prefill $(val[1])/$(val[2]) tokens", "\n\n")   # an SSE comment: no "data:" prefix
                     sse(chunk((;)))                             # an empty delta ({}): a chunk any client counts as activity, and changes no client state
                                                                 # (an empty `content` string may end the client's open reasoning block: later thinking was not shown)
-                elseif kind == :tool_call
+                elseif kind == :tool_start
                     sse(chunk((tool_calls = [(index = ncall, id = "call_" * randstring(12), type = "function",
-                                              var"function" = (name = val[1], arguments = val[2]))],)))
+                                              var"function" = (name = val, arguments = ""))],)))
+                elseif kind == :tool_args
+                    sse(chunk((tool_calls = [(index = ncall, var"function" = (arguments = val,))],)))
+                elseif kind == :tool_end
                     ncall += 1
                 elseif kind == :done
                     u = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
@@ -483,7 +570,8 @@ function chat_handler(http::HTTP.Stream, name::String)
             kind, val = take!(job.events)
             kind == :reasoning && print(reasoning, val)
             kind == :content && print(content, val)
-            kind == :tool_call && push!(calls, (id = "call_" * randstring(12), type = "function", var"function" = (name = val[1], arguments = val[2])))
+            kind == :tool_start && (push!(calls, (id = "call_" * randstring(12), type = "function", name = val, args = IOBuffer())))
+            kind == :tool_args && print(calls[end].args, val)
             if kind == :done
                 fin = val.finish; timings = val.timings; log_timings(val); usage = (prompt_tokens = val.prompt_tokens, completion_tokens = val.completion_tokens, total_tokens = val.prompt_tokens + val.completion_tokens,
                                            prompt_tokens_details = (cached_tokens = val.cached_tokens,)); break
@@ -492,7 +580,7 @@ function chat_handler(http::HTTP.Stream, name::String)
             end
         end
         msg = (role = "assistant", content = String(take!(content)), reasoning_content = String(take!(reasoning)))
-        isempty(calls) || (msg = merge(msg, (tool_calls = calls,)))
+        isempty(calls) || (msg = merge(msg, (tool_calls = [(id = c.id, type = c.type, var"function" = (name = c.name, arguments = String(take!(c.args)))) for c in calls],)))
         json_response(http, 200, (id = id, object = "chat.completion", created = created, model = name,
                                   choices = [(index = 0, message = msg, finish_reason = fin)], usage = usage, timings = timings))
     end
