@@ -6,7 +6,9 @@ project_hash = "3f3e21e0314eaf3923c43d669fc5a17729cd8342"
 
 [[deps.AMDGPU]]
 deps = ["AbstractFFTs", "AcceleratedKernels", "Adapt", "Atomix", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLD_jll", "LLVM", "LLVM_jll", "Libdl", "LinearAlgebra", "Pkg", "Preferences", "PrettyTables", "Printf", "ROCmDeviceLibs_jll", "Random", "Random123", "RandomNumbers", "SparseArrays", "SpecialFunctions", "StaticArraysCore", "Statistics", "UnsafeAtomics"]
-path = "/home/phil/devel/AMDGPU.jl"
+git-tree-sha1 = "00458e7982c96413c760a5c8630555d2a2df471a"
+repo-rev = "luminal-launch-bounds"
+repo-url = "https://github.com/philtomson/AMDGPU.jl"
 uuid = "21141c5a-9bdb-4563-92ae-f87d6854732e"
 version = "2.1.4"
 
@@ -688,7 +690,7 @@ version = "2.28.1010+0"
 [[deps.Metatheory]]
 deps = ["AutoHashEquals", "Reexport", "TermInterface", "TimerOutputs"]
 git-tree-sha1 = "2fcdf9c155e4e365d68f6729e66d1dbcc2c7d796"
-repo-rev = "b743e7597b26c9e4c1409ff389105264160ae12b"
+repo-rev = "ale/3.0"
 repo-url = "https://github.com/JuliaSymbolics/Metatheory.jl"
 uuid = "e9d8d322-4543-424a-9be4-0cc815abe26c"
 version = "3.0.0"

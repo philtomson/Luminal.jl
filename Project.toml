@@ -28,6 +28,10 @@ Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 [extensions]
 LuminalReactantExt = "Reactant"
 
+[sources]
+AMDGPU = {url = "https://github.com/philtomson/AMDGPU.jl", rev = "luminal-launch-bounds"}
+Metatheory = {url = "https://github.com/JuliaSymbolics/Metatheory.jl", rev = "ale/3.0"}
+
 [compat]
 Dates = "1.11.0"
 HTTP = "1.10"

@@ -136,11 +136,24 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 Requirements:
 - Julia 1.12.
-- For AMD GPUs: AMDGPU.jl with a working ROCm. Development uses ROCm 10.0 from
+- For AMD GPUs: a working ROCm. Development uses ROCm 10.1 from
   [TheRock](https://github.com/ROCm/TheRock) on a Radeon 8060S (gfx1151). Point
   `ROCM_PATH` and `LD_LIBRARY_PATH` at the install.
 - For NVIDIA GPUs: CUDA.jl.
-- Metatheory.jl 3.0 (`ale/3.0` branch, pinned in the Manifest) for the rewrite layer.
+- `Project.toml` has a `[sources]` section, so `Pkg.instantiate()` fetches two
+  non-registered packages from git:
+  - **Metatheory.jl 3.0**, the `ale/3.0` branch of JuliaSymbolics/Metatheory.jl
+    (the rewrite layer);
+  - **AMDGPU.jl**, the `luminal-launch-bounds` branch of
+    [philtomson/AMDGPU.jl](https://github.com/philtomson/AMDGPU.jl), a fork of
+    simeonschaub's `sds/update_wrappers` with two additions: `@roc` options
+    `flat_work_group_size` and `waves_per_eu` (HIP's `__launch_bounds__`, which the
+    128-row flash-attention kernel needs for its 252 registers), and
+    `ROCArray` bookkeeping that lets a caller release derived buffers promptly.
+    Luminal also runs on a stock AMDGPU.jl (the options are probed with
+    `@static`), but slower and with more memory held.
+  To develop AMDGPU.jl locally: `Pkg.develop(path="~/devel/AMDGPU.jl")` (do not
+  commit the resulting Manifest).
 - `ffmpeg`, only to decode audio files for Whisper.
 
 ## Examples
