@@ -224,7 +224,7 @@ Qwen3.8-27B (UD-Q4_K_XL GGUF, ~17 GB of weights) on the same GPU, through
 |-|-|
 | Cold prefill | 330-480 tok/s (75k tokens in about 3 minutes) |
 | Warm follow-up turn, first token | 3-25 s (only the new tokens are prefilled) |
-| Decode, short context | 15-20 tok/s |
+| Decode, short context | about 22 tok/s (a 30-token prompt) |
 | Decode, 70-130k tokens of context | 11-15 tok/s (2.3-2.9 tokens per speculation cycle) |
 | Context | 262144 tokens (17 GB of Float16 KV) |
 
