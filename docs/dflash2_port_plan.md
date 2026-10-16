@@ -69,18 +69,37 @@ a point mass as for MTP, which the argmax selector is).
 3. Integration into `_spec_loopN!` (block verify, adaptive block length, sampled verification, the end-of-generation checkpoint).
 4. A skinny native WMMA verify kernel if the 8-16 row GEMV verify is the bottleneck.
 
+## Stage 1 result (2026-10-16): go
+
+`benchmarks/dflash2_accept.jl` is a plain-array reference implementation of the draft (Float32, no graph compiler) run on four texts the target
+generated greedily (640 tokens each, short contexts of 30-700 tokens), with the target's hidden states after layers 6, 20, 34, 48 and 62
+(`Decoding.prefill_hiddens`). 152 blocks of 8 (seed + 7 drafts), positions every 16 tokens; "tokens per cycle" is 1 + the longest accepted prefix.
+MTP was measured on the same prompts with `generate_ids_speculative(ndraft = 0)` (adaptive 1-3 drafts).
+
+| Text | DFlash2, B = 8 | MTP greedy | MTP sampled (T 1, top-p .95, top-k 20) |
+|------|---------------:|-----------:|-----------------------------------:|
+| reasoning prose (sky and sunset) | 4.21 | 2.42 | 2.46 |
+| code (merge intervals) | 5.37 | 3.14 | 3.20 |
+| technical prose (flaky CI) | 2.34 | 2.32 | 2.25 |
+| narrative (Romeo and Juliet) | 2.45 | 2.29 | 2.09 |
+| overall | 3.59 | 2.50 | 2.44 |
+
+Accepted-length histogram (0..7 drafts): 33, 24, 33, 20, 12, 4, 6, 20. Conditional acceptance of draft j given 1..j-1: 78, 80, 65, 68, 71, 87, 77%.
+The draft's own logits rank the true token first in 80 / 67 / 48 / 39 / 33 / 25 / 24% of rows 1-7 and within the top 16 in 100 / 92 / 88 / 75 / 77 / 62 / 61%.
+
+Settled by the experiment: `target_layers` index the *output* of layer i (offset 0), the block uses rotate-half RoPE, the norm weights are used as stored (no 1 + w),
+`conv_base` is `[hidden, off, phase]`, and the selector's unary term is the raw target logit. The first run scored 1.02 tokens per cycle because of a
+reshape error in my head split (features of a head must be contiguous); with that fixed everything above matched without further tuning.
+
+What this does and does not show:
+- DFlash2 gets 1.7x MTP's tokens per cycle on reasoning prose and code, and no better than MTP on the two plainer texts. Sampled MTP is within 3% of greedy, so
+  sampling should not change the comparison much (not measured for DFlash2; the rejection scheme needs the drafter to propose a point mass, which the argmax selector does).
+- Contexts here are short. At 100k+ tokens the draft sees a 2048-row window (its training window), so acceptance could differ.
+- Cycle cost is not measured. An 8-row verify with the multi-column GEMV is extrapolated at about 167 ms (4 rows: 131 ms), and graph capture fails at 8 rows.
+  With 15-20 ms of drafting a cycle would cost about 190-200 ms against 160-185 ms for MTP, so the net decode gain is about +30% overall,
+  about +50% on reasoning prose and code, and a loss on plain prose unless the block length adapts to the recent acceptance.
+
 ## Status
 
-Stage 1 not started; the design is now settled from hipfire's code. Resolved:
-- The conv coefficients are computed **once per sublayer** from the normed input (`*_conv_proj`, 1280 values per row), and both phases use them:
-  phase 0 (offset 0) wraps the *input* of Q/K/V (attention) or of gate/up (FFN); phase 1 (offset 320 x 2) wraps the *output* of `attn_output` / `ffn_down`
-  before the residual add: `x = residual + conv1(wo(attn(...)))`. `*_conv_base` is `[phase, off, hidden]`, `dyn` is `[row, phase, off, group]`.
-- The block rows are `[seed, MASK x (B-1)]`, embedded with the **target's** token embedding table; RoPE positions for the queries are
-  `position .. position + B - 1` where `position` is the seed's position; context keys carry their own absolute positions (the last 2048).
-- The final norm is `output_norm`; rows 1..B-1 go through the **target's** `lm_head` (B-1 x 248320 logits) and the selector, anchored on the seed.
-  Row 0 (the seed) is not scored.
-- Verify feeds `[seed, d_1..d_(B-1)]`; draft d_i is accepted while the target's argmax after the previous fed token equals it.
-
-Still to settle empirically in the acceptance harness (a wrong choice shows as near-zero acceptance):
-- whether `target_layers` index the output of layer `i` (HF `hidden_states[i + 1]`) or its input;
-- the selector's unary term (raw target logit, as in hipfire, versus a scaled or log-softmax one).
+Stage 1 done (go). Next: Stage 2 (capture inside the real graphs, the fast draft pass, the loop in `_spec_loopN!`). Still open for Stage 2:
+the real-traffic acceptance at long context, the 8-row verify cost, and adaptive block length.

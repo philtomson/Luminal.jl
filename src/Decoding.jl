@@ -311,16 +311,16 @@ end
 _chunk_reuse() = get(ENV, "LUMINAL_CHUNK_REUSE", "0") == "1"
 prefill_chunk() = parse(Int, get(ENV, "LUMINAL_PREFILL_CHUNK", "512"))
 
-function _chunk_graph(s::LlamaSession, C::Int)
-    get!(s.spec, (:chunk, C)) do
+function _chunk_graph(s::LlamaSession, C::Int; extract=())
+    get!(s.spec, isempty(extract) ? (:chunk, C) : (:chunkx, C, Tuple(extract))) do
         dc = _decode_graph(s, 1)
         g = Base.invokelatest(Graph); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
         idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=1, rope_base=s.rope_base, kv_dtype=s.kv_dtype,
-                                       seq=C, want_hidden=true, head=:last)
+                                       seq=C, want_hidden=true, head=:last, extract_layers=extract)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(idg.logits_id, idg.hidden_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
-                      [idg.lens_input_id])
+                      [idg.lens_input_id], idg.extract_ids)
         wd = s.decode_weights
         if !(wd isa Type)
             by_id = Dict{Int, Type}(id => wd(name) for (name, id) in reg.mapping)
@@ -332,6 +332,41 @@ function _chunk_graph(s::LlamaSession, C::Int)
         exec = compile(g; device=s.device, retain=retain, weight_dtype=wd, free_intermediates=!_chunk_reuse())
         (exec=exec, idg=idg, cache=dc.cache)
     end
+end
+
+"""
+    prefill_hiddens(session, ids, layers; chunk=prefill_chunk()) -> Vector of (Hidden, n, 1) device arrays
+
+The residual stream after each of the (0-based) `layers`, for every token of `ids`, from a chunked prefill of `ids` from empty states (the session's
+decode cache is overwritten). The block drafter reads these as its context (see docs/dflash2_port_plan.md).
+"""
+function prefill_hiddens(s::LlamaSession, ids::Vector{Int}, layers; chunk::Int=prefill_chunk())
+    n = length(ids)
+    n + chunk <= s.max_seq || error("prefill_hiddens of $n tokens needs max_seq >= $(n + chunk)")
+    gr = _chunk_graph(s, chunk; extract=Tuple(layers)); cache = gr.cache; idg = gr.idg
+    for (i, l) in enumerate(s.model.layers)
+        NN._is_state_layer(l) && (fill!(cache.self_cache[i][1], 0); fill!(cache.self_cache[i][2], 0))
+    end
+    Hd = s.model.config.hidden
+    out = [Luminal.zero_tensor(s.device, Float32, Hd, n, 1) for _ in layers]
+    a = 0
+    while a < n
+        m = min(chunk, n - a)
+        toks = zeros(Float32, chunk, 1); toks[1:m, 1] .= ids[a+1:a+m]
+        inputs = Dict{Int, Any}(idg.token_input_id => toks, idg.pos_input_id => Float32[a], idg.lens_input_id => Float32[m])
+        for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
+            inputs[k_id] = cache.self_cache[i][1]; inputs[v_id] = cache.self_cache[i][2]
+        end
+        Luminal.CHUNK_POS_HINT[] = a
+        res = try gr.exec(inputs; device=s.device) finally Luminal.CHUNK_POS_HINT[] = -1 end
+        for (j, eid) in enumerate(idg.extract_ids)
+            view(out[j], :, a+1:a+m, :) .= view(res[eid], :, 1:m, :)
+        end
+        res = nothing
+        a += m
+        a < n && _chunk_reclaim!(s.device)
+    end
+    return out
 end
 
 # Can this session prefill in chunks?
