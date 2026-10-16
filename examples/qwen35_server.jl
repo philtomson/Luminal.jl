@@ -490,6 +490,23 @@ end
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 
+# Run `f` in a task pinned to a thread other than the main one (thread 1), whose tasks serve the HTTP clients: a blocking GPU wait on that
+# thread would starve them. (A spawned task may start on thread 1, and may migrate later: pin it.)
+function spawn_off_main_thread(f)
+    while true
+        started = Channel{Bool}(1)
+        t = Threads.@spawn begin
+            tid = Threads.threadid()
+            ok = tid != 1 && ccall(:jl_set_task_tid, Cint, (Any, Cint), current_task(), tid - 1) == 1
+            ok && (current_task().sticky = true)
+            put!(started, ok)
+            ok && f()
+        end
+        take!(started) && return t
+        wait(t)
+    end
+end
+
 function main()
     Logging.global_logger(QuietHTTP(Logging.global_logger()))
     args = filter(a -> !startswith(a, "--"), ARGS)
@@ -500,34 +517,46 @@ function main()
     use_spec = !("--no-spec" in ARGS)
     name = flag("name", splitext(basename(base))[1])
     T = "--int8" in ARGS ? Int8 : Luminal.Int4
-    f = read_gguf(base); cfg = qwen35_config(f); tok = LlamaTokenizer(f)
-    logline("loading $base")
-    W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
-    use_spec && merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = cfg.n_layers))
-    s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = parse(Int, flag("max-seq", "16384")), weights = W, decode_weights = T,
-                     kv_dtype = Float16)
-    d = use_spec ? MTPDrafter(s) : nothing
-    logline("loaded; warming up (compiles the graphs, about a minute)")
-    wid = Int.(LT.encode(tok, render_chat([(role = "user", content = "Say hello.")], nothing); bos = false))
-    for sm in (nothing, Sampler(temperature = 1.0, top_p = 0.95, top_k = 20))
-        use_spec ? (generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm); generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm)) :
-                   generate_ids(s, [wid]; max_new_tokens = 8, sampler = sm)
-    end
-    if use_spec                                    # compile the short-chunk prefill graphs (64 and 256 tokens) and the 512 one, through a throwaway cache
-        scratch = PrefixCache(min_tokens = typemax(Int))
-        for len in (20, 150, 700)
-            generate_ids_speculative(s, d, repeat(wid, cld(len, length(wid)))[1:len]; max_new_tokens = 4, ndraft = 0, prefix = scratch)
+    # All GPU work (loading, warm-up, the generation loop) runs in one task off the main thread: the HTTP server's tasks stay on the main
+    # thread, and a blocking GPU wait there would starve them (nothing is written to the clients between the end of a prefill and the end of the reply).
+    ready = Channel{Any}(1)
+    worker = spawn_off_main_thread() do
+        try
+        f = read_gguf(base); cfg = qwen35_config(f); tok = LlamaTokenizer(f)
+        logline("loading $base")
+        W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
+        use_spec && merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = cfg.n_layers))
+        s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = parse(Int, flag("max-seq", "16384")), weights = W, decode_weights = T,
+                         kv_dtype = Float16)
+        d = use_spec ? MTPDrafter(s) : nothing
+        logline("loaded; warming up (compiles the graphs, about a minute)")
+        wid = Int.(LT.encode(tok, render_chat([(role = "user", content = "Say hello.")], nothing); bos = false))
+        for sm in (nothing, Sampler(temperature = 1.0, top_p = 0.95, top_k = 20))
+            use_spec ? (generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm); generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm)) :
+                       generate_ids(s, [wid]; max_new_tokens = 8, sampler = sm)
+        end
+        if use_spec                                    # compile the short-chunk prefill graphs (64 and 256 tokens) and the 512 one, through a throwaway cache
+            scratch = PrefixCache(min_tokens = typemax(Int))
+            for len in (20, 150, 700)
+                generate_ids_speculative(s, d, repeat(wid, cld(len, length(wid)))[1:len]; max_new_tokens = 4, ndraft = 0, prefix = scratch)
+            end
+        end
+        put!(ready, s.max_seq)
+        while true
+            job = take!(JOBS)
+            job.cancel[] && continue
+            run_job!(s, d, tok, job, use_spec)
+            release_stale!(PREFIX)                       # (the replaced prefix entries: freed here, between requests, not before the first token)
+            Luminal.reclaim!(s.device)
+        end
+        catch e
+            put!(ready, e); rethrow()
         end
     end
+    max_seq = take!(ready); max_seq isa Exception && error("loading failed: " * sprint(showerror, max_seq))
     server = HTTP.serve!(http -> route(http, name), host, port; stream = true)
-    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec, context $(s.max_seq))")
-    while true
-        job = take!(JOBS)
-        job.cancel[] && continue
-        run_job!(s, d, tok, job, use_spec)
-        release_stale!(PREFIX)                       # (the replaced prefix entries: freed here, between requests, not before the first token)
-        Luminal.reclaim!(s.device)
-    end
+    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec, context $max_seq)")
+    wait(worker)
 end
 
 (abspath(PROGRAM_FILE) == (@__FILE__)) && main()
