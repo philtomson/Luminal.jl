@@ -327,6 +327,8 @@ const BUDGET_WRAPUP = "\n\nConsidering the limited thinking budget, I have to gi
 
 const PREFIX = PrefixCache()                    # the saved prefill states (see `PrefixCache`)
 const JOBS = Channel{Job}(64)
+const LAST_FULL = Ref(Int[])                    # the previous request's prompt + generated tokens (to see how much of it the next prompt repeats)
+const LAST_NP = Ref(0)                          # ... and the length of that prompt
 
 # The part of `text` after byte `sent`, cut by bytes (a decoded token list may hold a lone byte of an unfinished character, which is not valid
 # UTF-8: indexing by characters would fail), with any invalid byte shown as U+FFFD.
@@ -334,6 +336,17 @@ tail_text(text::String, sent::Int) = (t = String(codeunits(text)[sent+1:end]); i
 
 function run_job!(s, d, tok, job::Job, use_spec::Bool)
     te = time(); ids = Int.(LT.encode(tok, job.prompt; bos = false)); t_enc = time() - te
+    try                                          # (a diagnostic: could the end-of-generation state of the previous request be reused?)
+        lf = LAST_FULL[]; l = Luminal.Decoding._lcp(lf, ids); np = LAST_NP[]
+        if !isempty(lf)
+            thi = only(Int.(LT.encode(tok, "</think>"; bos = false))); ti = findfirst(==(thi), view(lf, np+1:length(lf)))
+            logline(@sprintf("  previous sequence: %d prompt + %d generated tokens (</think> at +%s); this prompt repeats %d of them (%d of the generated)%s",
+                             np, length(lf) - np, ti === nothing ? "none" : string(ti), l, max(l - np, 0),
+                             l < length(lf) ? "; first difference: previous " * repr(LT.decode(tok, lf[max(l-1,1):min(l+4,end)])) * " vs now " * repr(LT.decode(tok, ids[max(l-1,1):min(l+4,length(ids))])) : " (all)"))
+        end
+    catch e
+        logline("  previous-sequence diagnostic failed: " * sprint(showerror, e))
+    end
     t0 = time()
     logline(@sprintf("request: %d prompt tokens, up to %d new", length(ids), job.max_tokens))
     try
@@ -444,6 +457,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         cached = get(stats, :prefill_reused, 0); tf = t_first[] == 0.0 ? t1 : t_first[]
         spec = haskey(stats, :cycles) && stats[:cycles] > 0 ? spec_summary(stats) : ""
         isempty(spec) || logline("  speculation: " * spec)
+        LAST_FULL[] = vcat(ids, gen); LAST_NP[] = length(ids)
         reason == :cancel && logline(@sprintf("  cancelled: the client closed the connection after %d generated tokens (%.1f s)", length(gen), t1 - t0))
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
                                   prompt_tokens = length(ids), completion_tokens = length(gen), cached_tokens = cached,

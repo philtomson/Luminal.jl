@@ -284,7 +284,7 @@ function generate_ids_speculative(s::LlamaSession, d::MTPDrafter, prompt::Vector
     PREFILL_TIMES[:mtp_prime_save] = _tic() - t_mtp; PREFILL_TIMES[:prefill_total] = t_pf
     hook(draft, extra=0) = draft_hook === nothing ? draft : draft_hook(length(out) + extra, draft)
     h1 = H[:, n-off:n-off, :]
-    (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, on_token, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "")
+    (ndraft != 1 || sampler !== nothing) && return _spec_loopN!(s, d, y, out, h1, cache, eos_ids, hook, max_new_tokens, stats, ndraft == 0 ? maxdraft : ndraft; adaptive=ndraft == 0, sampler, on_token, fused=draft_hook === nothing && get(ENV, "LUMINAL_MTP_UNFUSED", "") == "", prefix, prompt)
     draft = hook(_mtp_step!(d, [y, y], cat(h1, h1; dims=2), 1)[1])
     vg = _verify_graph(s, 1, 2)
     cycles = accepted = 0
@@ -391,7 +391,30 @@ function _draw(sm::Sampler, idx, p)
     return idx[end] - 1
 end
 
-function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false, sampler=nothing, on_token=nothing)
+# The state after the last token fed (the prompt and every emitted token but the last, which is not fed yet) as a checkpoint of the live
+# sequence: the next request of a conversation repeats it as its prefix (its prompt is this one plus the answer and the tool results), so
+# it resumes here instead of prefilling the answer again. `emitted_pending`: the last cycle's emitted tokens when the head's K/V does not
+# cover them yet (the generation stopped before the draft step); `hid` holds the hidden states of that cycle's verify columns.
+function _save_end_ckpt!(s::LlamaSession, d::MTPDrafter, prefix::PrefixCache, prompt::Vector{Int}, out::Vector{Int}, cache, hid, nreal, K, y, emitted_pending)
+    (prefix.ckpt_every > 0 && s.kv_dtype === Float16 && length(prompt) >= prefix.min_tokens) || return 0
+    P = length(prompt) + length(out) - 1
+    cache.positions[1] == P || return 0
+    emitted_pending === nothing || _mtp_step!(d, [emitted_pending; fill(y, K - nreal)], hid, nreal)
+    states = Any[]
+    for (i, l) in enumerate(s.model.layers)
+        NN._is_state_layer(l) && push!(states, (copy(cache.self_cache[i][1]), copy(cache.self_cache[i][2])))
+    end
+    hh = Luminal.zero_tensor(s.device, Float32, s.model.config.hidden, 1, 1)
+    view(hh, :, 1:1, :) .= view(hid, :, nreal:nreal, :)
+    for k in filter(k -> k.pos == P, prefix.ckpts); _free_ckpt!(k); end
+    filter!(k -> k.pos != P, prefix.ckpts)
+    push!(prefix.ckpts, StateCkpt(P, states, hh)); sort!(prefix.ckpts, by = k -> k.pos)
+    prefix.live = vcat(prompt, out[1:end-1]); prefix.live_mtp = P - 1
+    return P
+end
+
+function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, h1, cache, eos_ids, hook, max_new_tokens, stats, ND::Int; adaptive::Bool=false, fused::Bool=false, sampler=nothing, on_token=nothing,
+                     prefix::Union{Nothing,PrefixCache}=nothing, prompt::Vector{Int}=Int[])
     K = ND + 1
     q = fill(0.7, ND)                                                 # conditional acceptance of draft j given 1..j-1 were
     sel = zeros(Int, ND)                                              # cycles run with each draft count
@@ -418,6 +441,7 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
     cycles = 0
     acc = zeros(Int, ND)                                              # acc[j]: cycles in which drafts 1..j were all accepted
     tm = zeros(3)
+    hid_last = nothing; nreal_last = 0; K_last = K; pending_mtp = false     # (for the end-of-generation checkpoint)
     while length(out) < max_new_tokens
         cache.positions[1] + K <= s.max_seq || break
         ND_c = K - 1; sel[ND_c] += 1
@@ -441,17 +465,25 @@ function _spec_loopN!(s::LlamaSession, d::MTPDrafter, y::Int, out::Vector{Int}, 
         end
         nreal = m + 1
         append!(out, emitted)
-        on_token !== nothing && on_token(emitted) && break
         cache.positions[1] += nreal
-        nreal < K && _rollback_states!(s, vg; slot=nreal)
+        nreal < K && _rollback_states!(s, vg; slot=nreal)           # (also when on_token stops the generation: the states then match the tokens fed)
         y = emitted[end]
-        any(e -> e in eos_ids, emitted) && break
+        hid_last = hid; nreal_last = nreal; K_last = K
+        if (on_token !== nothing && on_token(emitted)) || any(e -> e in eos_ids, emitted)
+            pending_mtp = true; break
+        end
         t2 = time_ns(); tm[3] += (t2 - t1) / 1e9
         ndn = adaptive ? _best_ndraft(q, ND, costs) : ND
         ds = draft_chain!([emitted; fill(y, K - nreal)], hid, nreal, ndn)
         K = ndn + 1
         vg = _verify_graph(s, 1, K)
         tm[2] += (time_ns() - t2) / 1e9
+    end
+    if prefix !== nothing && hid_last !== nothing && get(ENV, "LUMINAL_END_CKPT", "1") != "0"
+        t_ck = time()
+        pend = pending_mtp ? out[end - nreal_last + 1:end] : nothing
+        P = _save_end_ckpt!(s, d, prefix, prompt, out, cache, hid_last, nreal_last, K_last, y, pend)
+        stats === nothing || (stats[:end_ckpt] = P; stats[:end_ckpt_s] = time() - t_ck)
     end
     k = findfirst(t -> t in eos_ids, out)
     k === nothing || (out = out[1:k])
