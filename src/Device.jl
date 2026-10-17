@@ -8,7 +8,7 @@ using GPUArrays
  
 export AbstractDevice, CPUDevice, AbstractGPUDevice, CUDADevice, AMDDevice, 
        get_device, to_device, from_device, execute_with_capture,
-       reclaim!, available_memory, zero_tensor, uninit_tensor, synchronize_device
+       reclaim!, hostgc, available_memory, zero_tensor, uninit_tensor, synchronize_device
  
 abstract type AbstractDevice end
  
@@ -118,7 +118,19 @@ reclaim!(::CUDADevice) = CUDA.reclaim()
 # AMDGPU.jl keeps freed buffers in HIP's stream-ordered memory pool (up to a high
 # release threshold); on an APU that is system RAM the rest of the machine can't
 # use. Collect garbage, then trim the pool.
-reclaim!(::AMDDevice) = (GC.gc(); AMDGPU.HIP.reclaim(); nothing)
+# A collection even while automatic collection is off (`GC.enable(false)` makes `GC.gc()` a no-op). The server runs with automatic collection off and collects
+# only from its GPU worker thread: a finalizer that frees GPU memory (`hipFreeAsync`) on another thread while the worker launches a graph (`hipGraphLaunch`)
+# deadlocks inside the HIP runtime (two threads each holding a lock the other wants).
+function hostgc(full::Bool = false)
+    was = GC.enable(true)
+    try
+        GC.gc(full)
+    finally
+        GC.enable(was)
+    end
+    return nothing
+end
+reclaim!(::AMDDevice) = (hostgc(true); AMDGPU.HIP.reclaim(); nothing)
  
 """
     available_memory(device)
@@ -236,7 +248,7 @@ function _capture_hip_graph(f)
     # No GC inside the capture: collected GPU arrays are freed with stream-ordered
     # frees, which would be recorded into the graph and replayed. Collect first so
     # pending finalizers run now, outside the capture.
-    GC.gc()
+    hostgc(true)
     _destroy_dead_graphs()
     AMDGPU.synchronize()
     gc_was_enabled = GC.enable(false)

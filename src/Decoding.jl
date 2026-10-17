@@ -12,7 +12,7 @@ using AMDGPU
 using JSON3
 using Random
 
-export PrefixCache, release_stale!, Sampler, sample_token, greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative
+export PrefixCache, release_stale!, Sampler, sample_token, greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative, DFlash2, dflash_append!, dflash_append_rows!, dflash_draft!, generate_ids_dflash
 
 """
     weight_preset(name) -> (weight name -> Type)
@@ -199,17 +199,19 @@ end
 # after the first token (snapshot buffers `snaps`, for rolling a rejected draft back), and the final
 # residual stream (Hidden, seq, B) returned for the MTP head. It runs on the same cache arrays as the
 # plain decode step of batch B.
-function _verify_graph(s::LlamaSession, B::Int, seq::Int)
-    get!(s.spec, (:verify, B, seq)) do
+function _verify_graph(s::LlamaSession, B::Int, seq::Int; extract=())
+    get!(s.spec, isempty(extract) ? (:verify, B, seq) : (:verifyx, B, seq, Tuple(extract))) do
         dc = _decode_graph(s, B)
         g = Base.invokelatest(Graph); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
         idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype,
-                                       seq=seq, snapshots=seq - 1, want_hidden=true, want_argmax=true)
+                                       seq=seq, snapshots=seq - 1, want_hidden=true, want_argmax=true, extract_layers=extract)
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(idg.logits_id, idg.hidden_id, idg.argmax_id, idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
                       idg.lens_input_id == 0 ? Int[] : [idg.lens_input_id],
-                      [i for ab in idg.snap_ids for i in ab])
+                      [i for ab in idg.snap_ids for i in ab], idg.extract_ids)
+        # (more than 4 rows: past the split-K decode attention's 24 query rows per KV head the attention takes the prefill kernel, which reads the positions back
+        # to the host and so cannot be captured in a HIP graph)
         capture = s.device isa Luminal.AMDDevice
         wd = s.decode_weights
         if !(wd isa Type)
@@ -232,6 +234,11 @@ end
 # (0-based, host); the cache has the new K/V, the recurrent states are at the end of the `seq` tokens,
 # and `snaps` hold them after the first token.
 function _verify_step!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
+    res = _verify_run!(s, vg, tokens)
+    return res[vg.idg.logits_id], res[vg.idg.hidden_id], Int.(Array(res[vg.idg.argmax_id]))
+end
+# ... the executor's results, for callers that also want the extracted layer outputs (`idg.extract_ids`)
+function _verify_run!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
     cache = vg.cache; idg = vg.idg
     inputs = Dict{Int, Any}()
     inputs[idg.token_input_id] = Float32.(tokens)
@@ -246,8 +253,7 @@ function _verify_step!(s::LlamaSession, vg, tokens::AbstractMatrix{<:Integer})
         j += 1
         inputs[idg.snap_ids[j][1]] = vg.snaps[j][1]; inputs[idg.snap_ids[j][2]] = vg.snaps[j][2]
     end
-    res = vg.exec(inputs; device=s.device)
-    return res[idg.logits_id], res[idg.hidden_id], Int.(Array(res[idg.argmax_id]))
+    return vg.exec(inputs; device=s.device)
 end
 
 # Roll the recurrent states back to their snapshots (the state after the first verified token).
@@ -305,7 +311,7 @@ function _chunk_reclaim!(device)
     mode = get(ENV, "LUMINAL_CHUNK_GC", "young")
     mode == "full" && return Luminal.reclaim!(device)
     mode == "none" && return nothing
-    GC.gc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim()
+    Luminal.hostgc(false); device isa Luminal.AMDDevice && AMDGPU.HIP.reclaim()
     return nothing
 end
 _chunk_reuse() = get(ENV, "LUMINAL_CHUNK_REUSE", "0") == "1"
@@ -416,13 +422,14 @@ mutable struct PrefixCache
     stale::Vector{PrefixEntry}        # replaced entries, freed at the next prefill (the resumed one is still read after this one)
     live::Vector{Int}                 # the prompt whose K/V (below its length) the live cache holds: an entry that it starts with needs no K/V copied back
     live_mtp::Int                     # how many MTP pairs (positions) of the live MTP cache are valid for `live`
+    live_df::Int                      # how many context rows of the block drafter's ring (DFlash2) are valid for `live` (rows below this count)
     mtp_live::Bool                    # the entry resumed by the last prefill needs no MTP K/V copied back either
     ckpts::Vector{StateCkpt}          # state checkpoints along the live prompt, ascending position
     ckpt_every::Int                   # distance between checkpoints (0: none)
     resumed_kind::Symbol              # what the last prefill resumed from: :sys, :turn, :ckpt or :none
 end
 PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024, ckpt_every::Int=parse(Int, get(ENV, "LUMINAL_CKPT_EVERY", "4096"))) =
-    PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, false, StateCkpt[], ckpt_every, :none)
+    PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, 0, false, StateCkpt[], ckpt_every, :none)
 
 function _free_ckpt!(k::StateCkpt)
     for (a, b) in k.states; Luminal._free_now!(a); Luminal._free_now!(b); end
@@ -473,7 +480,7 @@ end
 # unless a `prefix` entry was resumed: then its last position is the first column), and off.
 # prefix / prefix_at: see `PrefixCache`; need_mtp: only resume entries that carry the MTP head's K/V.
 function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=prefill_chunk(), prefix::Union{Nothing,PrefixCache}=nothing, prefix_at=Int[],
-                           need_mtp::Bool=false, on_progress=nothing)
+                           need_mtp::Bool=false, on_progress=nothing, dflash=nothing)
     n = length(prompt)
     n < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
@@ -484,20 +491,25 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     tails = get(ENV, "LUMINAL_TAIL_CHUNKS", "1") == "0" ? () : Tuple(c for c in (64, 256) if c < chunk)     # smaller graphs for a short last chunk (a padded 512-token one costs ~2 s at 120k context)
     Hd = s.model.config.hidden
     best = nothing
+    # A block drafter (DFlash2) needs the context rows of the last _DF_WIN prompt tokens: the prefill may only resume at a position from which
+    # the rows it does not recompute are in the ring (valid for the live prompt below `rv`), or before the window.
+    c = prefix === nothing ? 0 : min(_lcp(prompt, prefix.live), n - 1)       # the live K/V holds this prompt's first c tokens
+    # (the ring keeps only the latest _DF_WIN rows: if it has advanced past n - _DF_WIN the rows of this prompt's window below its end are gone, so then only a resume before the window works)
+    ring_ok = dflash !== nothing && prefix !== nothing && dflash.nrows <= n ? min(prefix.live_df, c, dflash.nrows) : 0
+    resume_max = dflash === nothing ? n : max(ring_ok, n - _DF_WIN)
     if prefix !== nothing
         release_stale!(prefix)
         prefix.pending = PrefixEntry[]; prefix.resumed = nothing
         for e in prefix.entries
             L = length(e.ids)
-            L < n && (!need_mtp || e.mtp !== nothing) && (best === nothing || L > length(best.ids)) && view(prompt, 1:L) == e.ids && (best = e)
+            L < n && L <= resume_max && (!need_mtp || e.mtp !== nothing) && (best === nothing || L > length(best.ids)) && view(prompt, 1:L) == e.ids && (best = e)
         end
     end
     ck = nothing                                             # a state checkpoint of the live prompt further along than any entry
     if prefix !== nothing
-        c = min(_lcp(prompt, prefix.live), n - 1)            # the live K/V holds this prompt's first c tokens
         for k in filter(k -> k.pos > c, prefix.ckpts); _free_ckpt!(k); end
         filter!(k -> k.pos <= c, prefix.ckpts); sort!(prefix.ckpts, by = k -> k.pos)
-        i = findlast(k -> (!need_mtp || prefix.live_mtp >= k.pos - 1) && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0", prefix.ckpts)
+        i = findlast(k -> k.pos <= resume_max && (!need_mtp || prefix.live_mtp >= k.pos - 1) && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0", prefix.ckpts)
         i !== nothing && (best === nothing || prefix.ckpts[i].pos > length(best.ids)) && (ck = prefix.ckpts[i])
         prefix.resumed_kind = ck !== nothing ? :ckpt : best !== nothing ? best.kind : :none
     end
@@ -506,7 +518,11 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     skip_kv = ck !== nothing || (best !== nothing && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0" && length(prefix.live) >= a && view(prefix.live, 1:a) == best.ids)   # the live K/V already is the entry's
     mtp_live = skip_kv && prefix.live_mtp >= a - 1
     ck !== nothing && (best = nothing)
-    prefix === nothing || (prefix.live = Int[]; prefix.live_mtp = 0)           # (until this prefill is done)
+    prefix === nothing || (prefix.live = Int[]; prefix.live_mtp = 0; prefix.live_df = 0)           # (until this prefill is done)
+    if dflash !== nothing
+        dflash.nrows = max(a, n - _DF_WIN)                  # the ring holds the rows below `a` (when a > n - WIN); the chunks below append the rest of the window
+        dfhooks = Tuple(dflash.target_layers)
+    end
     Hall = Luminal.zero_tensor(s.device, Float32, Hd, n - off, 1)
     logits = nothing
     j = 0
@@ -548,7 +564,9 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
             p > a && (m = min(m, p - a); break)              # chunks end at the positions to save
         end
         Cc = something(findfirst(c -> m <= c, tails), 0) == 0 ? chunk : tails[findfirst(c -> m <= c, tails)]
-        gr = Cc == chunk ? gr0 : _chunk_graph(s, Cc); idg = gr.idg
+        wstart = n - _DF_WIN
+        dfx = dflash !== nothing && a + m > wstart
+        gr = dfx ? _chunk_graph(s, Cc; extract = dfhooks) : (Cc == chunk ? gr0 : _chunk_graph(s, Cc)); idg = gr.idg
         toks = zeros(Float32, Cc, 1); toks[1:m, 1] .= prompt[a+1:a+m]
         inputs = Dict{Int, Any}(idg.token_input_id => toks, idg.pos_input_id => Float32[a], idg.lens_input_id => Float32[m])
         for (i, (k_id, v_id)) in enumerate(zip(idg.self_k_ids, idg.self_v_ids))
@@ -557,6 +575,10 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         Luminal.CHUNK_POS_HINT[] = a                    # (see chunk_attention!)
         res = try gr.exec(inputs; device=s.device) finally Luminal.CHUNK_POS_HINT[] = -1 end
         view(Hall, :, a+1-off:a+m-off, :) .= view(res[idg.hidden_id], :, 1:m, :)
+        if dfx                                              # the rows of this chunk inside the window go into the drafter's ring
+            lo = max(a, wstart) - a + 1
+            dflash_append!(dflash, [res[eid][:, lo:m, 1] for eid in idg.extract_ids], a + lo - 1)
+        end
         a + m == n && (logits = Array{Float32}(res[idg.logits_id]))
         a += m
         for (kind, p) in points
@@ -586,7 +608,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
         on_progress === nothing || on_progress(a, n)
     end
     cache.positions .= n
-    prefix === nothing || (prefix.live = copy(prompt))                       # the live K/V below n is this prompt's (MTP: set once primed)
+    prefix === nothing || (prefix.live = copy(prompt); prefix.live_df = dflash === nothing ? 0 : n)       # the live K/V below n is this prompt's (MTP: set once primed)
     PREFILL_TIMES[:chunks] = _tic() - t_chunks - get(PREFILL_TIMES, :save, 0.0)
     t_reg = time()
     prefix === nothing || _register!(prefix, prefix.pending, best)
@@ -966,5 +988,7 @@ export transcribe, WhisperSession
 include("AWQ.jl")
 
 include("Speculative.jl")
+include("DFlash.jl")
+include("DFlashLoop.jl")
 
 end # module Decoding
