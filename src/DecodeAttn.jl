@@ -120,10 +120,13 @@ function _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK, ::Val{TR}) where {TR}
     return
 end
 
-function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0, Gq, ::Val{D}, ::Val{QR}, ::Val{Q8}) where {D, QR, Q8}
+function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0, Gq, rep, ::Val{D}, ::Val{QR}, ::Val{Q8}) where {D, QR, Q8}
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; hh = l ÷ 16; w = tid ÷ 32
-    c = workgroupIdx().x - 1; kvh = workgroupIdx().y - 1; b = workgroupIdx().z - 1
+    # rep > 1: the query heads of a KV group are split in `rep` groups of Gq (the heads of a workgroup), so that a many-token step still fits the LDS; the
+    # groups of one key chunk are adjacent workgroups, which read the same K/V (the second read comes from the cache). vg: the (KV group, head group) index.
+    xi = workgroupIdx().x - 1; c = xi ÷ rep; half = xi % rep
+    kvh = workgroupIdx().y - 1; vg = kvh * rep + half; b = workgroupIdx().z - 1
     pos = unsafe_trunc(Int, @inbounds posv[length(posv) == 1 ? 1 : b + 1])
     nmax = pos + S                           # slots 1..n are attended (the new tokens are already in the cache)
     k0 = c * DA_CH
@@ -140,7 +143,7 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0,
     idx = tid
     while idx < 32 * D
         rr = idx ÷ D; d = idx % D
-        @inbounds qs[_da_dperm(d, Val(Q8)) + 1, rr + 1] = rr < QR ? Float16(Qa[d + 1, rr ÷ Gq + 1 + t0, kvh * Gq + rr % Gq + 1, b + 1]) : Float16(0)
+        @inbounds qs[_da_dperm(d, Val(Q8)) + 1, rr + 1] = rr < QR ? Float16(Qa[d + 1, rr ÷ Gq + 1 + t0, vg * Gq + rr % Gq + 1, b + 1]) : Float16(0)
         idx += 256
     end
     if Q8
@@ -201,7 +204,7 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0,
     end
     sync_workgroup()
     if QR > 12
-        _da_vhalf!(WO, scT, Vp, tid, min(nmax - k0, DA_CH), k0, c, kvh, b, Val(D), Val(QR))
+        _da_vhalf!(WO, scT, Vp, tid, min(nmax - k0, DA_CH), k0, c, kvh, vg, b, Val(D), Val(QR))
     else
         # out[row, d] = sum_key p[row, key] V[d, key]: thread (dp, g) takes the key subset g, d pair dp
         ndp = D ÷ 2
@@ -241,20 +244,20 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0,
         end
         if g == 0
             @unroll for q in 1:QR
-                @inbounds WO[2dp + 1, q, c + 1, kvh + 1, b + 1] = a0[q]
-                @inbounds WO[2dp + 2, q, c + 1, kvh + 1, b + 1] = a1[q]
+                @inbounds WO[2dp + 1, q, c + 1, vg + 1, b + 1] = a0[q]
+                @inbounds WO[2dp + 2, q, c + 1, vg + 1, b + 1] = a1[q]
             end
         end
     end
     if tid < QR
-        @inbounds WM[tid + 1, c + 1, kvh + 1, b + 1] = mq[tid + 1]
-        @inbounds WL[tid + 1, c + 1, kvh + 1, b + 1] = lq[tid + 1]
+        @inbounds WM[tid + 1, c + 1, vg + 1, b + 1] = mq[tid + 1]
+        @inbounds WL[tid + 1, c + 1, vg + 1, b + 1] = lq[tid + 1]
     end
     return
 end
 # Many rows (QR > 12, D = 256): two thread groups, each takes half of the rows and all the keys (half the accumulators a thread
 # and no reduction across groups; the two groups read the same V). Thread (dp, g): head dims 2dp, 2dp + 1, rows g*QH + 1..
-function _da_vhalf!(WO, scT, Vp, tid, nv, k0, c, kvh, b, ::Val{D}, ::Val{QR}) where {D, QR}
+function _da_vhalf!(WO, scT, Vp, tid, nv, k0, c, kvh, vg, b, ::Val{D}, ::Val{QR}) where {D, QR}
     QH = (QR + 1) ÷ 2
     dp = tid % (D ÷ 2); g = tid ÷ (D ÷ 2)
     r0 = g * QH
@@ -276,8 +279,8 @@ function _da_vhalf!(WO, scT, Vp, tid, nv, k0, c, kvh, b, ::Val{D}, ::Val{QR}) wh
     end
     @unroll for q in 1:QH
         if r0 + q <= QR
-            @inbounds WO[2dp + 1, r0 + q, c + 1, kvh + 1, b + 1] = a0[q]
-            @inbounds WO[2dp + 2, r0 + q, c + 1, kvh + 1, b + 1] = a1[q]
+            @inbounds WO[2dp + 1, r0 + q, c + 1, vg + 1, b + 1] = a0[q]
+            @inbounds WO[2dp + 2, r0 + q, c + 1, vg + 1, b + 1] = a1[q]
         end
     end
     return
@@ -365,9 +368,16 @@ function decode_attention_split!(out, q, pk, pv, kn, vn, posv, scale::Float32, w
     D, S, H, B = size(q, 1), size(q, 2), size(q, 3), size(q, 4)
     KVH = size(pk, 3); T = size(pk, 2)
     (D in (128, 256) && H % KVH == 0 && size(pk, 1) == D + (q8 ? DA_Q8_PAD : 0) && cld(T, DA_CH) <= 1024) || return false
-    Gq = H ÷ KVH
-    tc = DA_MAX_ROWS ÷ Gq                     # tokens per launch (the LDS holds DA_MAX_ROWS query rows per KV head); a step of up to 2 launches (<= 8 tokens) is split
-    tc >= 1 && (S <= tc || S <= DA_MAX_TOKENS) || return false
+    Gphys = H ÷ KVH
+    # a step whose rows (tokens x heads of a KV group) do not fit the LDS: split the group's heads over `rep` workgroups (single pass over the cache), or, failing that,
+    # split the tokens over several launches (a pass over the cache each)
+    S <= DA_MAX_TOKENS || return false
+    divs = [r for r in 1:Gphys if Gphys % r == 0]
+    ri = findfirst(r -> S * (Gphys ÷ r) <= DA_MAX_ROWS, divs)
+    rep = ri === nothing ? 1 : divs[ri]
+    Gq = Gphys ÷ rep                          # heads per workgroup
+    tc = DA_MAX_ROWS ÷ Gq                     # tokens per launch
+    tc >= 1 || return false
     QR = min(S, tc) * Gq
     QR <= DA_MAX_ROWS && (QR <= 12 || D == 256) || return false
     Ksc = Vsc = posv                          # (unused placeholders unless the cache is int8)
@@ -385,11 +395,11 @@ function decode_attention_split!(out, q, pk, pv, kn, vn, posv, scale::Float32, w
     for t0 in 0:tc:S-1
         sc = min(tc, S - t0)                  # this launch's tokens
         QRc = sc * Gq
-        WO, WM, WL = get!(DA_WS, (typeof(out), D, nsplit, KVH, B, QRc)) do
-            (AMDGPU.zeros(Float32, D, QRc, nsplit, KVH, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH, B))
+        WO, WM, WL = get!(DA_WS, (typeof(out), D, nsplit, KVH * rep, B, QRc)) do
+            (AMDGPU.zeros(Float32, D, QRc, nsplit, KVH * rep, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH * rep, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH * rep, B))
         end
-        @roc groupsize=256 gridsize=(nsplit, KVH, B) _da_part_kernel!(
-            WO, WM, WL, q4, Kv, Vp, Ksc, Vsc, posv, scale * 1.4426950408889634f0, S, t0, Gq, Val(D), Val(QRc), Val(q8))
+        @roc groupsize=256 gridsize=(rep * nsplit, KVH, B) _da_part_kernel!(
+            WO, WM, WL, q4, Kv, Vp, Ksc, Vsc, posv, scale * 1.4426950408889634f0, S, t0, Gq, rep, Val(D), Val(QRc), Val(q8))
         @roc groupsize=256 gridsize=(H, sc * B) _da_merge_kernel!(o4, WO, WM, WL, posv, sc, t0, Gq)
     end
     return true

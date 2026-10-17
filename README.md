@@ -121,12 +121,13 @@ LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl \
   |-|----------------|
   | short context, predictable text (tool calls, chat) | +25-35%, up to 2x on tool calls |
   | 40k tokens of context, reasoning text | +9-18% |
-  | 40k tokens of context, new code | about even |
+  | 40k tokens of context, new code | +11-18% |
 
   It emits 1.4-1.7x as many tokens per cycle, but an 8-row verify costs more than
-  MTP's 2-4 rows, especially at long context (the attention reads the KV cache
-  twice), so the default stays MTP. The warm-up compiles one verify graph per block
-  length and takes about 2 minutes. Not combined with `--no-spec`.
+  MTP's 2-4 rows, so the gain shrinks with context length (not measured beyond 40k
+  tokens). The default stays MTP until it has run longer on real traffic. The warm-up
+  compiles one verify graph per block length and takes about 2 minutes. Not combined
+  with `--no-spec`.
 - `--reasoning-budget=N` limits the thinking: after N reasoning tokens the server
   closes the `<think>` block with a short wrap-up and the model answers from what
   it has (the resume costs a re-prefill of the new turn, about 10-20 s at N = 4096).
