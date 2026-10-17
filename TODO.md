@@ -814,7 +814,7 @@ loads, unrolling and staging K alone in LDS (-11% at 130k, nothing at 32k) did n
 for its kernel on this chip; ours is at ~11, so there is probably more (its 16-key tile also avoids the cross-wave max exchange; the
 causal-tail exactness fix and `__launch_bounds__(256, 2)` occupancy control are things we do not have).
 
-### Launch bounds from Julia: our AMDGPU.jl branch (`~/devel/AMDGPU.jl`, branch `luminal-launch-bounds`, commit e4fa557)
+### (Superseded: Luminal now uses `philtomson/AMDGPU.jl#luminal-upstream`, current upstream plus `waves_per_eu` and `DERIVE_SCOPE`; see the README.) Launch bounds from Julia: our old AMDGPU.jl branch (`~/devel/AMDGPU.jl`, branch `luminal-launch-bounds`, commit e4fa557)
 AMDGPU.jl never sets `amdgpu-flat-work-group-size` / `amdgpu-waves-per-eu`, so LLVM assumes 1024-thread workgroups and caps every kernel at
 192 VGPRs (wave32). The branch adds compiler options `flat_work_group_size` and `waves_per_eu` (`@roc ... flat_work_group_size=256 k(...)`),
 based on the exact commit Luminal's Manifest used (`simeonschaub/AMDGPU.jl#sds/update_wrappers` @ ba948d9). Pushed as `philtomson/AMDGPU.jl#luminal-launch-bounds`, which Project.toml `[sources]` and the Manifest now use.
