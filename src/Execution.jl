@@ -1014,12 +1014,8 @@ function _launch_delta_reg!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale
     nt = cld(DELTA_REG_LANES * dv, 32) * 32
     args = (out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, Val(dk ÷ DELTA_REG_LANES), Val(snap_t > 0),
             Val(cld(DELTA_REG_CHUNK * dk, nt)), Val(cld(DELTA_REG_CHUNK * dv, nt)))   # loads per thread of a chunk's q / k and v
-    @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
-        wpe = dk == 128 ? 12 : 1
-        @roc groupsize=nt gridsize=nv * B flat_work_group_size=nt waves_per_eu=wpe _delta_rule_reg_kernel!(args...)
-    else
-        @roc groupsize=nt gridsize=nv * B _delta_rule_reg_kernel!(args...)
-    end
+    wpe = dk == 128 ? 12 : 1
+    @roc_bounded nt wpe groupsize=nt gridsize=nv * B _delta_rule_reg_kernel!(args...)
     return nothing
 end
 

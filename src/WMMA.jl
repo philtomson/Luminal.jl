@@ -994,11 +994,9 @@ end
 
 # `wpe` > 0 bounds the registers per thread (waves per SIMD) when AMDGPU.jl has the launch-bounds options
 function _launch_q4(kern, args, nthreads, grid, wpe)
-    @static if :waves_per_eu in AMDGPU.COMPILER_KWARGS
-        if wpe > 0
-            @roc groupsize=nthreads gridsize=grid flat_work_group_size=nthreads waves_per_eu=wpe kern(args...)
-            return nothing
-        end
+    if HAS_WAVES_PER_EU && wpe > 0
+        @roc_bounded nthreads wpe groupsize=nthreads gridsize=grid kern(args...)
+        return nothing
     end
     @roc groupsize=nthreads gridsize=grid kern(args...)
     return nothing
