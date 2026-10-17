@@ -2544,6 +2544,7 @@ function _wmma_nat_gemm!(C, W::NativeWeight, B, residual)
     return true
 end
 
+const NAT_D2_COLS = Ref(parse(Int, get(ENV, "LUMINAL_NAT_D2_COLS", "8")))      # columns per pass of the Float16 dot2 GEMV (1..8)
 function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
     M, K = size(W)
     N = length(B) ÷ K
@@ -2573,8 +2574,8 @@ function _nat_matmul!(C, W::NativeWeight, B; residual = nothing)
         X16 .= Base.reshape(Bc, K, N)
         Xq = Base.reshape(reinterpret(NTuple{4, UInt32}, vec(X16)), K ÷ 8, N)
         while c0 < N
-            nc = min(4, N - c0)
-            vc = nc == 4 ? Val(4) : nc == 3 ? Val(3) : nc == 2 ? Val(2) : Val(1)
+            nc = min(NAT_D2_COLS[], N - c0)
+            vc = nc >= 8 ? Val(8) : nc == 7 ? Val(7) : nc == 6 ? Val(6) : nc == 5 ? Val(5) : nc == 4 ? Val(4) : nc == 3 ? Val(3) : nc == 2 ? Val(2) : Val(1)
             @roc groupsize=256 gridsize=cld(M, 32) _nat_gemvD_kernel!(Y, Wq, _nat_meta(W), _nat_blk(W), Xq, K ÷ 32, M, c0, R, RES, Val(_nat_fmt(W)), vc)
             c0 += nc
         end
