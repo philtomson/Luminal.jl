@@ -20,6 +20,7 @@ using AMDGPU
 using KernelAbstractions.Extras: @unroll
 
 const DA_CH = 256                # keys per workgroup
+const DA_MAX_TOKENS = 8            # a step of more tokens takes the prefill attention
 const DA_MAX_ROWS = 24           # S * Gq limit (LDS; 4 tokens x 6 query heads per KV head)
 const DA_Q8_PAD = 16             # bytes appended to an int8 cache row (the Float32 scale + padding to 16 B)
 const _DA_NEG1152 = 0xe480e480   # -1152 in f16 pairs
@@ -119,7 +120,7 @@ function _kv_dequant_kernel!(kt, vt, pk, pv, ksc, vsc, NK, ::Val{TR}) where {TR}
     return
 end
 
-function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, Gq, ::Val{D}, ::Val{QR}, ::Val{Q8}) where {D, QR, Q8}
+function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0, Gq, ::Val{D}, ::Val{QR}, ::Val{Q8}) where {D, QR, Q8}
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; hh = l ÷ 16; w = tid ÷ 32
     c = workgroupIdx().x - 1; kvh = workgroupIdx().y - 1; b = workgroupIdx().z - 1
@@ -139,7 +140,7 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, Gq,
     idx = tid
     while idx < 32 * D
         rr = idx ÷ D; d = idx % D
-        @inbounds qs[_da_dperm(d, Val(Q8)) + 1, rr + 1] = rr < QR ? Float16(Qa[d + 1, rr ÷ Gq + 1, kvh * Gq + rr % Gq + 1, b + 1]) : Float16(0)
+        @inbounds qs[_da_dperm(d, Val(Q8)) + 1, rr + 1] = rr < QR ? Float16(Qa[d + 1, rr ÷ Gq + 1 + t0, kvh * Gq + rr % Gq + 1, b + 1]) : Float16(0)
         idx += 256
     end
     if Q8
@@ -163,7 +164,7 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, Gq,
         for i in 0:7
             row = 16rt + 2i + hh
             if row < QR
-                n = pos + row ÷ Gq + 1            # this row's token attends slots 1..n
+                n = pos + row ÷ Gq + t0 + 1       # this row's token attends slots 1..n
                 @inbounds scT[klA * QR + row + 1] = k0 + klA < n ? scA[i + 1].value * s2A : -1f30
                 @inbounds scT[klB * QR + row + 1] = k0 + klB < n ? scB[i + 1].value * s2B : -1f30
             end
@@ -284,13 +285,13 @@ end
 @inline _da_add_exch(a::NTuple{N,Float32}, exch, off, D) where {N} = ntuple(q -> a[q] + @inbounds(exch[(q - 1) * D + off]), Val(N))
 
 # one workgroup per (head, token, sequence): out[:, h, s, b] = the chunks' outputs weighted by exp2(m_c - M) / L
-function _da_merge_kernel!(out, WO, WM, WL, posv, S, Gq)
+function _da_merge_kernel!(out, WO, WM, WL, posv, S, t0, Gq)
     tid = workitemIdx().x - 1
     h = workgroupIdx().x - 1; sb = workgroupIdx().y - 1
     s = sb % S + 1; b = sb ÷ S
     D = size(out, 1)
     pos = unsafe_trunc(Int, @inbounds posv[length(posv) == 1 ? 1 : b + 1])
-    nv = cld(pos + s, DA_CH)
+    nv = cld(pos + s + t0, DA_CH)
     kvh = h ÷ Gq; row = (s - 1) * Gq + h % Gq
     fc = @ROCStaticLocalArray(Float32, (1024,), false)
     red = @ROCStaticLocalArray(Float32, (8,), false)
@@ -349,7 +350,7 @@ function _da_merge_kernel!(out, WO, WM, WL, posv, S, Gq)
             @inbounds acc += fc[c + 1] * WO[tid + 1, row + 1, c + 1, kvh + 1, b + 1]
             c += 1
         end
-        @inbounds out[tid + 1, h + 1, s, b + 1] = acc * stat[1]
+        @inbounds out[tid + 1, h + 1, s + t0, b + 1] = acc * stat[1]
     end
     return
 end
@@ -365,7 +366,9 @@ function decode_attention_split!(out, q, pk, pv, kn, vn, posv, scale::Float32, w
     KVH = size(pk, 3); T = size(pk, 2)
     (D in (128, 256) && H % KVH == 0 && size(pk, 1) == D + (q8 ? DA_Q8_PAD : 0) && cld(T, DA_CH) <= 1024) || return false
     Gq = H ÷ KVH
-    QR = S * Gq
+    tc = DA_MAX_ROWS ÷ Gq                     # tokens per launch (the LDS holds DA_MAX_ROWS query rows per KV head); a step of up to 2 launches (<= 8 tokens) is split
+    tc >= 1 && (S <= tc || S <= DA_MAX_TOKENS) || return false
+    QR = min(S, tc) * Gq
     QR <= DA_MAX_ROWS && (QR <= 12 || D == 256) || return false
     Ksc = Vsc = posv                          # (unused placeholders unless the cache is int8)
     if q8
@@ -375,15 +378,19 @@ function decode_attention_split!(out, q, pk, pv, kn, vn, posv, scale::Float32, w
         @roc groupsize=256 gridsize=cld(D * S * KVH * B, 256) _da_write_kernel!(pk, pv, kn, vn, posv, S)
     end
     nsplit = cld(T, DA_CH)
-    WO, WM, WL = get!(DA_WS, (typeof(out), D, nsplit, KVH, B, QR)) do
-        (AMDGPU.zeros(Float32, D, QR, nsplit, KVH, B), AMDGPU.zeros(Float32, QR, nsplit, KVH, B), AMDGPU.zeros(Float32, QR, nsplit, KVH, B))
-    end
     Kv = q8 ? reinterpret(NTuple{4,UInt32}, pk) : reinterpret(WMMA_V8H, pk)
     Vp = q8 ? reinterpret(UInt16, pv) : reinterpret(NTuple{2,Float16}, pv)
     q4 = q isa ROCArray ? q : copy(q)
-    @roc groupsize=256 gridsize=(nsplit, KVH, B) _da_part_kernel!(
-        WO, WM, WL, q4, Kv, Vp, Ksc, Vsc, posv, scale * 1.4426950408889634f0, S, Gq, Val(D), Val(QR), Val(q8))
     o4 = Base.reshape(out, D, H, S, B)
-    @roc groupsize=256 gridsize=(H, S * B) _da_merge_kernel!(o4, WO, WM, WL, posv, S, Gq)
+    for t0 in 0:tc:S-1
+        sc = min(tc, S - t0)                  # this launch's tokens
+        QRc = sc * Gq
+        WO, WM, WL = get!(DA_WS, (typeof(out), D, nsplit, KVH, B, QRc)) do
+            (AMDGPU.zeros(Float32, D, QRc, nsplit, KVH, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH, B))
+        end
+        @roc groupsize=256 gridsize=(nsplit, KVH, B) _da_part_kernel!(
+            WO, WM, WL, q4, Kv, Vp, Ksc, Vsc, posv, scale * 1.4426950408889634f0, S, t0, Gq, Val(D), Val(QRc), Val(q8))
+        @roc groupsize=256 gridsize=(H, sc * B) _da_merge_kernel!(o4, WO, WM, WL, posv, sc, t0, Gq)
+    end
     return true
 end
