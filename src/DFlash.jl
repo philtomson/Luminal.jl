@@ -454,7 +454,7 @@ _df_mm!(C, W, X) = (Luminal.batch_matmul!(C, W, X); C)
 function _df_draft_body!(d::DFlash2, w::DFWork)
     B = _DF_B
     scale = 1f0 / sqrt(Float32(_DF_HD))
-    copyto!(w.X, w.x0)
+    w.X .= w.x0      # (a broadcast: copyto! on device arrays is hipMemcpyWithStream in current AMDGPU.jl, which cannot be captured)
     for (li, l) in enumerate(d.layers)
         _df_rmsw!(w.xn, w.X, l.an)
         _df_mm!(w.dyn, l.acp, w.xn)
@@ -475,7 +475,7 @@ function _df_draft_body!(d::DFlash2, w::DFWork)
         _df_conv2!(w.X, w.ff, l.fcb, w.dyn, 1, w.X)
     end
     _df_rmsw!(w.Xo, w.X, d.onorm)
-    copyto!(w.Hd, view(w.Xo, :, 2:B))
+    w.Hd .= view(w.Xo, :, 2:B)
     _df_mm!(w.logits, d.lm_head, w.Hd)
     _df_mm!(w.proj, d.selh, w.Hd)
     return nothing

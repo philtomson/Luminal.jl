@@ -703,6 +703,7 @@ function main()
             Luminal.reclaim!(s.device)
         end
         catch e
+            @error "worker failed" exception = (e, catch_backtrace())
             put!(ready, e); rethrow()
         end
     end
