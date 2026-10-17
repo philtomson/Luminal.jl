@@ -10,7 +10,6 @@ using SymbolicUtils: term, Sym
 using SymbolicUtils.Code: toexpr
 # Import execution functions for compiled thunk
 using Luminal: execute_op, execute_op!, realize_view, to_device, realized_dims, eval_dim, execute_with_capture
-using CUDA
 using AMDGPU
 using GPUArrays
 using KernelAbstractions

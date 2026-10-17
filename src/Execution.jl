@@ -2,7 +2,6 @@
 
 
 
-using CUDA
 using AMDGPU
 using LinearAlgebra
 using GPUArrays
@@ -2699,13 +2698,9 @@ end
 # C[:, :, i] = A[:, :, i] * B[:, :, i] as one strided-batched BLAS call on GPU.
 _batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}) where {T<:Union{Float32,Float64}} =
     AMDGPU.rocBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
-_batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}) where {T<:Union{Float32,Float64}} =
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
 _batched_gemm!(C, A, B) = nothing
 _batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}, ta::Char, tb::Char) where {T<:Union{Float32,Float64}} =
     AMDGPU.rocBLAS.gemm_strided_batched!(ta, tb, one(T), A, B, zero(T), C)
-_batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}, ta::Char, tb::Char) where {T<:Union{Float32,Float64}} =
-    CUDA.CUBLAS.gemm_strided_batched!(ta, tb, one(T), A, B, zero(T), C)
 _batched_gemm!(C, A, B, ta, tb) = nothing
 
 _swap12(X) = ndims(X) == 2 ? permutedims(X, (2, 1)) : permutedims(X, (2, 1, 3:ndims(X)...))
