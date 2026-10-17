@@ -171,7 +171,8 @@ Requirements:
     [JuliaGPU/AMDGPU.jl#1163](https://github.com/JuliaGPU/AMDGPU.jl/pull/1163)), used by the
     register-resident delta-rule kernel, and `DERIVE_SCOPE`, which lets a caller release
     reshaped and reinterpreted arrays inside a HIP graph capture (without it a captured
-    graph allocates buffers it never frees and cannot be relaunched). Launch bounds
+    graph allocates buffers it never frees and cannot be relaunched; see
+    [JuliaGPU/AMDGPU.jl#1164](https://github.com/JuliaGPU/AMDGPU.jl/issues/1164)). Launch bounds
     (`maxthreads`) come from upstream. Luminal probes the options with `@static`: without
     `waves_per_eu` the delta-rule kernel is about 1.4x slower, and without `DERIVE_SCOPE`
     graph capture fails, so the fork branch is needed until that is upstream.
