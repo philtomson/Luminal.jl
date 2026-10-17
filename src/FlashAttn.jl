@@ -422,16 +422,16 @@ end
 # (the luminal-launch-bounds branch, see TODO.md) the kernel is compiled for exactly 256 threads per workgroup, which lifts LLVM's
 # 192-VGPR cap (it assumes 1024 threads otherwise); stock AMDGPU.jl launches it without.
 # True when `_launch_flash_lds!` takes the 128-row kernel, which also reads a Float32 query and can write the (D, H, S, B) output layout.
-_flash_rows128(NT) = NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64" && :flat_work_group_size in AMDGPU.COMPILER_KWARGS
+_flash_rows128(NT) = NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64" && HAS_LAUNCH_BOUNDS
 
 function _launch_flash_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, nb; hs::Bool = false) where {NT}
-    @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
+    @static if HAS_LAUNCH_BOUNDS
         if NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64"
             # D = 256: the 128-row, 512-thread block (needs the launch bounds: 252 VGPRs)
-            @roc groupsize=512 gridsize=(cld(S, 64), nb) flat_work_group_size=512 _flash_prefill_lds2!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT), Val(hs))
+            @roc_bounded 512 0 groupsize=512 gridsize=(cld(S, 64), nb) _flash_prefill_lds2!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT), Val(hs))
             return nothing
         end
-        @roc groupsize=256 gridsize=(cld(S, 32), nb) flat_work_group_size=256 _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
+        @roc_bounded 256 0 groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
     else
         @roc groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
     end

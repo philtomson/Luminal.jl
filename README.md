@@ -156,19 +156,25 @@ Requirements:
 - For AMD GPUs: a working ROCm. Development uses ROCm 10.1 from
   [TheRock](https://github.com/ROCm/TheRock) on a Radeon 8060S (gfx1151). Point
   `ROCM_PATH` and `LD_LIBRARY_PATH` at the install.
-- For NVIDIA GPUs: CUDA.jl.
+- For NVIDIA GPUs: CUDA.jl, which is an optional dependency (a package extension,
+  `ext/LuminalCUDAExt.jl`); add it to your environment to use it. It is not in
+  `Project.toml`'s dependencies because no registered CUDA.jl release works with the
+  current AMDGPU.jl yet. The CUDA backend has not been exercised in recent work.
 - `Project.toml` has a `[sources]` section, so `Pkg.instantiate()` fetches two
   non-registered packages from git:
   - **Metatheory.jl 3.0**, the `ale/3.0` branch of JuliaSymbolics/Metatheory.jl
     (the rewrite layer);
-  - **AMDGPU.jl**, the `luminal-launch-bounds` branch of
-    [philtomson/AMDGPU.jl](https://github.com/philtomson/AMDGPU.jl), a fork of
-    simeonschaub's `sds/update_wrappers` with two additions: `@roc` options
-    `flat_work_group_size` and `waves_per_eu` (HIP's `__launch_bounds__`, which the
-    128-row flash-attention kernel needs for its 252 registers), and
-    `ROCArray` bookkeeping that lets a caller release derived buffers promptly.
-    Luminal also runs on a stock AMDGPU.jl (the options are probed with
-    `@static`), but slower and with more memory held.
+  - **AMDGPU.jl**, the `luminal-upstream` branch of
+    [philtomson/AMDGPU.jl](https://github.com/philtomson/AMDGPU.jl): current upstream
+    `main` of JuliaGPU/AMDGPU.jl plus two additions. `waves_per_eu` for `@roc`
+    (the `amdgpu-waves-per-eu` attribute; submitted as
+    [JuliaGPU/AMDGPU.jl#1163](https://github.com/JuliaGPU/AMDGPU.jl/pull/1163)), used by the
+    register-resident delta-rule kernel, and `DERIVE_SCOPE`, which lets a caller release
+    reshaped and reinterpreted arrays inside a HIP graph capture (without it a captured
+    graph allocates buffers it never frees and cannot be relaunched). Launch bounds
+    (`maxthreads`) come from upstream. Luminal probes the options with `@static`: without
+    `waves_per_eu` the delta-rule kernel is about 1.4x slower, and without `DERIVE_SCOPE`
+    graph capture fails, so the fork branch is needed until that is upstream.
   To develop AMDGPU.jl locally: `Pkg.develop(path="~/devel/AMDGPU.jl")` (do not
   commit the resulting Manifest).
 - `ffmpeg`, only to decode audio files for Whisper.
@@ -396,8 +402,8 @@ the reduced-precision weight formats have no gradients.
 ### Devices
 - **AMD ROCm** (AMDGPU.jl) is the primary, tested target.
 - **CPU** runs everything, with plain-loop fallbacks for the fused kernels.
-- **CUDA** (CUDA.jl) has backends for the generic paths but has not been
-  exercised in recent work.
+- **CUDA** (CUDA.jl, optional extension) has backends for the generic paths but has not
+  been exercised in recent work.
 
 ### XLA via Reactant.jl (optional)
 With [Reactant.jl](https://github.com/EnzymeAD/Reactant.jl) loaded, a Luminal graph

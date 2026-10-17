@@ -1,6 +1,5 @@
 module Device
  
-using CUDA
 using AMDGPU
 # using Vulkan # Deferring to avoid InitError if libvulkan.so.1 is missing
 
@@ -17,6 +16,9 @@ struct CPUDevice <: AbstractDevice end
 abstract type AbstractGPUDevice <: AbstractDevice end
  
 struct CUDADevice <: AbstractGPUDevice end
+# CUDA.jl is an optional dependency (ext/LuminalCUDAExt.jl): loading it fills in the CUDA methods below and sets this
+# probe, which says whether a CUDA GPU is usable (functional and a tiny allocation works).
+const CUDA_PROBE = Ref{Any}(nothing)
 struct AMDDevice <: AbstractGPUDevice end
  
 # struct VulkanDevice <: AbstractDevice 
@@ -37,15 +39,8 @@ Automatically detect and return the best available device.
 Priority: CUDA > AMDGPU > CPU.
 """
 function get_device()
-    if CUDA.functional()
-        try
-            # Light health check
-            CUDA.CuArray([1.0f0])
-            return CUDADevice()
-        catch e
-            @warn "CUDA is functional but health check failed: $e. Falling back to next device."
-        end
-    end
+    probe = CUDA_PROBE[]
+    probe !== nothing && probe() && return CUDADevice()
     
     if AMDGPU.functional()
         try
@@ -89,7 +84,6 @@ to_device(data::AnyGPUArray, ::CUDADevice) = data
 to_device(data::AnyGPUArray, ::AMDDevice) = data
  
 # 2. Moving from CPU to specific GPU
-to_device(data::AbstractArray, ::CUDADevice) = CUDA.CuArray(data)
 to_device(data::AbstractArray, ::AMDDevice) = AMDGPU.ROCArray(data)
  
 # Explicitly handle CPUDevice and VulkanDevice to avoid ambiguity with generic fallback
@@ -97,7 +91,6 @@ to_device(data::AbstractArray, ::CPUDevice) = data
 # to_device(data::AbstractArray, ::VulkanDevice) = data
  
 # Number placement (mostly for scalars in graphs)
-to_device(data::Number, ::CUDADevice) = CUDA.CuArray(fill(data))
 to_device(data::Number, ::AMDDevice) = AMDGPU.ROCArray(fill(data))
  
 """
@@ -114,7 +107,6 @@ from_device(data::AnyGPUArray) = Array(data)
 Explicitly reclaim unused GPU memory if the backend supports it.
 """
 reclaim!(::AbstractDevice) = nothing
-reclaim!(::CUDADevice) = CUDA.reclaim()
 # AMDGPU.jl keeps freed buffers in HIP's stream-ordered memory pool (up to a high
 # release threshold); on an APU that is system RAM the rest of the machine can't
 # use. Collect garbage, then trim the pool.
@@ -138,7 +130,6 @@ reclaim!(::AMDDevice) = (hostgc(true); AMDGPU.HIP.reclaim(); nothing)
 Get available GPU memory in MiB. Returns -1 if unknown.
 """
 available_memory(::AbstractDevice) = -1.0
-available_memory(::CUDADevice) = CUDA.available_memory() / (1024 * 1024)
 # Free memory the AMD GPU can still allocate, in MB (-1 if unknown). On an APU
 # (little dedicated VRAM, e.g. Strix Halo) GPU buffers live in system RAM through
 # the GTT pool, so the limit is the smaller of the pool's free space and the
@@ -179,7 +170,6 @@ end
 Allocate a zero-filled tensor of specified type and dimensions on `device`.
 """
 zero_tensor(::CPUDevice, dtype, dims...) = zeros(dtype, dims...)
-zero_tensor(::CUDADevice, dtype, dims...) = CUDA.fill(dtype(0), dims...)
 zero_tensor(::AMDDevice, dtype, dims...) = AMDGPU.fill(dtype(0), dims...)
 # zero_tensor(::VulkanDevice, dtype, dims...) = zeros(dtype, dims...)
 
@@ -212,7 +202,6 @@ execute_with_capture(::AbstractDevice, f, cache) = f()
 Block until work queued on `device` has finished (no-op on CPU).
 """
 synchronize_device(::AbstractDevice) = nothing
-synchronize_device(::CUDADevice) = CUDA.synchronize()
 synchronize_device(::AMDDevice) = AMDGPU.synchronize()
 
 # HIP graph capture and replay. The caller opts in by putting a `:key` in

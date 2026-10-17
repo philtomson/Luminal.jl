@@ -2,7 +2,6 @@
 
 
 
-using CUDA
 using AMDGPU
 using LinearAlgebra
 using GPUArrays
@@ -1014,12 +1013,8 @@ function _launch_delta_reg!(out, q, k, v, g, beta, st, lens, snap, snap_t, scale
     nt = cld(DELTA_REG_LANES * dv, 32) * 32
     args = (out, q, k, v, g, beta, st, lens, snap, snap_t, scale, G, fresh, Val(dk ÷ DELTA_REG_LANES), Val(snap_t > 0),
             Val(cld(DELTA_REG_CHUNK * dk, nt)), Val(cld(DELTA_REG_CHUNK * dv, nt)))   # loads per thread of a chunk's q / k and v
-    @static if :flat_work_group_size in AMDGPU.COMPILER_KWARGS
-        wpe = dk == 128 ? 12 : 1
-        @roc groupsize=nt gridsize=nv * B flat_work_group_size=nt waves_per_eu=wpe _delta_rule_reg_kernel!(args...)
-    else
-        @roc groupsize=nt gridsize=nv * B _delta_rule_reg_kernel!(args...)
-    end
+    wpe = dk == 128 ? 12 : 1
+    @roc_bounded nt wpe groupsize=nt gridsize=nv * B _delta_rule_reg_kernel!(args...)
     return nothing
 end
 
@@ -2703,13 +2698,9 @@ end
 # C[:, :, i] = A[:, :, i] * B[:, :, i] as one strided-batched BLAS call on GPU.
 _batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}) where {T<:Union{Float32,Float64}} =
     AMDGPU.rocBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
-_batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}) where {T<:Union{Float32,Float64}} =
-    CUDA.CUBLAS.gemm_strided_batched!('N', 'N', one(T), A, B, zero(T), C)
 _batched_gemm!(C, A, B) = nothing
 _batched_gemm!(C::ROCArray{T,3}, A::ROCArray{T,3}, B::ROCArray{T,3}, ta::Char, tb::Char) where {T<:Union{Float32,Float64}} =
     AMDGPU.rocBLAS.gemm_strided_batched!(ta, tb, one(T), A, B, zero(T), C)
-_batched_gemm!(C::CuArray{T,3}, A::CuArray{T,3}, B::CuArray{T,3}, ta::Char, tb::Char) where {T<:Union{Float32,Float64}} =
-    CUDA.CUBLAS.gemm_strided_batched!(ta, tb, one(T), A, B, zero(T), C)
 _batched_gemm!(C, A, B, ta, tb) = nothing
 
 _swap12(X) = ndims(X) == 2 ? permutedims(X, (2, 1)) : permutedims(X, (2, 1, 3:ndims(X)...))
