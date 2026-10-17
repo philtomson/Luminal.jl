@@ -99,7 +99,32 @@ What this does and does not show:
   With 15-20 ms of drafting a cycle would cost about 190-200 ms against 160-185 ms for MTP, so the net decode gain is about +30% overall,
   about +50% on reasoning prose and code, and a loss on plain prose unless the block length adapts to the recent acceptance.
 
-## Status
+## Stage 2 result (2026-10-17): integrated, correct, and about even with MTP at long context
 
-Stage 1 done (go). Next: Stage 2 (capture inside the real graphs, the fast draft pass, the loop in `_spec_loopN!`). Still open for Stage 2:
-the real-traffic acceptance at long context, the 8-row verify cost, and adaptive block length.
+`--dflash=<draft gguf>` on `examples/qwen35_server.jl` (and `generate_ids_dflash`) runs the drafter in the real pipeline:
+- the target's five layer outputs are extracted inside the chunked prefill (only the last 2048 prompt tokens) and the batched verify step;
+- the block pass and the context-ring update are fixed kernel sequences on persistent buffers, captured in HIP graphs (draft pass 18 ms, ring update 3-10 ms);
+- verify of up to 8 rows uses the split-K decode attention in two launches of at most 4 tokens (capturable in a HIP graph), and the Float16 dot2 GEMV does up to 8 columns per
+  pass (bit-identical to 4, 40-45% faster for 5-8 columns: it also speeds up MTP's longer verifies);
+- the block length is chosen per cycle from the running acceptance and the measured cost of each length;
+- the end-of-generation state checkpoint and the prefix cache work with it (the ring's validity is tracked next to the live K/V: `PrefixCache.live_df`).
+Greedy output is identical to plain greedy decoding; a follow-up request resumes from the checkpoint.
+
+Measured (same prompts, both drafters in one process, sampled as the server does where noted):
+
+| | DFlash2 | MTP |
+|-|--------:|----:|
+| prompt 1 (reasoning prose), short context, greedy | 19.9-21.0 tok/s, 3.6 tokens/cycle | 14.5-18.4 tok/s, 2.6 |
+| prompt 2 (code), short context, greedy | 23.1-23.3 tok/s, 4.35 | 18.2-18.4 tok/s, 2.9 |
+| tool call (file write), short context | 32-41 tok/s, 5.8-7.3 | about 22 tok/s, 3.6 (earlier server logs) |
+| 40k tokens of context, reasoning text, sampled | 18.6-19.4 tok/s, 4.0-4.5 | 16.4-17.1 tok/s, 2.75-3.1 |
+| 40k tokens of context, new code, sampled | 13.3-16.3 tok/s, 3.1-3.9 | 15.3-15.8 tok/s, 2.8-2.9 |
+
+A cycle costs about 150 ms (8-row verify) + 18 (draft) + 5 at short context and about 195 + 27 + 5 at 40k tokens, against about 185 ms for MTP, so the extra
+tokens per cycle are mostly paid for in verify time at long context. Two things would move this: a single-pass attention for 8 tokens (48 query rows per KV head;
+the split-K kernel's LDS holds 24, so it reads the KV cache twice: about 25 ms at 40k tokens and 60 ms at 100k) and a faster 8-column weight multiply (100-130 GB/s on the
+layer matrices against 215 GB/s on the output matrix).
+
+A deadlock found on the way (it can also happen without DFlash): a finalizer freeing GPU memory (`hipFreeAsync`) on the HTTP thread while the GPU worker launches a captured
+graph (`hipGraphLaunch`) hangs inside the HIP runtime. The server now runs with automatic garbage collection off and collects from the GPU worker thread only (`Luminal.hostgc`).
+

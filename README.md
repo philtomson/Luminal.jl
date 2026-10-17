@@ -111,6 +111,22 @@ LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl \
   `POST /v1/chat/completions`). For opencode, add an `@ai-sdk/openai-compatible`
   provider with that `baseURL` and the `--name` as the model id. Long prompts can
   take minutes before the first token, so raise or disable its request timeouts.
+- `--dflash=<Qwen3.8-27B-DFlash2 .gguf>` replaces the MTP head by the DFlash2 block drafter
+  (z-lab/Inco AI, ~1.1 GB, [docs/dflash2_port_plan.md](docs/dflash2_port_plan.md)): one pass proposes up to 7 draft
+  tokens, which the 27B verifies in a single batched step. The output is the same
+  as without it (verification is exact, and sampling uses rejection sampling).
+  Measured against MTP on the same prompts (decode speed):
+
+  | | DFlash2 vs MTP |
+  |-|----------------|
+  | short context, predictable text (tool calls, chat) | +25-35%, up to 2x on tool calls |
+  | 40k tokens of context, reasoning text | +9-18% |
+  | 40k tokens of context, new code | about even |
+
+  It emits 1.4-1.7x as many tokens per cycle, but an 8-row verify costs more than
+  MTP's 2-4 rows, especially at long context (the attention reads the KV cache
+  twice), so the default stays MTP. The warm-up compiles one verify graph per block
+  length and takes about 2 minutes. Not combined with `--no-spec`.
 - `--reasoning-budget=N` limits the thinking: after N reasoning tokens the server
   closes the `<think>` block with a short wrap-up and the model answers from what
   it has (the resume costs a re-prefill of the new turn, about 10-20 s at N = 4096).

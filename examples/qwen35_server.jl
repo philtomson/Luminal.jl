@@ -2,7 +2,7 @@
 #
 # Usage:
 #   LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl <model.gguf> [--mtp=<gguf with the MTP head>] [--port=8080]
-#       [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=<model id>] [--min-avail=20] [--reasoning-budget=N]
+#       [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--dflash=<DFlash2 draft gguf>] [--name=<model id>] [--min-avail=20] [--reasoning-budget=N]
 # Then point the harness at http://localhost:8080/v1 (model id: --name, default the file's name).
 #
 # Endpoints: GET /v1/models, GET /health, POST /v1/chat/completions ("stream": true gives server-sent events). Request fields used: messages
@@ -398,7 +398,11 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
             e[1] == :content && (ncontent[] += length(e[2]))
         end
     end
+    gc_t = Ref(time())
     function on_token(new)
+        if time() - gc_t[] > 2.0                         # the only place besides the idle loop where the server collects garbage (see `Luminal.hostgc`)
+            Luminal.hostgc(false); gc_t[] = time()
+        end
         for t in new
             if t in eos; reason = :stop; return true; end
             push!(gen, t)
@@ -429,7 +433,9 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         return reason == :length
     end
     function generate!(prompt, max_new, st, at)
-        if use_spec
+        if d isa DFlash2
+            generate_ids_dflash(s, d, prompt; max_new_tokens = max_new + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at = at, stats = st, on_progress)
+        elseif use_spec
             generate_ids_speculative(s, d, prompt; max_new_tokens = max_new + 8, ndraft = 0, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at = at, stats = st, on_progress)
         else
             generate_ids(s, [prompt]; max_new_tokens = max_new + 8, sampler = job.sampler, on_token, prefix = PREFIX, prefix_at = at, on_progress)
@@ -642,10 +648,12 @@ function main()
     Logging.global_logger(QuietHTTP(Logging.global_logger()))
     args = filter(a -> !startswith(a, "--"), ARGS)
     flag(n, d) = (i = findfirst(a -> startswith(a, "--$n="), ARGS); i === nothing ? d : ARGS[i][length(n)+4:end])
-    isempty(args) && error("usage: qwen35_server.jl <model.gguf> [--mtp=<gguf>] [--port=8080] [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--name=id] [--reasoning-budget=N]")
+    isempty(args) && error("usage: qwen35_server.jl <model.gguf> [--mtp=<gguf>] [--port=8080] [--host=127.0.0.1] [--max-seq=16384] [--int8] [--no-spec] [--dflash=<gguf>] [--name=id] [--reasoning-budget=N]")
     base = args[1]; mtp = flag("mtp", base)
     port = parse(Int, flag("port", "8080")); host = flag("host", "127.0.0.1")
     use_spec = !("--no-spec" in ARGS)
+    dflash_path = flag("dflash", "")                     # the DFlash2 block drafter instead of the MTP head
+    use_dflash = use_spec && !isempty(dflash_path)
     REASONING_BUDGET[] = parse(Int, flag("reasoning-budget", "0"))
     name = flag("name", splitext(basename(base))[1])
     T = "--int8" in ARGS ? Int8 : Luminal.Int4
@@ -657,24 +665,37 @@ function main()
         f = read_gguf(base); cfg = qwen35_config(f); tok = LlamaTokenizer(f)
         logline("loading $base")
         W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
-        use_spec && merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = cfg.n_layers))
+        use_spec && !use_dflash && merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = cfg.n_layers))
         s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = parse(Int, flag("max-seq", "16384")), weights = W, decode_weights = T,
                          kv_dtype = Float16)
-        d = use_spec ? MTPDrafter(s) : nothing
+        d = use_dflash ? DFlash2(s, dflash_path, base) : use_spec ? MTPDrafter(s) : nothing
         logline("loaded; warming up (compiles the graphs, about a minute)")
+        gen_spec(prompt; kw...) = d isa DFlash2 ? generate_ids_dflash(s, d, prompt; kw...) : generate_ids_speculative(s, d, prompt; ndraft = 0, kw...)
         wid = Int.(LT.encode(tok, render_chat([(role = "user", content = "Say hello.")], nothing); bos = false))
         for sm in (nothing, Sampler(temperature = 1.0, top_p = 0.95, top_k = 20))
-            use_spec ? (generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm); generate_ids_speculative(s, d, wid; max_new_tokens = 24, ndraft = 0, sampler = sm)) :
+            use_spec ? (gen_spec(wid; max_new_tokens = 24, sampler = sm); gen_spec(wid; max_new_tokens = 24, sampler = sm)) :
                        generate_ids(s, [wid]; max_new_tokens = 8, sampler = sm)
+        end
+        if d isa DFlash2                               # one verify graph per block length (2..8 rows)
+            for nd in 1:7
+                generate_ids_dflash(s, d, wid; max_new_tokens = 6, nprop = nd)
+            end
         end
         if use_spec                                    # compile the short-chunk prefill graphs (64 and 256 tokens) and the 512 one, through a throwaway cache
             scratch = PrefixCache(min_tokens = typemax(Int))
             for len in (20, 150, 700)
-                generate_ids_speculative(s, d, repeat(wid, cld(len, length(wid)))[1:len]; max_new_tokens = 4, ndraft = 0, prefix = scratch)
+                gen_spec(repeat(wid, cld(len, length(wid)))[1:len]; max_new_tokens = 4, prefix = scratch)
             end
         end
+        Luminal.hostgc(true)
+        GC.enable(false)        # From here on only this thread collects garbage: a finalizer freeing GPU memory on the HTTP thread while this one launches a captured graph
+                                # deadlocks inside the HIP runtime (seen with the first request that has tools arriving while the previous one finished).
         put!(ready, s.max_seq)
         while true
+            if !isready(JOBS)                            # idle: collect now and then (the HTTP side allocates a little)
+                timedwait(() -> isready(JOBS), 10.0)
+                isready(JOBS) || (Luminal.hostgc(true); continue)
+            end
             job = take!(JOBS)
             job.cancel[] && continue
             run_job!(s, d, tok, job, use_spec)
@@ -687,7 +708,7 @@ function main()
     end
     max_seq = take!(ready); max_seq isa Exception && error("loading failed: " * sprint(showerror, max_seq))
     server = HTTP.serve!(http -> route(http, name), host, port; stream = true)
-    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec, context $max_seq)")
+    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec$(use_dflash ? ", DFlash2 block drafter" : use_spec ? ", MTP head" : ""), context $max_seq)")
     wait(worker)
 end
 
