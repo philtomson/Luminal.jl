@@ -142,6 +142,7 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0,
     svs = Q8 ? (@ROCStaticLocalArray(Float32, (256,), false)) : scT   # int8 cache: the chunk's V scales
     mq = @ROCStaticLocalArray(Float32, (24,), false)
     lq = @ROCStaticLocalArray(Float32, (24,), false)
+    red = @ROCStaticLocalArray(Float32, (256,), false)
     # stage the queries: row = (token s, head g); rows >= QR are zero
     idx = tid
     while idx < 32 * D
@@ -177,33 +178,47 @@ function _da_part_kernel!(WO, WM, WL, Qa, Kv, Vp, Ksc, Vsc, posv, scale2, S, t0,
         end
     end
     sync_workgroup()
-    # softmax of each row over the chunk (a wave per row)
-    row = w
-    while row < QR
-        m = -1f30
-        i = l
-        while i < DA_CH
-            @inbounds m = max(m, scT[i * QR + row + 1])
-            i += 32
+    # softmax of each row over the chunk. scT is (key, row) with the row fastest, so thread (row, g) = (tid % QR, tid / QR) reads consecutive
+    # rows in a wave (no LDS bank conflicts) and takes every ng-th key; the ng partial maxima / sums of a row are combined through `red`.
+    ng = 256 ÷ QR
+    srow = tid % QR; sg = tid ÷ QR
+    act = sg < ng
+    m = -1f30
+    if act
+        kk = sg
+        while kk < DA_CH
+            @inbounds m = max(m, scT[kk * QR + srow + 1])
+            kk += ng
         end
-        for off in (1, 2, 4, 8, 16)
-            m = max(m, AMDGPU.Device.shfl_xor(m, Cint(off)))
+        @inbounds red[sg * QR + srow + 1] = m
+    end
+    sync_workgroup()
+    M = -1f30
+    if act
+        for g2 in 0:ng - 1
+            @inbounds M = max(M, red[g2 * QR + srow + 1])
         end
-        ssum = 0f0
-        i = l
-        while i < DA_CH
-            @inbounds e = scT[i * QR + row + 1] <= -1f29 ? 0f0 : exp2(scT[i * QR + row + 1] - m)
-            @inbounds scT[i * QR + row + 1] = Q8 ? e * svs[i + 1] : e
+    end
+    sync_workgroup()
+    ssum = 0f0
+    if act
+        kk = sg
+        while kk < DA_CH
+            @inbounds sv = scT[kk * QR + srow + 1]
+            e = sv <= -1f29 ? 0f0 : exp2(sv - M)
+            @inbounds scT[kk * QR + srow + 1] = Q8 ? e * svs[kk + 1] : e
             ssum += e
-            i += 32
+            kk += ng
         end
-        for off in (1, 2, 4, 8, 16)
-            ssum += AMDGPU.Device.shfl_xor(ssum, Cint(off))
+        @inbounds red[sg * QR + srow + 1] = ssum
+    end
+    sync_workgroup()
+    if tid < QR
+        L = 0f0
+        for g2 in 0:ng - 1
+            @inbounds L += red[g2 * QR + tid + 1]
         end
-        if l == 0
-            @inbounds mq[row + 1] = m; @inbounds lq[row + 1] = ssum
-        end
-        row += 8
+        @inbounds mq[tid + 1] = M; @inbounds lq[tid + 1] = L
     end
     sync_workgroup()
     if QR > 12
