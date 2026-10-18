@@ -24,7 +24,10 @@ const DA_MAX_TOKENS = 8            # a step of more tokens takes the prefill att
 const DA_MAX_ROWS = 24           # S * Gq limit (LDS; 4 tokens x 6 query heads per KV head)
 const DA_Q8_PAD = 16             # bytes appended to an int8 cache row (the Float32 scale + padding to 16 B)
 const _DA_NEG1152 = 0xe480e480   # -1152 in f16 pairs
-const DA_WS = Dict{Any, Any}()   # partial-result workspaces (a captured graph bakes in the pointers)
+const DA_WS = Dict{Any, Any}()
+# The chunks' partial outputs (WO) are stored as Float16: at 150k keys they are 115 MB per layer for an 8-token step, written by the part kernel and read
+# back by the merge kernel, so their bytes set the merge kernel's time (it runs at the DRAM rate). LUMINAL_DA_WO16=0 keeps Float32.
+_da_wo_f16() = get(ENV, "LUMINAL_DA_WO16", "1") != "0"   # partial-result workspaces (a captured graph bakes in the pointers)
 
 # helpers with their own scopes (closures in the kernel body must not capture reassigned variables)
 @inline _da_fma(a::NTuple{N,Float32}, p::NTuple{N,Float32}, v::Float32) where {N} = ntuple(q -> a[q] + p[q] * v, Val(N))
@@ -395,8 +398,9 @@ function decode_attention_split!(out, q, pk, pv, kn, vn, posv, scale::Float32, w
     for t0 in 0:tc:S-1
         sc = min(tc, S - t0)                  # this launch's tokens
         QRc = sc * Gq
-        WO, WM, WL = get!(DA_WS, (typeof(out), D, nsplit, KVH * rep, B, QRc)) do
-            (AMDGPU.zeros(Float32, D, QRc, nsplit, KVH * rep, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH * rep, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH * rep, B))
+        WT = _da_wo_f16() ? Float16 : Float32
+        WO, WM, WL = get!(DA_WS, (typeof(out), D, nsplit, KVH * rep, B, QRc, WT)) do
+            (AMDGPU.zeros(WT, D, QRc, nsplit, KVH * rep, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH * rep, B), AMDGPU.zeros(Float32, QRc, nsplit, KVH * rep, B))
         end
         @roc groupsize=256 gridsize=(rep * nsplit, KVH, B) _da_part_kernel!(
             WO, WM, WL, q4, Kv, Vp, Ksc, Vsc, posv, scale * 1.4426950408889634f0, S, t0, Gq, rep, Val(D), Val(QRc), Val(q8))
