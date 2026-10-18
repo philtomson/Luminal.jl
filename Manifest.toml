@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "54cd901731efbf00ff458dfd3aa4636373e89426"
+project_hash = "5efae7c7928a97d94b6e095234d330eb50c43fab"
 
 [[deps.AMDGPU]]
 deps = ["AMDGPU_LLVM_Backend_jll", "AbstractFFTs", "Adapt", "Atomix", "BFloat16s", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelInterface", "LLVM", "LLVMDowngrader_jll", "Libdl", "LinearAlgebra", "PrecompileTools", "Preferences", "PrettyTables", "Printf", "Random", "Random123", "RandomNumbers", "Scratch", "SparseArrays", "Statistics", "UnsafeAtomics"]
@@ -290,11 +290,6 @@ git-tree-sha1 = "54b76cbb40d9a0f5368c880725b2f141da77c94f"
 uuid = "a8cc5b0e-0ffa-5ad4-8c14-923d3ee1735f"
 version = "4.2.0"
 
-[[deps.DLFP8Types]]
-git-tree-sha1 = "422996f4ddf0ed17a9a3b729347fcbf38fae80b2"
-uuid = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
-version = "0.1.0"
-
 [[deps.DataAPI]]
 git-tree-sha1 = "abe83f3a2f1b857aac70ef8b269080af17764bbe"
 uuid = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
@@ -314,11 +309,6 @@ version = "1.0.0"
 [[deps.Dates]]
 deps = ["Printf"]
 uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
-version = "1.11.0"
-
-[[deps.Distributed]]
-deps = ["Random", "Serialization", "Sockets"]
-uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 version = "1.11.0"
 
 [[deps.DocStringExtensions]]
@@ -673,11 +663,6 @@ git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
 uuid = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
 version = "0.5.16"
 
-[[deps.MappedArrays]]
-git-tree-sha1 = "0ee4497a4e80dbd29c058fcee6493f5219556f40"
-uuid = "dbb5928d-eab1-5f90-85c2-b9b0edb7c900"
-version = "0.4.3"
-
 [[deps.Markdown]]
 deps = ["Base64", "JuliaSyntaxHighlighting", "StyledStrings"]
 uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
@@ -832,12 +817,6 @@ deps = ["StyledStrings"]
 uuid = "9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"
 version = "1.11.0"
 
-[[deps.ProgressMeter]]
-deps = ["Distributed", "Printf"]
-git-tree-sha1 = "fbb92c6c56b34e1a2c4c36058f68f332bec840e7"
-uuid = "92933f4c-e287-5a05-a399-4b506db050ca"
-version = "1.11.0"
-
 [[deps.REPL]]
 deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
 uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
@@ -916,10 +895,10 @@ uuid = "6ac6d60f-d740-5983-97d7-a4482c0689f4"
 version = "2025.4.0+0"
 
 [[deps.SafeTensors]]
-deps = ["BFloat16s", "DLFP8Types", "JSON", "MappedArrays", "Mmap", "ProgressMeter"]
-git-tree-sha1 = "4ac3c1c38c93d19580791cbedd0cb10a4a79b7e3"
+deps = ["JSON3"]
+git-tree-sha1 = "224344b2793c1dbadeae172dbcf56026d5d6f32a"
 uuid = "eeda0dda-7046-4914-a807-2495fc7abb89"
-version = "1.3.0"
+version = "1.0.0"
 
 [[deps.ScopedValues]]
 deps = ["HashArrayMappedTries", "Logging"]
