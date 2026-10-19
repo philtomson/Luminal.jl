@@ -2940,6 +2940,7 @@ execute_op(op::Contiguous, a) = copy(a)
 execute_op(op::MatMul, a, b) = batch_matmul(a, b)
 execute_op(op::SumReduce, a) = dropdims(Base.sum(a, dims=op.dim), dims=op.dim)
 execute_op(op::MaxReduce, a) = dropdims(Base.maximum(a, dims=op.dim), dims=op.dim)
+execute_op(op::Scan, a) = execute_op!(similar(a), op, a)
 execute_op(op::Slice, a) = execute_slice(a, op.ranges)
 execute_op(op::Pad, a) = execute_pad(a, op.padding)
 execute_op(op::Constant, device) = to_device(op.value, device)
@@ -2968,8 +2969,6 @@ function execute_op(op::Function, inputs...)
     elseif op.name == "Gather"
         indices = Int.(inputs[2]) .+ 1
         return inputs[1][indices, :]
-    elseif op.name == "CumSum"
-        return cumsum(inputs[1], dims=ndims(inputs[1]))
     else
         error("Function op with name $(op.name) not implemented.")
     end
@@ -3108,6 +3107,47 @@ end
 execute_op!(out, op::SumReduce, a) = _reduce_dim!(out, a, op.dim, +, zero(eltype(out)))
 execute_op!(out, op::MaxReduce, a) = _reduce_dim!(out, a, op.dim, max, _max_neutral(eltype(out)))
 _max_neutral(T) = T <: AbstractFloat ? T(-Inf) : typemin(T)
+
+# Scans: inclusive left fold along `dim`, one thread per (before, after) coordinate pair on the GPU (the axis is read
+# in order, so the result is the sequential fold's: bit-identical to the CPU path). 16-bit floats accumulate in Float32.
+@kernel function _scan_kernel!(out, @Const(a), r, pre, op, init)
+    g = @index(Global, Linear)
+    i = (g - 1) % pre + 1
+    j = (g - 1) ÷ pre + 1
+    base = i + pre * r * (j - 1)
+    acc = init
+    for k in 1:r
+        @inbounds acc = op(acc, convert(typeof(init), a[base + pre * (k - 1)]))
+        @inbounds out[base + pre * (k - 1)] = convert(eltype(out), acc)
+    end
+end
+
+_scan_fn(kind::Symbol) = kind === :sum ? (+) : kind === :prod ? (*) : kind === :max ? max :
+    error("unknown scan kind $kind")
+_scan_init(kind::Symbol, T) = kind === :sum ? zero(T) : kind === :prod ? one(T) : _max_neutral(T)
+
+function execute_op!(out, op::Scan, a)
+    f = _scan_fn(op.kind)
+    T = eltype(out)
+    acc_T = T <: Union{Float16, Core.BFloat16} ? Float32 : T
+    init = convert(acc_T, _scan_init(op.kind, T))
+    pre = prod(size(a)[1:op.dim - 1]; init=1)
+    r = size(a, op.dim)
+    post = prod(size(a)[op.dim + 1:end]; init=1)
+    if out isa AnyGPUArray
+        _scan_kernel!(KernelAbstractions.get_backend(out), 64)(out, a, r, pre, f, init; ndrange = pre * post)
+    else
+        A = Base.reshape(a, pre, r, post); O = Base.reshape(out, pre, r, post)
+        @inbounds for j in 1:post, i in 1:pre
+            acc = init
+            for k in 1:r
+                acc = f(acc, convert(acc_T, A[i, k, j]))
+                O[i, k, j] = convert(T, acc)
+            end
+        end
+    end
+    return out
+end
 
 execute_op!(out, op::Slice, a) = execute_slice!(out, a, op.ranges)
 execute_op!(out, op::Pad, a) = execute_pad!(out, a, op.padding)
@@ -3734,12 +3774,6 @@ function execute_op!(out, op::Function, inputs...)
         else
             indices = Int.(inputs[2]) .+ 1
             copyto!(out, inputs[1][indices, :])
-        end
-    elseif op.name == "CumSum"
-        if inputs[1] isa AMDGPU.ROCArray
-            AMDGPU.@allowscalar cumsum!(out, inputs[1], dims=ndims(inputs[1]))
-        else
-            cumsum!(out, inputs[1], dims=ndims(inputs[1]))
         end
     else
         error("Function op with name $(op.name) not implemented.")

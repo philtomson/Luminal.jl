@@ -1,4 +1,4 @@
-import Base: +, -, *, /, %, <, >, <=, >=, ==, !=, log2, exp2, sin, cos, exp, sqrt, max, min, abs, sum, maximum
+import Base: +, -, *, /, %, <, >, <=, >=, ==, !=, log2, exp2, sin, cos, exp, sqrt, max, min, abs, sum, maximum, prod, cumsum, cumprod
 
 # Binary Arithmetics with Scalar support
 # -------------------------------------
@@ -587,15 +587,26 @@ function arange(graph::Graph, to::DimType)
     return add_op!(graph, Function("ARange"), Tuple{Int, Int, ShapeTracker}[], ShapeTracker([to]))
 end
 
-function cumsum_last_dim(a::GraphTensor)
-    axis = length(a.shape.indexes)
-    # Force contiguity
+# Inclusive scans along `dim` (shape unchanged), exact: no log/exp round trip, so cumprod / prod are right for
+# negative and zero elements and for integers.
+function _scan(a::GraphTensor, kind::Symbol, dim::Int)
+    1 <= dim <= length(a.shape.indexes) || throw(ArgumentError("scan dimension $dim out of range for a tensor of rank $(length(a.shape.indexes))"))
     a_cont = contiguous(a)
-    orig_length = realized_dims(a_cont.shape)[axis]
-    
-    inputs = [(a_cont.id, 0, a_cont.shape)]
-    output_shape = deepcopy(a_cont.shape)
-    return add_op!(a.graph_ref, Function("CumSum"), inputs, output_shape)
+    return add_op!(a.graph_ref, Scan(kind, dim), [(a_cont.id, 0, a_cont.shape)], deepcopy(a_cont.shape))
+end
+
+cumsum(a::GraphTensor, dim::Int) = _scan(a, :sum, dim)
+cumprod(a::GraphTensor, dim::Int) = _scan(a, :prod, dim)
+cummax(a::GraphTensor, dim::Int) = _scan(a, :max, dim)
+cumsum_last_dim(a::GraphTensor) = cumsum(a, length(a.shape.indexes))
+
+# Product over `dim` (dropped): the last element of the product scan
+function prod(a::GraphTensor, dim::Int)
+    dims = realized_dims(a.shape)
+    n = dims[dim]
+    n == 0 && throw(ArgumentError("prod over a zero-length axis"))
+    last = slice_along(cumprod(a, dim), dim, n - 1, n)
+    return reshape(last, [d for (i, d) in enumerate(dims) if i != dim])
 end
 
 function triu(graph::Graph, size::DimType, diagonal::Int=0)

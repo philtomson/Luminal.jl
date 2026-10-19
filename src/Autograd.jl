@@ -265,6 +265,29 @@ function vjp_rules(op::MaxReduce, node_id::Int, node::Node, grad_out::GraphTenso
     accumulate_grad!(grads, input_id, select(is_max, expand(grad_out, op.dim, n) / count, 0))
 end
 
+# --- Scans ---
+
+# Reverse cumulative sum along `dim`: sum_{j >= i} g_j = total - cumsum_i + g_i
+function _reverse_cumsum(g::GraphTensor, dim::Int)
+    n = realized_dims(g.shape)[dim]
+    return expand(sum(g, dim), dim, n) - cumsum(g, dim) + g
+end
+
+function vjp_rules(op::Scan, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)
+    input_id = node.inputs[1][1]
+    graph = grad_out.graph_ref
+    if op.kind === :sum
+        accumulate_grad!(grads, input_id, _reverse_cumsum(grad_out, op.dim))
+    elseif op.kind === :prod
+        # d out_j / d x_i = out_j / x_i for j >= i: undefined where x_i == 0
+        x = GraphTensor(input_id, node.inputs[1][3], graph)
+        out = GraphTensor(node_id, graph.shapes[node_id], graph)
+        accumulate_grad!(grads, input_id, _reverse_cumsum(grad_out * out, op.dim) / x)
+    else
+        error("no gradient rule for the $(op.kind) scan")
+    end
+end
+
 # --- Piecewise ops ---
 
 function vjp_rules(op::Mod, node_id::Int, node::Node, grad_out::GraphTensor, grads::Dict)

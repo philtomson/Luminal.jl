@@ -172,6 +172,13 @@ struct MaxReduce <: Op
     dim::Int
 end
 
+# Inclusive scan along `dim` (output shape = input shape): `kind` is :sum, :prod or :max. Exact, evaluated as a left fold
+# in the element type; any bracketing is a valid implementation (the ops are associative), so a backend may reorder.
+struct Scan <: Op
+    kind::Symbol
+    dim::Int
+end
+
 # Movement Ops
 struct Permute <: Op
     dims::Vector{Int}

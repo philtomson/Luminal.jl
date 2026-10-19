@@ -66,7 +66,7 @@ const _Arith = Union{Add, Mul, Mod, Max, FusedMulAdd, FusedAddReLU}
 output_dtype(op::_Arith, ins) = _require(op, _same_dtype(op, ins), _isnum, "numeric")
 output_dtype(op::Div, ins) = _require(op, _same_dtype(op, ins), _isfloat, "floating-point (for integers use trunc_div)")
 output_dtype(op::LessThan, ins) = (_require(op, _same_dtype(op, ins), _isnum, "numeric"); Bool)
-output_dtype(op::Union{SumReduce, MaxReduce}, ins) = _require(op, ins[1], _isnum, "numeric")
+output_dtype(op::Union{SumReduce, MaxReduce, Scan}, ins) = _require(op, ins[1], _isnum, "numeric")
 output_dtype(op::Union{MatMul, MatMulT}, ins) = _require(op, _same_dtype(op, ins), _isfloat, "floating-point")
 output_dtype(op::Union{MappingGather, LutKOp, LutKBwdPinsOp, LutKDWOp, SparseMapGather, SparseMapBwdS, SparseMapBwdX}, ins) = (_require(op, ins[1], _isfloat, "floating-point"); ins[1])
 
@@ -92,7 +92,7 @@ output_dtype(op::Iota, ins) = op.dtype
 
 function output_dtype(op::Function, ins)
     op.name == "ARange" && return Float32
-    return isempty(ins) ? Float32 : ins[1]      # InputTensor's dtype is given explicitly; Gather, CumSum
+    return isempty(ins) ? Float32 : ins[1]      # InputTensor's dtype is given explicitly; Gather
 end
 
 output_dtype(op::Cast, ins) = op.dtype
