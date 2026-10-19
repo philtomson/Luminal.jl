@@ -3,7 +3,7 @@
 This document outlines the strategy and progress for porting the Luminal deep learning framework from Rust to Julia.
 
 > [!NOTE]
-> **Last updated: February 20, 2026** — Reflects completion of Phase 5 (Standalone Llama GPU Generation) and Phase 8.
+> **Last updated: October 18, 2026** — the gap list reflects a comparison with upstream `77d3060f`; phases 1-8 are as of February 2026.
 
 ---
 
@@ -127,50 +127,33 @@ All optimization features have been implemented and verified through comprehensi
 
 ---
 
-## Missing Features (vs. Rust Luminal)
+## Gaps against Rust Luminal (checked 2026-10-18 against upstream `77d3060f`)
 
-The following features from the Rust version are **not yet implemented** in the Julia port:
+Most of what this section once listed has since been built: autograd and Adam (`Autograd.jl`, `tests/test_autograd.jl`),
+int8 / Q4 / Q8 / AWQ weights and GGUF / safetensors import, matrix-core (WMMA) kernels, Whisper, Gemma3, Qwen3.5/3.6/3.8,
+Phi-3 weight mapping, speculative decoding (MTP, DFlash2), the OpenAI-compatible Qwen server, NCM (`src/NCM.jl`),
+exact scans (`Scan`: cumsum / cumprod / cummax / prod) and a ROCm backend. What upstream has and we do not, by priority:
 
+| Status | Feature | Upstream | Notes for the port |
+|--------|---------|----------|--------------------|
+| next | Paged attention / shared KV pool | `luminal_nn::{cache,attention}`, `model_zoo::paged_llama3` | Functional graph primitives: a flat slot cache per layer, `scatter_rows` / `gather_rows`, GQA over the gathered context, additive biases built from positions and sequence ids. Allocation and page tables stay with the caller. |
+| open | Mixture-of-experts layer | `luminal_nn::moe`, `qwen3_moe`, `gemma4_moe` | `Qwen35.jl` mentions MoE; check how much of a generic routed-expert layer exists before porting. |
+| open | Pooling layers | `luminal_nn::pooling` | No pooling layer in `NN.jl` (NCM has host-side area pooling only). Needed for YOLO. |
+| open | FP8 Llama | `llama3_1_fp8` | FP8 storage and dequantizing matmul; gfx1151 has no FP8 matrix cores, so a dequantize-then-GEMM path. |
+| open | Gemma 4 MoE, Qwen3 MoE, Flux2, YOLO v11 | `model_zoo` | Models; each needs the layers above first. |
+| open | PyTorch frontend | `crates/pytorch` (PT2 translator, SPMD, ShapeVar buckets) | Not planned: Reactant (StableHLO) is the interop route here. |
+| open | Metal backend | `luminal_metal` | Not planned (no Julia Metal story we use). |
+| open | Search compiler depth | egglog rulesets, layout IR, memory arenas, bucketed graph residency, profile-guided search | Ours is a smaller Metatheory e-graph layer (`EGraphRewrite.jl`) plus measured search for prefill graphs. |
+| open | Symbolic `split_dims` / `merge_dims` | simplifier rules `(x*y)/y -> x` (#566) | Dimensions here support `+` and `*` only (no symbolic `div`), so the failure those rules fix cannot occur yet; revisit if symbolic splits are added. |
+| open | Checked integer overflow in scans | `LogicalScan*` reference semantics | Our `cumprod` on integers wraps. |
+| open | Tracing / profiling export | `luminal_tracing` (Perfetto) | `LAUNCH_PROFILE`-style timers exist; no trace export. |
+| not planned | Multi-GPU / distributed | | Single device. |
 
-### Training Support ❌
-- Autograd / automatic differentiation
-- Gradient computation and backpropagation
-- Optimizers (SGD, Adam, AdamW, etc.)
-- Graph-based autodiff compiler
+Done since the first version of this list: training (autograd, optimizers), quantization (int8, Q4, Q8, AWQ, GGUF native weights),
+model import (GGUF, safetensors), Phi-3 and Whisper, matrix-core kernels (`WMMA.jl`), a benchmarking suite (`benchmarks/`),
+exact scans (cumsum / cumprod / cummax / prod).
 
-**Status**: Currently inference-only. **High priority** for future development.
-
-### Distributed Computing ❌
-- Data parallelism
-- Pipeline parallelism
-- Tensor parallelism
-- Multi-GPU support
-
-**Status**: Single-device only. Not prioritized.
-
-### Additional Models
-- **[x] Whisper (speech recognition)** - Ported core architecture components (`AudioEncoder`, `TextDecoder`, `Conv1D`, `WhisperSelfAttention`, `WhisperCrossAttention`) and compiled simulation loop to `examples/whisper.jl` running at ~12 steps/sec.
-- ❌ Yolo v8 (object detection)
-- ❌ Phi 3
-
-**Status**: Llama and Whisper architectures implemented. Models can be added as needed.
-
-### Advanced Hardware Features ❌
-- Metal backend (macOS GPU)
-- Tensor Core optimization
-- Blackwell intrinsics (TMEM, TMA)
-- INT8/INT4 quantization
-
-**Status**: Metal not supported by Julia ecosystem. Tensor Cores and quantization planned.
-
-### Tooling ❌
-- Benchmarking suite vs PyTorch/other frameworks
-- Automated PyTorch validation tests
-- Model import/export (GGUF, safetensors)
-
-**Status**: Validation infrastructure needed for production use.
-
-See [`Julia/README.md`](../Julia/README.md) for detailed feature comparison.
+See [`performance_vs_luminal.md`](performance_vs_luminal.md) for measurements against upstream.
 
 ---
 
