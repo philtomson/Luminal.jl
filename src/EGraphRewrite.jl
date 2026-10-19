@@ -29,7 +29,7 @@ import ..Luminal
 using ..Luminal: Graph, ShapeTracker, realized_dims, add_op!, Op, DimType
 
 export Rewriter, to_egraph, saturate_graph!, merge_projections!, choice_groups, decisions,
-       extract_graph, static_cost, measured_search, rule_names, rule_report, RuleReport, provenance, ChosenProvenance
+       extract_graph, static_cost, measured_search, rule_names, rule_report, RuleReport, provenance, ChosenProvenance, search_space
 
 # ---------------------------------------------------------------------------
 # Shape analysis
@@ -1159,11 +1159,17 @@ end
 # rough, and the rest of the system needs memory too).
 const SEARCH_MEMORY_HEADROOM = 4 * 2^30
 
-function compile_searched(graph::Graph; search::Symbol, precision, search_inputs, search_cache,
-                          search_tolerance::Real=1e-3,
-                          device, retain::Vector{Int}, kwargs...)
-    search in (:static, :measured) || error("search must be :none, :static or :measured")
-    isempty(retain) && error("compile(...; search=$search) needs `retain`: the node ids to keep")
+"""
+    search_space(graph; search=:measured, precision, search_inputs, search_tolerance, device, retain, kwargs...)
+
+Everything a search over `graph` needs: the saturated e-graph `rw`, `build(choices; budget)` (the candidate as a `RewrittenGraph`),
+`make_runner(choices)` (build, verify against the Float32 reference, return a zero-argument step function or `nothing`),
+`lowering_decisions(choices)` (the compiler's fusion / view sites of the extracted graph, as decisions), and the search `inputs`.
+`compile_searched` runs coordinate descent over it; other strategies (random sampling, a genome search) can reuse it.
+"""
+function search_space(graph::Graph; search::Symbol=:measured, precision=false, search_inputs=nothing,
+                      search_tolerance::Real=1e-3, device, retain::Vector{Int}, kwargs...)
+    isempty(retain) && error("search_space needs `retain`: the node ids to keep")
     rw = to_egraph(graph, retain)
     saturate_graph!(rw; precision=precision)
     merge_projections!(rw; precision=precision)
@@ -1197,7 +1203,7 @@ function compile_searched(graph::Graph; search::Symbol, precision, search_inputs
                              lowering=lowering, compile_kwargs...)
         return RewrittenGraph(cg, m)
     end
-    search === :static && return build(Dict{Any, String}())
+    search === :static && return (; rw, build, user_lowering, kwargs=NamedTuple(kwargs))
 
     # Default inputs: zeros, placed on the device once (host inputs would be copied
     # in on every timed run).
@@ -1253,6 +1259,17 @@ function compile_searched(graph::Graph; search::Symbol, precision, search_inputs
         return [("lowering: " * k, [Dict{Any,String}(), Dict{Any,String}(k => "off")])
                 for k in sort!(collect(sites)) if get(user_lowering, k, true)]
     end
+    return (; rw, build, make_runner, lowering_decisions, inputs, outs, reference, user_lowering, kwargs=NamedTuple(kwargs))
+end
+
+function compile_searched(graph::Graph; search::Symbol, precision, search_inputs, search_cache,
+                          search_tolerance::Real=1e-3,
+                          device, retain::Vector{Int}, kwargs...)
+    search in (:static, :measured) || error("search must be :none, :static or :measured")
+    sp = search_space(graph; search=search, precision=precision, search_inputs=search_inputs,
+                      search_tolerance=search_tolerance, device=device, retain=retain, kwargs...)
+    search === :static && return sp.build(Dict{Any, String}())
+    (; rw, build, make_runner, lowering_decisions) = sp
     choices, _ = measured_search(rw, make_runner; cache_dir=search_cache, extra=lowering_decisions,
                                  release=run -> run isa _Runner && Luminal.release!(run.r.cg),
                                  cache_tag=string(nameof(typeof(device)), precision, search_tolerance, kwargs))

@@ -1,0 +1,32 @@
+
+== prefill, 16 tokens: 868 nodes
+setup 24 s; 12 e-graph decisions (options: 6,6,9,8,6,6,7,7,7,6,2,2)
+coordinate descent: 302 s, 44 forced choices
+random sampling: 129 assignments in 303 s (0 rejected by verification); quick times median 33.00 ms, best 21.64 ms
+head to head (15 interleaved rounds, median ms per run; the search uses :activations precision, the originals are exact):
+  original, f32 weights       42.09 ms   +116.5% vs coordinate descent    1.00x vs original f32
+  original, f16 weights       24.73 ms    +27.2% vs coordinate descent    1.70x vs original f32
+  static extraction           21.33 ms     +9.7% vs coordinate descent    1.97x vs original f32
+  coordinate descent          19.44 ms     +0.0% vs coordinate descent    2.16x vs original f32
+  random #1                   21.74 ms    +11.8% vs coordinate descent    1.94x vs original f32
+  random #2                   22.41 ms    +15.3% vs coordinate descent    1.88x vs original f32
+  random #3                   23.18 ms    +19.2% vs coordinate descent    1.82x vs original f32
+  random #4                   23.24 ms    +19.5% vs coordinate descent    1.81x vs original f32
+  random #5                   24.68 ms    +26.9% vs coordinate descent    1.71x vs original f32
+RESULT 16 tokens: original f32 42.09 ms, f16 24.73 ms, static 21.33 ms, coordinate descent 19.44 ms (2.16x over f32); best random 21.74 ms: +11.8% vs coordinate descent; fraction of quick samples faster than CD (quick-timed): 0.00
+
+== prefill, 64 tokens: 868 nodes
+setup 0 s; 12 e-graph decisions (options: 6,6,9,8,6,6,7,7,7,6,2,2)
+coordinate descent: 384 s, 110 forced choices
+random sampling: 149 assignments in 385 s (0 rejected by verification); quick times median 76.05 ms, best 45.47 ms
+head to head (15 interleaved rounds, median ms per run; the search uses :activations precision, the originals are exact):
+  original, f32 weights       61.90 ms   +113.9% vs coordinate descent    1.00x vs original f32
+  original, f16 weights       73.94 ms   +155.5% vs coordinate descent    0.84x vs original f32
+  static extraction           34.71 ms    +19.9% vs coordinate descent    1.78x vs original f32
+  coordinate descent          28.95 ms     +0.0% vs coordinate descent    2.14x vs original f32
+  random #1                   45.38 ms    +56.8% vs coordinate descent    1.36x vs original f32
+  random #2                   46.76 ms    +61.6% vs coordinate descent    1.32x vs original f32
+  random #3                   46.77 ms    +61.6% vs coordinate descent    1.32x vs original f32
+  random #4                   46.83 ms    +61.8% vs coordinate descent    1.32x vs original f32
+  random #5                   46.52 ms    +60.7% vs coordinate descent    1.33x vs original f32
+RESULT 64 tokens: original f32 61.90 ms, f16 73.94 ms, static 34.71 ms, coordinate descent 28.95 ms (2.14x over f32); best random 45.38 ms: +56.8% vs coordinate descent; fraction of quick samples faster than CD (quick-timed): 0.00

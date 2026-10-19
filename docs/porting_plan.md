@@ -220,6 +220,17 @@ what dominated decode here.
 2. **C2, genome search** over the existing choice groups: sample joint assignments, keep a population, mutate and cross. Go
    if it beats coordinate descent by 2% or more on TinyLlama decode or prefill at equal search time; otherwise keep
    coordinate descent and record the result here.
+   *Headroom experiment (`benchmarks/search_headroom.jl`, results in `benchmarks/search_headroom_results.txt`, TinyLlama
+   prefill, `:activations` precision, no graph capture):* random joint assignments of all decisions, for the same wall time
+   as coordinate descent (about 130-150 samples, 300-385 s), are far worse than coordinate descent: the best of five
+   re-timed finalists is 12% (16 tokens) and 57% (64 tokens) slower, and none of the quick-timed samples beat it. So random
+   sampling shows no headroom, and the landscape is needle-like (most joint assignments are bad). This does not test a
+   *guided* genome search, only that blind sampling is useless. Before / after the search: 16 tokens 42.1 ms (f32 original) ->
+   24.7 (f16 weights) -> 21.3 (static extraction) -> 19.4 (coordinate descent, 2.16x over f32); 64 tokens 61.9 -> 73.9 (f16
+   weights: slower than f32 here) -> 34.7 -> 29.0 (2.14x). Coordinate descent is 9.7% / 19.9% faster than the static pick.
+   Recommendation: no-go on a genome search unless a perturbation probe around the coordinate-descent optimum (two-decision
+   flips) finds a 2% win. Note: the measured search crashes with HIP graph capture (`hipErrorStreamCaptureUnsupported` from a
+   `Reshape` copy in some candidate; same failure at `51b13c4`, so not a regression).
 3. ~~**C7, rule equivalence tests**~~: done (`tests/test_rule_equivalence.jl`). For every named rule, seeded random graphs
    (random ranks, sizes, axes, batch dims) trigger it, and the static extraction plus every alternative of every decision
    is run and compared with the original graph (exact rules to 1e-5; int8 / int4 against a matmul by the dequantized
