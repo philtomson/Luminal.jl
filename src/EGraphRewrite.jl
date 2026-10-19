@@ -457,14 +457,14 @@ function _theory(precision)
 end
 
 """
-    saturate_graph!(rw; precision=false, iterations=16)
+    saturate_graph!(rw; precision=false, iterations=16, extra_rules=[])
 
-Apply the named rule sets until saturation (or the iteration/size limits). Returns Metatheory's `SaturationReport`; what each rule
+Apply the named rule sets (plus `extra_rules`, named with `_named`, e.g. to test a candidate rule) until saturation (or the iteration/size limits). Returns Metatheory's `SaturationReport`; what each rule
 matched, fired and created is kept in `rw` (see `rule_report`, `provenance`). Calling it again adds to those counts.
 """
-function saturate_graph!(rw::Rewriter; precision=false, iterations::Int=16)
+function saturate_graph!(rw::Rewriter; precision=false, iterations::Int=16, extra_rules::Vector{RewriteRule}=RewriteRule[])
     CTX[] = rw.ctx
-    theory = RewriteRule[_instrument(r, rw.log) for r in _theory(precision)]
+    theory = RewriteRule[_instrument(r, rw.log) for r in vcat(_theory(precision), extra_rules)]
     params = SaturationParams(timeout=iterations, eclasslimit=0, enodelimit=0,
                               scheduler=ReportingScheduler, schedulerparams=(log=rw.log,))
     rep = saturate!(rw.g, theory, params)
@@ -600,13 +600,17 @@ function choice_groups(rw::Rewriter)
     g = rw.g
     groups = Dict{Any, Vector{Id}}()
     for (k, ec) in g.classes
-        sigs = sort!(unique([signature(g, n) for n in ec.nodes if v_isexpr(n)]))
+        # a node that reads its own class (e.g. a reshape to the same shape, merged with its input by a rule) is not an
+        # alternative: extracting it would be a cycle
+        sigs = sort!(unique([signature(g, n) for n in ec.nodes if v_isexpr(n) && !_reads_own_class(g, ec, n)]))
         length(sigs) > 1 || continue
         key = (Tuple(sigs), ec.data === nothing ? nothing : ec.data.dims)
         push!(get!(groups, key, Id[]), ec.id)
     end
     return [(k, sort!(v), collect(k[1])) for (k, v) in sort!(collect(groups), by = x -> string(x[1]))]
 end
+
+_reads_own_class(g, ec, n) = any(c -> find(g, c) == ec.id, v_children(n))
 
 # Greedy DAG extraction: a node's cost is the summed own-cost of the *set* of
 # e-classes it depends on, so shared subgraphs count once. (Tree costs, which

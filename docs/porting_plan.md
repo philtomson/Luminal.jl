@@ -220,8 +220,15 @@ what dominated decode here.
 2. **C2, genome search** over the existing choice groups: sample joint assignments, keep a population, mutate and cross. Go
    if it beats coordinate descent by 2% or more on TinyLlama decode or prefill at equal search time; otherwise keep
    coordinate descent and record the result here.
-3. **C7, rule equivalence tests**: for each rule, random shapes and dtypes, rewritten graph versus the CPU interpreter.
-   Prerequisite for adding rules safely (step 4).
+3. ~~**C7, rule equivalence tests**~~: done (`tests/test_rule_equivalence.jl`). For every named rule, seeded random graphs
+   (random ranks, sizes, axes, batch dims) trigger it, and the static extraction plus every alternative of every decision
+   is run and compared with the original graph (exact rules to 1e-5; int8 / int4 against a matmul by the dequantized
+   weights, on the GPU). A coverage test fails if a rule never fired, and a deliberately wrong rule (`a + b` as `a * b`,
+   added through `saturate_graph!(...; extra_rules=)`) must be caught, so a new rule needs a graph that exercises it. The
+   first run found a real bug: a rule that merges a node with its own input (reshape to the same shape) made `decisions`
+   offer a self-referential alternative whose extraction crashed (`KeyError` in `_total_cost`); `choice_groups` now skips
+   nodes that read their own class. Not covered yet: dtypes other than Float32, and the merged-projection pass
+   (`merge_projections!`, tested separately in `test_egraph_rewrite.jl`).
 4. **C1, recognise fused ops from primitives** for softmax, RMSNorm and SwiGLU, which `NCM.jl` and `Gemma3.jl` currently spell
    out by hand. Go if the recognised graph runs as fast as the hand-fused one.
 5. **C6 + C5, bounds, buckets and a bufferization plan**, together: bounds and buckets decide which programs exist, the plan
