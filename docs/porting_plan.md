@@ -136,7 +136,7 @@ exact scans (`Scan`: cumsum / cumprod / cummax / prod) and a ROCm backend. What 
 
 | Status | Feature | Upstream | Notes for the port |
 |--------|---------|----------|--------------------|
-| next | Paged attention / shared KV pool | `luminal_nn::{cache,attention}`, `model_zoo::paged_llama3` | Functional graph primitives: a flat slot cache per layer, `scatter_rows` / `gather_rows`, GQA over the gathered context, additive biases built from positions and sequence ids. Allocation and page tables stay with the caller. |
+| partly done | Paged attention / shared KV pool | `luminal_nn::{cache,attention}`, `model_zoo::paged_llama3` | `src/PagedAttention.jl` has the graph primitives (flat slot cache, `gather_rows` / `scatter_rows`, GQA over the gathered context, causal / sequence-isolation / sliding-window biases, `packed_sequence_ids`), tested against a per-sequence reference on CPU and GPU. Not done: a batched paged Llama decode graph (upstream `paged_llama3`) and a page-table allocator; neither is in the primitives by design. |
 | open | Mixture-of-experts layer | `luminal_nn::moe`, `qwen3_moe`, `gemma4_moe` | `Qwen35.jl` mentions MoE; check how much of a generic routed-expert layer exists before porting. |
 | open | Pooling layers | `luminal_nn::pooling` | No pooling layer in `NN.jl` (NCM has host-side area pooling only). Needed for YOLO. |
 | open | FP8 Llama | `llama3_1_fp8` | FP8 storage and dequantizing matmul; gfx1151 has no FP8 matrix cores, so a dequantize-then-GEMM path. |

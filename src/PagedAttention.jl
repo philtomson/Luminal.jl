@@ -138,7 +138,7 @@ Causal, and only the `window` most recent positions (the query's own included).
 function sliding_window_bias(qpos::GraphTensor, kpos::GraphTensor, window::Int)
     window > 0 || throw(ArgumentError("attention window must be positive"))
     q, k = _pair(_f32(qpos), _f32(kpos))
-    return select((k > q) + (k < q - Float32(window - 1)) > 0f0, MASKED_SCORE, 0f0)
+    return select(cast(k > q, Float32) + cast(k < q - Float32(window - 1), Float32) > 0f0, MASKED_SCORE, 0f0)
 end
 
 """
