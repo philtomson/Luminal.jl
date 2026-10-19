@@ -143,7 +143,7 @@ exact scans (`Scan`: cumsum / cumprod / cummax / prod) and a ROCm backend. What 
 | open | Gemma 4 MoE, Qwen3 MoE, Flux2, YOLO v11 | `model_zoo` | Models; each needs the layers above first. |
 | open | PyTorch frontend | `crates/pytorch` (PT2 translator, SPMD, ShapeVar buckets) | Not planned: Reactant (StableHLO) is the interop route here. |
 | open | Metal backend | `luminal_metal` | Not planned (no Julia Metal story we use). |
-| open | Search compiler depth | egglog rulesets, layout IR, memory arenas, bucketed graph residency, profile-guided search | Ours is a smaller Metatheory e-graph layer (`EGraphRewrite.jl`) plus measured search for prefill graphs. |
+| next | Compiler and search depth | egglog rulesets, logical / layout IR, genome search, bufferization and arenas, bounds and buckets | The largest gap and the core of upstream's design; see [Compiler and search](#compiler-and-search-the-largest-gap) below. |
 | open | Symbolic `split_dims` / `merge_dims` | simplifier rules `(x*y)/y -> x` (#566) | Dimensions here support `+` and `*` only (no symbolic `div`), so the failure those rules fix cannot occur yet; revisit if symbolic splits are added. |
 | open | Checked integer overflow in scans | `LogicalScan*` reference semantics | Our `cumprod` on integers wraps. |
 | open | Tracing / profiling export | `luminal_tracing` (Perfetto) | `LAUNCH_PROFILE`-style timers exist; no trace export. |
@@ -154,6 +154,80 @@ model import (GGUF, safetensors), Phi-3 and Whisper, matrix-core kernels (`WMMA.
 exact scans (cumsum / cumprod / cummax / prod).
 
 See [`performance_vs_luminal.md`](performance_vs_luminal.md) for measurements against upstream.
+
+---
+
+## Compiler and search: the largest gap
+
+Written 2026-10-18 from upstream's `spec.md`, `docs/design/*`, `docs/architecture.md` and the module headers of
+`src/{extraction,search_support,bucketing}.rs`, `src/buffer/*`, `src/layout/*`, `src/logical/*` (about 28k lines of Rust in
+`src/`; I have not read every rule). Our side is `src/EGraphRewrite.jl`, `src/Compiler.jl` and
+[`egraph_rewrite_layer.md`](egraph_rewrite_layer.md).
+
+### What upstream does
+
+```
+frontend recorder -> logical SSA (primitive ops, symbolic dims with bounds)
+  -> egglog saturation (named rulesets; backends add rewrites HLIR -> backend ops)   the only place rewriting happens
+  -> extraction: a genome picks one producer per e-class        } search = genetic algorithm over genomes,
+  -> backend profiles each candidate (fitness = measured time)  } every candidate is valid by construction
+  -> layout IR (LayoutTensor: logical shape + physical layout as separate, searchable facts)
+  -> destination-passing rewrite -> bufferization (alias / in-place conflict analysis, MLIR-style)
+  -> arena (one storage plan; boundary buffers owned by the application) -> runtime
+```
+
+Design rules that shape it: HLIR is a closed set of about 20 primitive ops, and everything else (fused kernels, matmul
+libraries, attention) is introduced by a backend's egglog rules and chosen by extraction; no post-extraction passes may
+pattern-match or fuse; every extractable graph must be semantically equivalent to the logical program for all valid
+dtypes, shapes, strides and dynamic dims; a CPU `ReferenceRuntime` implements every HLIR op as the semantic oracle; every rule
+lives in a named ruleset and has a unique name, so run reports are keyed by rule; dynamic dimensions carry interval bounds,
+and an application may compile one program per bucket and dispatch on the runtime values of the dynamic variables, with
+an optional arena shared by the buckets.
+
+### What we have
+
+A Metatheory.jl e-graph over the whole `Graph` (not a primitive subset: the nodes are our fused ops), a rule set of about
+ten theories (expand elimination, scale motion, merged projections, transposed matmul, precision / quantization per
+matmul, kernel-variant alternatives), greedy DAG extraction with a refinement pass, and a **measured search** that does
+coordinate descent over about 13 choice groups, timing verified candidates against the incumbent in interleaved rounds
+with a cache. `compile()` is the executor: elementwise fusion, buffer reuse and aliasing, constant folding, HIP graph capture.
+Search for a TinyLlama decode step took 14.54 ms per token against 14.9 for the unsearched Float16 path, and the measured
+search found prefill mixes no fixed choice gives (up to 19% at 16 tokens), so the machinery pays off where it applies.
+
+### The gaps, with what each would buy here
+
+| # | Gap | Upstream | Ours | Why it matters for this project |
+|---|-----|----------|------|----------------------------------|
+| C1 | Rewriting from primitives | Fusion and lowering are rules over ~20 primitive ops | Fused ops (`SoftmaxOp`, `RMSNormOp`, `DecodeAttention`, ...) are produced by the front end or by `compile()` passes, and the rules choose between alternatives we encoded | New fusions mean new hand-written ops and `compile()` code. Recognising softmax / RMSNorm / SwiGLU from primitives would make model code backend-neutral. |
+| C2 | Search algorithm | Genetic search over complete genomes (joint choices, crossover) | Coordinate descent over groups, plus a few joint decisions | Coordinate descent cannot find choices that only pay together (it needed hand-made joint decisions for merged projections). Cheap to try on the existing groups. |
+| C3 | Rule hygiene and reporting | Named rulesets, unique rule names, per-rule run reports | Anonymous `@theory` blocks | We cannot say which rule made a graph larger or slower; debugging the Metatheory issues in `egraph_rewrite_layer.md` was done by hand. |
+| C4 | Layout IR | Logical shape and physical layout are separate; layouts are e-class facts the search can choose | `ShapeTracker` views plus explicit `Contiguous`; weight layouts chosen by hand (`HalfWeight`, `MatMulT`, `Q4Weight`, ...) | Needed before kernels can be generated rather than hand-written, and for searching transposes and tilings. Large; defer until generated kernels are on the table. |
+| C5 | Bufferization and arenas | One-shot bufferization with alias analysis, destination-passing, an arena that packs device tensors and scratch, boundary buffers owned by the caller | Reuse and aliasing inside `compile()`; buffers freed by the garbage collector (see the 27B memory notes) | Peak memory is our real limit on gfx1151 (27B, 262k context). A liveness-based plan with caller-owned boundary buffers would replace the chunked-prefill and GC workarounds. |
+| C6 | Bounded dynamic dims and buckets | `SymbolBounds` intervals with interval analysis; one compiled program per bucket; dispatch on `dyn_map`; shared arena | Symbolic dims re-plan buffers when a symbol changes; prefill is padded to power-of-two buckets by hand in `llama_generate` | Replaces the ad hoc padding and the per-position reallocation; with C5, buckets can share one arena. |
+| C7 | Semantic oracle and equivalence tests | `ReferenceRuntime` plus fixtures for every rule over shapes, dtypes and strides | Search verifies each candidate's outputs against the original graph on one input; the CPU interpreter exists but there are no per-rule property tests | A wrong rule is caught at search time only when it fires on that input. Per-rule tests would catch dtype and stride cases first. |
+| C8 | Rewriting engine | egglog (named rulesets, schedules, multi-pattern rules, primitives) | Metatheory.jl 3.0 on a fork branch; single-rooted patterns (merged projections needed a separate pass); defined-function head names silently never match | Our rule language is the limit on C1. egglog has no Julia binding; options are an FFI to the Rust crate or staying on Metatheory with the workarounds. |
+| C9 | Backend profiling interface | `profile(llir)` is part of the Runtime trait | `measured_search(rw, make_runner)` is generic, the device code is not factored as a runtime | Fine for one backend; only matters if we add another. |
+
+Where we are ahead or equal: measured search with interleaved rounds, noise-aware acceptance (more than 1% and at least 4 of 5
+rounds) and an on-disk winner cache; kernel parameters (threads, columns per pass) as search variants; quantization as a rewrite
+choice. Upstream searches layouts and fusions we cannot express; we search precision and kernel shape per matmul, which is
+what dominated decode here.
+
+### Proposed order (each step ends with a go / no-go)
+
+1. **C3, rule names and per-rule reports** in `EGraphRewrite.jl` (small). Go when a search report lists which rules created
+   the chosen graph's nodes.
+2. **C2, genome search** over the existing choice groups: sample joint assignments, keep a population, mutate and cross. Go
+   if it beats coordinate descent by 2% or more on TinyLlama decode or prefill at equal search time; otherwise keep
+   coordinate descent and record the result here.
+3. **C7, rule equivalence tests**: for each rule, random shapes and dtypes, rewritten graph versus the CPU interpreter.
+   Prerequisite for adding rules safely (step 4).
+4. **C1, recognise fused ops from primitives** for softmax, RMSNorm and SwiGLU, which `NCM.jl` and `Gemma3.jl` currently spell
+   out by hand. Go if the recognised graph runs as fast as the hand-fused one.
+5. **C6 + C5, bounds, buckets and a bufferization plan**, together: bounds and buckets decide which programs exist, the plan
+   decides their memory. Go if peak memory of a 32k-token 27B prefill drops without a throughput loss.
+6. **C4, layout IR**, only if we commit to generated kernels.
+7. **C8**: revisit the rewriting engine after step 4 shows whether Metatheory's rule language holds.
 
 ---
 
