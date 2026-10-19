@@ -187,6 +187,8 @@ Requirements:
 | `examples/llama_chat.jl` | Text generation from a Llama-family checkpoint (TinyLlama, Llama-3-8B-Instruct): `--chat`, `--int8`, `--search=static\|measured`, extra `--prompt=` flags for a batch, `--interactive` |
 | `examples/qwen35_server.jl` | OpenAI-compatible server for a Qwen3.5/3.6/3.8 GGUF (streaming, tool calls, MTP speculative decoding, prompt caching) |
 | `examples/qwen35_gguf.jl` | One-shot text generation from a Qwen3.5/3.6/3.8 GGUF |
+| `examples/ncm_generate.jl` | Next-Concept Modeling ([HazyResearch/ncm](https://github.com/HazyResearch/ncm)) text generation with the TinyStories checkpoint: 128 tokens in 12 forward passes, coarse to fine (`--n`, `--seed`, `--temp`, `--top_k`, `--top_p`, `--cpu`); convert the checkpoint first with `examples/ncm_convert.py` |
+| `examples/ncm_reference.py`, `examples/ncm_tokenizer_reference.py` | PyTorch references (generator logits; quantizer and decoder token ids) for checking the Luminal NCM port |
 | `examples/llama_reference.py` | Dumps Hugging Face reference logits and greedy continuations for a Llama checkpoint |
 | `examples/llama_validate.jl` | Compares a checkpoint's logits, greedy output and batched output with that reference, and times decode |
 | `examples/batched_decode.jl` | Decode throughput against batch size |
