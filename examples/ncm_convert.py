@@ -6,9 +6,30 @@ Reads generator.pt and tokenizer.pt with torch.load(weights_only=True) (no pickl
 generator.safetensors and tokenizer.safetensors next to them. Training-only state (EMA statistics, hit counters,
 the precomputed attention mask) is dropped; the level-0 unigram table that seeds generation is kept as `level0_unigram`.
 """
-import sys
+import sys, pickle, codecs, struct
 import torch
 from safetensors.torch import save_file
+
+class _Unpickler(pickle.Unpickler):
+    """The BPE vocabulary pickle holds only ints and bytes; refuse any other global."""
+    def find_class(self, module, name):
+        if (module, name) == ("_codecs", "encode"):
+            return codecs.encode
+        raise pickle.UnpicklingError(f"blocked {module}.{name}")
+
+def convert_bpe(src, dst):
+    """Vocabulary {id: bytes} -> raw file: int32 n, int32 offsets[n + 1], the concatenated token bytes (little endian).
+    The merge list is only needed to encode text."""
+    with open(src, "rb") as f:
+        vocab = _Unpickler(f).load()
+    toks = [vocab[i] for i in range(len(vocab))]
+    off = [0]
+    for t in toks:
+        off.append(off[-1] + len(t))
+    with open(dst, "wb") as f:
+        f.write(struct.pack(f"<{len(off) + 1}i", len(toks), *off))
+        f.write(b"".join(toks))
+    print(f"{dst}: {len(toks)} tokens")
 
 DROP = ("ema_cluster_size_", "ema_w_", "codebook_hit_", "attn_mask_for_masking", "lvl_1L")
 
@@ -24,3 +45,4 @@ if __name__ == "__main__":
     convert(f"{d}/generator.pt", f"{d}/generator.safetensors",
             lambda ck: {"level0_unigram": ck["inference"]["level0_unigram"].float().contiguous()})
     convert(f"{d}/tokenizer.pt", f"{d}/tokenizer.safetensors", lambda ck: {})
+    convert_bpe(f"{d}/bpe_vocab_8192.pickle", f"{d}/bpe_vocab.bin")
