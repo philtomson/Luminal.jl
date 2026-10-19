@@ -228,8 +228,14 @@ what dominated decode here.
    *guided* genome search, only that blind sampling is useless. Before / after the search: 16 tokens 42.1 ms (f32 original) ->
    24.7 (f16 weights) -> 21.3 (static extraction) -> 19.4 (coordinate descent, 2.16x over f32); 64 tokens 61.9 -> 73.9 (f16
    weights: slower than f32 here) -> 34.7 -> 29.0 (2.14x). Coordinate descent is 9.7% / 19.9% faster than the static pick.
-   Recommendation: no-go on a genome search unless a perturbation probe around the coordinate-descent optimum (two-decision
-   flips) finds a 2% win. Note: the measured search crashes with HIP graph capture (`hipErrorStreamCaptureUnsupported` from a
+   *Neighbourhood probe (`benchmarks/search_neighbourhood.jl`, results in `benchmarks/search_neighbourhood_results.txt`):*
+   around the coordinate-descent optimum, every single-decision change (74 / 76) plus two-decision changes for the same wall
+   time (106 / 103), cheap-pass timed against the incumbent and the best six re-timed in 15 interleaved rounds. Best neighbour:
+   -1.91% at 16 tokens (19.03 vs 19.41 ms; a choice-group option plus one Slice-view lowering off, the best of ~180, so
+   partly winner's curse) and -0.49% at 64 tokens (30.18 vs 30.33 ms). The median neighbour is 8% / 15% slower. Neither reaches
+   the 2% gate, and the 16-token gain is about the timing noise (a few percent per single timing). **Decision: no-go on a genome
+   search; keep coordinate descent.** Revisit only if the search space grows (new decisions from C1 fusions) or capture-mode
+   timing, which this probe could not use, moves the optimum. Note: the measured search crashes with HIP graph capture (`hipErrorStreamCaptureUnsupported` from a
    `Reshape` copy in some candidate; same failure at `51b13c4`, so not a regression).
 3. ~~**C7, rule equivalence tests**~~: done (`tests/test_rule_equivalence.jl`). For every named rule, seeded random graphs
    (random ranks, sizes, axes, batch dims) trigger it, and the static extraction plus every alternative of every decision

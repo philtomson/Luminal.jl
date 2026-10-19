@@ -1,0 +1,28 @@
+
+== prefill, 16 tokens: 868 nodes
+coordinate descent: 303 s, 44 forced choices
+neighbourhood: 74 distinct single-decision changes
+evaluated 74 single and 106 pair neighbours (0 rejected by verification); cheap-pass ratio vs incumbent: median 1.080, best 0.982, 0 below 0.98
+head to head (15 interleaved rounds, median ms per run):
+  coordinate descent (incumbent)                                            19.41 ms   +0.00% vs incumbent
+  (2048, 16, 1) opt 6 + lowering lowering: view Slice (256, 16, 1)          19.03 ms   -1.91% vs incumbent
+  (2048, 16, 1) opt 6                                                       19.17 ms   -1.22% vs incumbent
+  (2048, 16, 1) opt 6                                                       19.71 ms   +1.56% vs incumbent
+  (2560, 16, 1) opt 4                                                       19.62 ms   +1.12% vs incumbent
+  (2048, 16, 1) opt 4 + (2048, 16, 1) opt 6                                 19.65 ms   +1.24% vs incumbent
+  (32000, 16, 1) opt 4 + (11264, 16, 1) opt 1                               19.58 ms   +0.92% vs incumbent
+RESULT 16 tokens: best neighbour 19.03 ms vs coordinate descent 19.41 ms: -1.91% (gate: -2% or better)
+
+== prefill, 64 tokens: 868 nodes
+coordinate descent: 361 s, 110 forced choices
+neighbourhood: 76 distinct single-decision changes
+evaluated 76 single and 103 pair neighbours (0 rejected by verification); cheap-pass ratio vs incumbent: median 1.147, best 0.977, 2 below 0.98
+head to head (15 interleaved rounds, median ms per run):
+  coordinate descent (incumbent)                                            30.33 ms   +0.00% vs incumbent
+  lowering lowering: view Slice (2048, 64, 1)                               30.33 ms   -0.00% vs incumbent
+  (2048, 64, 1) opt 5                                                       30.21 ms   -0.37% vs incumbent
+  (2048, 64, 1) opt 6                                                       30.27 ms   -0.18% vs incumbent
+  (5632, 64, 1) opt 2 + (5632, 64, 1) opt 8                                 30.18 ms   -0.49% vs incumbent
+  (2048, 64, 1) opt 4 + (2560, 64, 1) opt 4                                 30.30 ms   -0.09% vs incumbent
+  lowering lowering: view Reshape (2048, 64, 1)                             30.56 ms   +0.76% vs incumbent
+RESULT 64 tokens: best neighbour 30.18 ms vs coordinate descent 30.33 ms: -0.49% (gate: -2% or better)
