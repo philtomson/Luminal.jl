@@ -81,6 +81,9 @@ export greedy_decode, transcribe, WhisperSession, llama_generate, LlamaSession, 
 
 # Next-Concept Modeling generator
 include("PagedAttention.jl")
+include("PagedLlama.jl")
+include("Pooling.jl")
+include("MoE.jl")
 include("NCM.jl")
 export NCM
 

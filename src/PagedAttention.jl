@@ -204,4 +204,149 @@ function paged_attention(query::GraphTensor, new_keys::GraphTensor, new_values::
     return (output=grouped_query_attention(query, ctx.keys, ctx.values, bias, geo), cache=cache)
 end
 
+
+# --- page-table allocator (host side) --------------------------------------------------------------------------------
+
+module PageTables
+
+export PageTable, OutOfPages, reserve!, release!, truncate!, slots_of, sequence_length, free_pages, has_sequence, plan_step
+
+"A request needed more pages than are free; the table is left unchanged."
+struct OutOfPages <: Exception
+    needed::Int
+    free::Int
+end
+Base.showerror(io::IO, e::OutOfPages) = print(io, "OutOfPages: need $(e.needed) more page(s), $(e.free) free")
+
+"""
+    PageTable(slots; page_size=16)
+
+Host-side allocator for a flat slot pool of `slots` physical slots, handed out in pages of `page_size`. Each sequence
+(an integer id) owns a list of pages and a length; its token `t` lives in slot `pages[t ÷ page_size + 1] * page_size + t % page_size`
+(0-based). Allocation is all-or-nothing, and freed pages are reused (lowest index first).
+"""
+mutable struct PageTable
+    page_size::Int
+    n_pages::Int
+    free::Vector{Int}                    # free page indices, a stack (lowest on top)
+    pages::Dict{Int,Vector{Int}}
+    lengths::Dict{Int,Int}
+    function PageTable(slots::Int; page_size::Int=16)
+        page_size > 0 && slots >= page_size || throw(ArgumentError("need slots >= page_size > 0"))
+        n = slots ÷ page_size
+        return new(page_size, n, collect(n-1:-1:0), Dict{Int,Vector{Int}}(), Dict{Int,Int}())
+    end
+end
+
+free_pages(pt::PageTable) = length(pt.free)
+has_sequence(pt::PageTable, seq::Integer) = haskey(pt.lengths, seq)
+sequence_length(pt::PageTable, seq::Integer) = get(pt.lengths, seq, 0)
+
+_slot(pt::PageTable, pages, t) = pages[t ÷ pt.page_size + 1] * pt.page_size + t % pt.page_size
+
+"""
+    reserve!(pt, seq, n) -> Vector{Int}
+
+Extend sequence `seq` (created on first use) by `n` tokens and return their `n` physical slots, in logical order.
+Throws `OutOfPages` without changing anything if the pool cannot hold them.
+"""
+function reserve!(pt::PageTable, seq::Integer, n::Integer)
+    n >= 0 || throw(ArgumentError("cannot reserve $n tokens"))
+    len = get(pt.lengths, seq, 0)
+    have = length(get(pt.pages, seq, Int[]))
+    need = cld(len + n, pt.page_size) - have
+    need <= length(pt.free) || throw(OutOfPages(need, length(pt.free)))
+    pages = get!(pt.pages, seq, Int[])
+    for _ in 1:need
+        push!(pages, pop!(pt.free))
+    end
+    pt.lengths[seq] = len + n
+    return [_slot(pt, pages, t) for t in len:len+n-1]
+end
+
+"All of `seq`'s slots in logical order (token 0 first)."
+function slots_of(pt::PageTable, seq::Integer)
+    haskey(pt.lengths, seq) || throw(KeyError(seq))
+    pages = pt.pages[seq]
+    return [_slot(pt, pages, t) for t in 0:pt.lengths[seq]-1]
+end
+
+"Forget `seq` and return its pages to the pool."
+function release!(pt::PageTable, seq::Integer)
+    haskey(pt.lengths, seq) || throw(KeyError(seq))
+    for p in pt.pages[seq]
+        push!(pt.free, p)
+    end
+    sort!(pt.free; rev=true)
+    delete!(pt.pages, seq); delete!(pt.lengths, seq)
+    return nothing
+end
+
+"Shorten `seq` to `len` tokens (e.g. rejected speculative tokens), freeing pages that become empty."
+function truncate!(pt::PageTable, seq::Integer, len::Integer)
+    haskey(pt.lengths, seq) || throw(KeyError(seq))
+    0 <= len <= pt.lengths[seq] || throw(ArgumentError("cannot truncate a sequence of $(pt.lengths[seq]) to $len"))
+    pages = pt.pages[seq]
+    keep = cld(len, pt.page_size)
+    while length(pages) > keep
+        push!(pt.free, pop!(pages))
+    end
+    sort!(pt.free; rev=true)
+    pt.lengths[seq] = len
+    return nothing
+end
+
+"""
+    plan_step(pt, items; rows, context, pool_slots) -> NamedTuple
+
+One step over `items = [seq => tokens, ...]` (each token is one row): reserves the slots and returns the padded vectors a
+paged decode graph takes. All are `Int` vectors, `rows` long (`tokens`, `positions`, `write_slots`, `row_seq`) or
+`context` long (`read_slots`, `key_positions`, `key_seq`); padding rows write to slot `pool_slots` (out of range, so the write
+is dropped), and padding context entries read that slot and carry sequence id -1, so every query masks them. If the step does not fit,
+nothing is reserved. Also returns `last_row`: the row of each item's last token.
+"""
+function plan_step(pt::PageTable, items; rows::Int, context::Int, pool_slots::Int)
+    nrows = sum(length(t) for (_, t) in items; init=0)
+    nrows <= rows || throw(ArgumentError("$nrows tokens do not fit in $rows rows"))
+    seqs = unique(first.(items))
+    before = Dict(s => (has_sequence(pt, s) ? sequence_length(pt, s) : nothing) for s in seqs)
+    try
+        tokens = zeros(Int, rows); positions = zeros(Int, rows); write_slots = fill(pool_slots, rows); row_seq = fill(-2, rows)
+        last_row = Int[]
+        r = 0
+        for (s, toks) in items
+            start = sequence_length(pt, s)
+            slots = reserve!(pt, s, length(toks))
+            for (i, t) in enumerate(toks)
+                r += 1
+                tokens[r] = t; positions[r] = start + i - 1; write_slots[r] = slots[i]; row_seq[r] = s
+            end
+            push!(last_row, r)
+        end
+        ctx = sum(sequence_length(pt, s) for s in seqs)
+        ctx <= context || throw(ArgumentError("context of $ctx tokens does not fit in $context entries"))
+        read_slots = fill(pool_slots, context); key_positions = zeros(Int, context); key_seq = fill(-1, context)
+        c = 0
+        for s in seqs, (p, sl) in enumerate(slots_of(pt, s))
+            c += 1
+            read_slots[c] = sl; key_positions[c] = p - 1; key_seq[c] = s
+        end
+        return (; tokens, positions, write_slots, row_seq, read_slots, key_positions, key_seq, last_row)
+    catch
+        for s in seqs                                    # undo: restore the lengths and pages this call took
+            if before[s] === nothing
+                has_sequence(pt, s) && release!(pt, s)
+            else
+                truncate!(pt, s, before[s])
+            end
+        end
+        rethrow()
+    end
+end
+
+end # module PageTables
+
+using .PageTables
+export PageTables, PageTable, OutOfPages, reserve!, release!, truncate!, slots_of, sequence_length, free_pages, has_sequence, plan_step
+
 end # module PagedAttention
