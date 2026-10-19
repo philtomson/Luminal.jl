@@ -157,6 +157,59 @@ end
 # precision=:int8 / :int4: the static extraction chooses the quantized kernels,
 # and the measured search keeps only candidates that match it (the quantized
 # results, not Float32) -- they must equal the graph run on the dequantized weights.
+@testset "named rules and the rule report" begin
+    all_features = (:weights, :activations, :int8, :int4)
+    names = rule_names(precision=all_features)
+    @test allunique(names) && all(n -> occursin(r"^[a-z0-9]+\.[a-z0-9_-]+$", n), names)
+    @test rule_names() == filter(n -> startswith(n, r"canonical|algebra|kernel"), names)
+    @test length(rule_names(precision=:int8)) == length(rule_names()) + 4
+
+    g = Graph()
+    x = Luminal.tensor(g, [4, 3]); y = Luminal.tensor(g, [4, 5, 3]); w = Luminal.tensor(g, [6, 4]); xin = Luminal.tensor(g, [4, 5])
+    out = Luminal.expand(x, 2, 5) * y + 1.0f0
+    mm = Luminal.matmul(w, xin) * 0.5f0
+    rw = to_egraph(g, [out.id, mm.id])
+    rep = saturate_graph!(rw; precision=true)
+    r = rule_report(rw)
+    @test r.iterations == rep.iterations && r.reason === rep.reason
+    row(n) = only(filter(x -> x.name == n, r.rows))
+    @test row("canonical.mul-expand-lhs").fired == 2           # Mul(Expand(x), y) rewritten to a reshape-broadcast, twice
+    @test row("canonical.mul-expand-rhs").fired == 0           # no such pattern: matched but declined
+    @test row("algebra.scale-into-lhs").fired == 2 && row("algebra.scale-into-rhs").fired == 2
+    @test row("canonical.reshape-chain").matches > 0 && !row("canonical.reshape-chain").dynamic
+    @test all(x -> x.fired <= x.matches, r.rows)
+    @test row("precision.f16-gemv-64").matches > 0              # a MatMul on a (weight-like) input was offered
+    @test occursin("canonical.mul-expand-lhs", sprint(show, MIME("text/plain"), r))
+
+    # which rules created the nodes of the extracted graph: the scale moved into the matmul's rhs, the expand became a reshape
+    pv = provenance(rw)
+    @test pv.by_rule["canonical.mul-expand-lhs"] == 1 && pv.by_rule["algebra.scale-into-rhs"] == 1
+    @test pv.input == 3
+    @test occursin("algebra.scale-into-rhs", sprint(show, MIME("text/plain"), pv))
+    # forcing no choices extracts the same graph as before: provenance is a read-only view
+    ng, m = extract_graph(rw)
+    @test !any(n -> n.op isa Luminal.Expand, ng.nodes)
+
+    # variants of one rule family differ only in their parameters: forcing one credits exactly that rule
+    g2 = Graph()
+    w2 = Luminal.tensor(g2, [64, 64]); x2 = Luminal.tensor(g2, [64, 1, 1])
+    g2.tensors[(w2.id, 1)] = ones(Float32, 64, 64)               # a weight (persistent tensor)
+    o2 = Luminal.matmul(w2, x2)
+    rw2 = to_egraph(g2, [o2.id])
+    saturate_graph!(rw2; precision=:int4)
+    opts = only(filter(d -> occursin("xMatMulQ4", d[1]), decisions(rw2)))[2]
+    for (variant, rule) in (("xMatMulQ4(128, 0)", "int4.t128-c0"), ("xMatMulQ4(0, 1)", "int4.t0-c1"), ("xMatMulQ4(256, 0)", "int4.t256-c0"))
+        opt = only(filter(o -> !isempty(o) && startswith(first(values(o)), variant), opts))
+        @test provenance(rw2; choices=opt).by_rule == Dict(rule => 1)
+    end
+    @test isempty(provenance(rw2; choices=only(filter(o -> !isempty(o) && startswith(first(values(o)), "xMatMul("), opts))).by_rule)
+
+    # a second saturation adds to the counts and never fires more than before
+    before = row("canonical.mul-expand-lhs").fired
+    saturate_graph!(rw; precision=true)
+    @test only(filter(x -> x.name == "canonical.mul-expand-lhs", rule_report(rw).rows)).fired >= before
+end
+
 if get_device() isa Luminal.AMDDevice
     @testset "search with int8 / int4 weights" begin
         dev = get_device()

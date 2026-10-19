@@ -29,7 +29,7 @@ import ..Luminal
 using ..Luminal: Graph, ShapeTracker, realized_dims, add_op!, Op, DimType
 
 export Rewriter, to_egraph, saturate_graph!, merge_projections!, choice_groups, decisions,
-       extract_graph, static_cost, measured_search
+       extract_graph, static_cost, measured_search, rule_names, rule_report, RuleReport, provenance, ChosenProvenance
 
 # ---------------------------------------------------------------------------
 # Shape analysis
@@ -141,6 +141,44 @@ _thaw(::Type{T}, p) where {T <: AbstractVector} = convert(T, collect(p))
 _thaw(::Type, p) = p
 _rebuild_op(T::DataType, params) = T((_thaw(fieldtype(T, i), params[i]) for i in 1:fieldcount(T))...)
 
+# ---------------------------------------------------------------------------
+# Rule log: what each named rule matched, fired and created
+# ---------------------------------------------------------------------------
+
+mutable struct RuleStat
+    matches::Int     # e-matches found by the search phases, summed over iterations
+    fired::Int       # dynamic-rule applications that produced a node (static `-->` rules do not report this)
+    bans::Int        # times the backoff scheduler banned the rule for matching too much
+end
+RuleStat() = RuleStat(0, 0, 0)
+
+"""
+Collector filled by `saturate_graph!`: per-rule statistics, and for each node a dynamic rule created, its head and
+the e-classes of its children (a later union may merge them: compare canonical ids), so that `provenance` can say which
+rule produced a node of the extracted graph.
+"""
+mutable struct RuleLog
+    stats::Dict{String,RuleStat}
+    created::Dict{Symbol,Vector{Tuple{Any,Vector{Any},String}}}  # head => [(params, child classes or `nothing`, rule)]
+    iterations::Int
+    reason::Union{Symbol,Nothing}
+    searched::Dict{String,Int}                                  # rule => iterations in which it was searched
+    original::Vector{Tuple{Symbol,Vector{Id}}}                  # the input graph's e-nodes: head and child classes
+end
+RuleLog() = RuleLog(Dict{String,RuleStat}(), Dict{Symbol,Vector{Tuple{Any,Vector{Any},String}}}(), 0, nothing, Dict{String,Int}(),
+                    Tuple{Symbol,Vector{Id}}[])
+
+_stat(log::RuleLog, name::String) = get!(log.stats, name, RuleStat())
+
+# A copy of `r` named `name`. `@theory` rules are anonymous, and `RewriteRule` is immutable.
+_rename(r::RewriteRule, name::String) = RewriteRule(; (f => getfield(r, f) for f in fieldnames(typeof(r)))..., name=name)
+
+# Name a rule set: `prefix.name` for each rule, in order (a length mismatch is a bug in the table below, caught at load).
+function _named(rules, prefix::String, names)
+    length(rules) == length(names) || error("rule set $prefix has $(length(rules)) rules but $(length(names)) names")
+    return RewriteRule[_rename(r, string(prefix, ".", n)) for (r, n) in zip(rules, names)]
+end
+
 """
     Rewriter
 
@@ -153,7 +191,9 @@ struct Rewriter
     graph::Graph
     roots::Vector{Int}          # original node ids to preserve (outputs)
     class_of::Vector{Id}        # original node id -> e-class id
+    log::RuleLog                # what each named rule matched and created (see `rule_report`)
 end
+Rewriter(g, ctx, graph, roots, class_of) = Rewriter(g, ctx, graph, roots, class_of, RuleLog())
 
 function _edge(g, ctx, child_class::Id, st::ShapeTracker, producer_shape::ShapeTracker)
     Luminal._is_trivial_view(st, producer_shape) && return g[child_class]
@@ -179,6 +219,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
+    log = RuleLog()
     class_of = Vector{Id}(undef, length(graph.nodes))
     for (nid, node) in enumerate(graph.nodes)
         op = node.op
@@ -197,6 +238,10 @@ function to_egraph(graph::Graph, roots::Vector{Int})
         end
         id = addexpr!(g, ex)
         ec = g[id]
+        for n in ec.nodes
+            v_isexpr(n) && get_constant(g, v_head(n)) === ex.args[1] &&
+                push!(log.original, (ex.args[1], Id[c for c in v_children(n)[2:end]]))
+        end
         if ec.data === nothing
             isconst = nid in ctx.weights ||
                       (!isempty(node.inputs) && all(_isconst(g, class_of[i]) for (i, _, _) in node.inputs))
@@ -207,7 +252,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
         class_of[nid] = id
     end
     g.root = addexpr!(g, Expr(:call, :xRoots, (), (g[class_of[r]] for r in roots)...))
-    return Rewriter(g, ctx, graph, copy(roots), class_of)
+    return Rewriter(g, ctx, graph, copy(roots), class_of, log)
 end
 
 # ---------------------------------------------------------------------------
@@ -239,7 +284,7 @@ function _expand_to_broadcast(h, p, e, a, b)
     return Expr(:call, h, p, Expr(:call, :xReshape, (one_dim,), a), b)
 end
 
-const CANONICAL_RULES = @theory p q e a b s begin
+const CANONICAL_RULES = _named((@theory p q e a b s begin
     xMul(p::Tuple, xExpand(e::Tuple, a), b) => _expand_to_broadcast(:xMul, p, e, a, b)
     xMul(p::Tuple, b, xExpand(e::Tuple, a)) => _expand_to_broadcast(:xMul, p, e, a, b)
     xAdd(p::Tuple, xExpand(e::Tuple, a), b) => _expand_to_broadcast(:xAdd, p, e, a, b)
@@ -247,35 +292,35 @@ const CANONICAL_RULES = @theory p q e a b s begin
     # Consecutive reshapes collapse; a reshape to the same shape is the identity
     xReshape(p::Tuple, xReshape(q::Tuple, a)) --> xReshape(p, a)
     xReshape(p::Tuple, a) => (a.data !== nothing && isequal(Tuple(p[1]), a.data.dims)) ? a : nothing
-end
+end), "canonical", ("mul-expand-lhs", "mul-expand-rhs", "add-expand-lhs", "add-expand-rhs", "reshape-chain", "reshape-identity"))
 
 # Scaling a matmul's result by a scalar equals scaling either operand first. Which
 # is cheapest depends on the operand sizes, and on whether an operand is a weight.
-const ALGEBRAIC_RULES = @theory p q a b s begin
+const ALGEBRAIC_RULES = _named((@theory p q a b s begin
     xMul(p::Tuple, xMatMul(q::Tuple, a, b), s) =>
         _scalar(s.data === nothing ? nothing : s.data.dims) ? :(xMatMul($q, xMul($p, $a, $s), $b)) : nothing
     xMul(p::Tuple, xMatMul(q::Tuple, a, b), s) =>
         _scalar(s.data === nothing ? nothing : s.data.dims) ? :(xMatMul($q, $a, xMul($p, $b, $s))) : nothing
-end
+end), "algebra", ("scale-into-lhs", "scale-into-rhs"))
 
 # Precision choice (not exact: rounds weights to Float16): a weight matmul may run
 # with Float16 weights, with the GEMV kernel at any of its workgroup sizes (the
 # best one depends on the matrix shape). Opt-in.
 _half_ok(g, w) = _is_weight(g, w) && w.data !== nothing && length(w.data.dims) == 2
 const WEIGHT_VARIANTS = ((64, :gemv), (128, :gemv), (256, :gemv))
-const PRECISION_RULES = @theory q w x begin
+const PRECISION_RULES = _named((@theory q w x begin
     xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((64, :gemv)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((128, :gemv)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256, :gemv)), $w, $x)) : nothing
-end
+end), "precision", ("f16-gemv-64", "f16-gemv-128", "f16-gemv-256"))
 
 # precision=:activations additionally offers rocBLAS's mixed-precision GEMM
 # (:gemm_ex), which rounds the *activations* to Float16 too: ~2x Float32 GEMM for
 # prefill-sized inputs, but ~5e-3 relative logit error over TinyLlama's 22 layers.
 const ACTIVATION_VARIANTS = ((256, :gemm_ex),)
-const ACTIVATION_RULES = @theory q w x begin
+const ACTIVATION_RULES = _named((@theory q w x begin
     xMatMul(q::Tuple, w, x) => _half_ok(_egraph, w) ? :(xMatMulF16($((256, :gemm_ex)), $w, $x)) : nothing
-end
+end), "activation", ("f16-gemm_ex",))
 
 # precision=:int8 offers weight-only int8 (group-wise scales) for weight matmuls:
 # half the bytes of Float16 for decode, lossy (see docs). Each variant is
@@ -284,12 +329,12 @@ end
 # the number of columns and the GPU, so a measured search times them.
 const INT8_VARIANTS = ((0, 0), (128, 0), (256, 0), (0, 8))
 _int8_ok(g, w) = _half_ok(g, w) && w.data.dims[2] % 16 == 0
-const INT8_RULES = @theory q w x begin
+const INT8_RULES = _named((@theory q w x begin
     xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((0, 0)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((128, 0)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((256, 0)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _int8_ok(_egraph, w) ? :(xMatMulQ8($((0, 8)), $w, $x)) : nothing
-end
+end), "int8", ("t0-c0", "t128-c0", "t256-c0", "t0-c8"))
 
 # precision=:int4 offers 4-bit weights (Q4Weight: symmetric, groups of 32 by
 # default). Variants are (threads per workgroup, columns per pass), 0 = the
@@ -298,12 +343,12 @@ end
 # `weight_dtype` policies (see `weight_preset`).
 const INT4_VARIANTS = ((0, 0), (128, 0), (256, 0), (0, 1))
 _int4_ok(g, w) = _half_ok(g, w) && w.data.dims[2] % 32 == 0
-const INT4_RULES = @theory q w x begin
+const INT4_RULES = _named((@theory q w x begin
     xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((0, 0)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((128, 0)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((256, 0)), $w, $x)) : nothing
     xMatMul(q::Tuple, w, x) => _int4_ok(_egraph, w) ? :(xMatMulQ4($((0, 1)), $w, $x)) : nothing
-end
+end), "int4", ("t0-c0", "t128-c0", "t256-c0", "t0-c1"))
 
 # Gross verification tolerance for the static extraction with int8 weights (see
 # compile_searched: candidates are then checked against it). Against Float32,
@@ -340,30 +385,125 @@ end
 # Kernel choice: a matmul whose operand is a Permute swapping the first two dims can
 # read the unpermuted tensor through a BLAS transpose flag instead of copying it.
 _is_swap12(p) = (d = p[1]; length(d) >= 2 && d[1] == 2 && d[2] == 1 && all(d[i] == i for i in 3:length(d)))
-const KERNEL_RULES = @theory q p r a b begin
+const KERNEL_RULES = _named((@theory q p r a b begin
     xMatMul(q::Tuple, xPermute(p::Tuple, a), b) =>
         _is_swap12(p) ? :(xMatMulT($((true, false)), $a, $b)) : nothing
     xMatMul(q::Tuple, a, xPermute(p::Tuple, b)) =>
         _is_swap12(p) ? :(xMatMulT($((false, true)), $a, $b)) : nothing
     xMatMul(q::Tuple, xPermute(p::Tuple, a), xPermute(r::Tuple, b)) =>
         (_is_swap12(p) && _is_swap12(r)) ? :(xMatMulT($((true, true)), $a, $b)) : nothing
+end), "kernel", ("matmul-transpose-lhs", "matmul-transpose-rhs", "matmul-transpose-both"))
+
+# Backoff scheduling (Metatheory's default) that also tells the rule log what each search found.
+mutable struct ReportingScheduler <: Metatheory.EGraphs.Schedulers.AbstractScheduler
+    inner::Metatheory.EGraphs.Schedulers.BackoffScheduler
+    theory::Vector{RewriteRule}
+    log::RuleLog
+end
+function ReportingScheduler(g::EGraph, theory; log::RuleLog)
+    inner = Metatheory.EGraphs.Schedulers.BackoffScheduler(g, theory)
+    return ReportingScheduler(inner, collect(RewriteRule, theory), log)
+end
+const _Sch = Metatheory.EGraphs.Schedulers
+_Sch.cansaturate(s::ReportingScheduler) = _Sch.cansaturate(s.inner)
+_Sch.cansearch(s::ReportingScheduler, i::Int) = _Sch.cansearch(s.inner, i)
+_Sch.cansearch(s::ReportingScheduler, i::Int, id) = _Sch.cansearch(s.inner, i, id)
+_Sch.setiter!(s::ReportingScheduler, it::Int) = _Sch.setiter!(s.inner, it)
+_Sch.rebuild!(s::ReportingScheduler) = _Sch.rebuild!(s.inner)
+function _Sch.inform!(s::ReportingScheduler, i::Int, n::Int)
+    st = _stat(s.log, s.theory[i].name)
+    st.matches += n
+    s.log.searched[s.theory[i].name] = get(s.log.searched, s.theory[i].name, 0) + 1
+    before = first(s.inner.data[i])
+    _Sch.inform!(s.inner, i, n)
+    st.bans += first(s.inner.data[i]) - before
+    return nothing
+end
+
+# A dynamic rule's right-hand side, reporting each node it creates to `log`.
+function _instrument(r::RewriteRule, log::RuleLog)
+    _stat(log, r.name)
+    r.op === (|>) || return r
+    f, name = r.right_fun, r.name
+    wrapped = function (id, g, args...)
+        res = f(id, g, args...)
+        if res !== nothing
+            _stat(log, name).fired += 1
+            if res isa Expr && res.head === :call && length(res.args) >= 1 && res.args[1] isa Symbol
+                kids = Any[a isa EClass ? a.id : (a isa Integer ? a : nothing) for a in res.args[3:end]]
+                push!(get!(log.created, res.args[1], Tuple{Any,Vector{Any},String}[]), (res.args[2], kids, name))
+            end
+        end
+        return res
+    end
+    return RewriteRule(; (f_ => getfield(r, f_) for f_ in fieldnames(typeof(r)) if f_ !== :right_fun)..., right_fun=wrapped)
 end
 
 """
-    saturate_graph!(rw; precision=false, iterations=8)
+    rule_names(; precision=false) -> Vector{String}
 
-Apply the rule sets until saturation (or the iteration/size limits).
+The names of the rules `saturate_graph!` applies for `precision`, in order: `canonical.*`, `algebra.*`, `kernel.*`, then `precision.*`,
+`activation.*`, `int8.*`, `int4.*` when enabled. Names are unique.
+"""
+rule_names(; precision=false) = String[r.name for r in _theory(precision)]
+
+function _theory(precision)
+    f = _precision_features(precision)
+    return vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES,
+                :weights in f ? PRECISION_RULES : RewriteRule[],
+                :activations in f ? ACTIVATION_RULES : RewriteRule[],
+                :int8 in f ? INT8_RULES : RewriteRule[],
+                :int4 in f ? INT4_RULES : RewriteRule[])
+end
+
+"""
+    saturate_graph!(rw; precision=false, iterations=16)
+
+Apply the named rule sets until saturation (or the iteration/size limits). Returns Metatheory's `SaturationReport`; what each rule
+matched, fired and created is kept in `rw` (see `rule_report`, `provenance`). Calling it again adds to those counts.
 """
 function saturate_graph!(rw::Rewriter; precision=false, iterations::Int=16)
     CTX[] = rw.ctx
-    f = _precision_features(precision)
-    theory = vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES,
-                  :weights in f ? PRECISION_RULES : RewriteRule[],
-                  :activations in f ? ACTIVATION_RULES : RewriteRule[],
-                  :int8 in f ? INT8_RULES : RewriteRule[],
-                  :int4 in f ? INT4_RULES : RewriteRule[])
-    params = SaturationParams(timeout=iterations, eclasslimit=0, enodelimit=0)
-    return saturate!(rw.g, theory, params)
+    theory = RewriteRule[_instrument(r, rw.log) for r in _theory(precision)]
+    params = SaturationParams(timeout=iterations, eclasslimit=0, enodelimit=0,
+                              scheduler=ReportingScheduler, schedulerparams=(log=rw.log,))
+    rep = saturate!(rw.g, theory, params)
+    rw.log.iterations += rep.iterations
+    rw.log.reason = rep.reason
+    return rep
+end
+
+"""
+    RuleReport
+
+A table of the rules of the last `saturate_graph!` calls: for each rule its e-matches, how many nodes it created (`fired`; a
+static `-->` rule cannot say, shown as `-`) and how often the backoff scheduler banned it. `rule_report(rw)` builds one; printing
+it gives the table. Fields: `rows`, `iterations`, `reason`, `classes`, `nodes`.
+"""
+struct RuleReport
+    rows::Vector{NamedTuple{(:name, :matches, :fired, :bans, :dynamic),Tuple{String,Int,Int,Int,Bool}}}
+    iterations::Int
+    reason::Union{Symbol,Nothing}
+    classes::Int
+    nodes::Int
+end
+
+function rule_report(rw::Rewriter; precision=nothing)
+    log = rw.log
+    names = precision === nothing ? sort!(collect(keys(log.stats))) : rule_names(precision=precision)
+    dyn = Set(r.name for r in vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES, PRECISION_RULES, ACTIVATION_RULES, INT8_RULES, INT4_RULES)
+              if r.op === (|>))
+    rows = [(; name=n, matches=_stat(log, n).matches, fired=_stat(log, n).fired, bans=_stat(log, n).bans, dynamic=n in dyn) for n in names]
+    return RuleReport(rows, log.iterations, log.reason, length(rw.g.classes), length(rw.g.memo))
+end
+
+function Base.show(io::IO, ::MIME"text/plain", r::RuleReport)
+    println(io, "RuleReport: ", r.iterations, " iterations, stopped by ", r.reason, "; ", r.classes, " e-classes, ", r.nodes, " e-nodes")
+    w = maximum(length(x.name) for x in r.rows; init=4)
+    println(io, "  ", rpad("rule", w), "  matches   fired  bans")
+    for x in r.rows
+        println(io, "  ", rpad(x.name, w), "  ", lpad(x.matches, 7), "  ", lpad(x.dynamic ? string(x.fired) : "-", 6), "  ", lpad(x.bans, 4))
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -608,12 +748,18 @@ Rebuild a Graph choosing one e-node per e-class: the alternative whose
 else the node with the lowest static tree cost. `idmap` maps original root and input node ids to new ids;
 persistent tensors are carried over.
 """
-function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
+function _choose(rw::Rewriter, choices)
     g = rw.g
     CTX[] = rw.ctx
     greedy = _dag_extract(g, choices)
     pick = Dict(id => b[2] for (id, b) in greedy)
     _refine!(g, pick, choices, g.root, Dict(id => b[1] for (id, b) in greedy))
+    return pick
+end
+
+function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
+    g = rw.g
+    pick = _choose(rw, choices)
     ng = Graph()
     memo = Dict{Id, Int}()
     idmap = Dict{Int, Int}()
@@ -656,6 +802,64 @@ function extract_graph(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
         idmap[r] = build(rw.class_of[r])
     end
     return ng, idmap
+end
+
+
+"""
+    ChosenProvenance
+
+Where the nodes of an extracted graph came from: `nodes` lists each reachable derived node as `(class, head, rules)`, `by_rule` counts
+chosen nodes per creating rule, `input` the nodes that were in the original graph, and `unattributed` those created by a static (`-->`)
+rule, which cannot report what it creates. A node that several rules created counts once for each.
+"""
+struct ChosenProvenance
+    nodes::Vector{NamedTuple{(:class, :head, :rules),Tuple{Id,Symbol,Vector{String}}}}
+    by_rule::Dict{String,Int}
+    input::Int
+    unattributed::Int
+end
+
+"""
+    provenance(rw; choices=Dict()) -> ChosenProvenance
+
+Which rule created each node of the graph `extract_graph(rw; choices)` would build.
+"""
+function provenance(rw::Rewriter; choices::AbstractDict=Dict{Id,String}())
+    g, log = rw.g, rw.log
+    pick = _choose(rw, choices)
+    original = Set((h, Id[find(g, c) for c in kids]) for (h, kids) in log.original)
+    nodes = NamedTuple{(:class, :head, :rules),Tuple{Id,Symbol,Vector{String}}}[]
+    by_rule = Dict{String,Int}()
+    input = unattributed = 0
+    for c in sort!(collect(_reachable(g, pick, g.root)))
+        n = pick[c]
+        v_isexpr(n) || continue
+        h = get_constant(g, v_head(n))
+        h in (:xIn, :xView, :xRoots) && continue
+        kids = Id[find(g, k) for k in v_children(n)[2:end]]
+        params = _lit(g, v_children(n)[1])
+        if (h, kids) in original
+            input += 1
+            continue
+        end
+        rules = String[]
+        for (rparams, rkids, name) in get(log.created, h, ())
+            isequal(rparams, params) && length(rkids) == length(kids) &&
+                all(i -> rkids[i] === nothing || find(g, rkids[i]) == kids[i], eachindex(kids)) &&
+                !(name in rules) && push!(rules, name)
+        end
+        isempty(rules) ? (unattributed += 1) : foreach(r -> by_rule[r] = get(by_rule, r, 0) + 1, rules)
+        push!(nodes, (; class=c, head=h, rules))
+    end
+    return ChosenProvenance(nodes, by_rule, input, unattributed)
+end
+
+function Base.show(io::IO, ::MIME"text/plain", p::ChosenProvenance)
+    println(io, "ChosenProvenance: ", p.input, " nodes from the input graph, ", length(p.nodes) - p.unattributed, " created by named rules, ",
+            p.unattributed, " by static rules")
+    for (name, n) in sort!(collect(p.by_rule); by=x -> (-x[2], x[1]))
+        println(io, "  ", rpad(name, 28), n)
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -1048,6 +1252,10 @@ function compile_searched(graph::Graph; search::Symbol, precision, search_inputs
     choices, _ = measured_search(rw, make_runner; cache_dir=search_cache, extra=lowering_decisions,
                                  release=run -> run isa _Runner && Luminal.release!(run.r.cg),
                                  cache_tag=string(nameof(typeof(device)), precision, search_tolerance, kwargs))
+    prov = provenance(rw; choices=Dict{Any,String}(k => v for (k, v) in choices if !(k isa String)))
+    println("rules behind the chosen graph (nodes created): ",
+            isempty(prov.by_rule) ? "none" : join(("$k=$v" for (k, v) in sort!(collect(prov.by_rule); by=first)), ", "),
+            "; ", prov.input, " input nodes, ", prov.unattributed, " from static rules")
     return build(choices)
 end
 

@@ -200,7 +200,7 @@ search found prefill mixes no fixed choice gives (up to 19% at 16 tokens), so th
 |---|-----|----------|------|----------------------------------|
 | C1 | Rewriting from primitives | Fusion and lowering are rules over ~20 primitive ops | Fused ops (`SoftmaxOp`, `RMSNormOp`, `DecodeAttention`, ...) are produced by the front end or by `compile()` passes, and the rules choose between alternatives we encoded | New fusions mean new hand-written ops and `compile()` code. Recognising softmax / RMSNorm / SwiGLU from primitives would make model code backend-neutral. |
 | C2 | Search algorithm | Genetic search over complete genomes (joint choices, crossover) | Coordinate descent over groups, plus a few joint decisions | Coordinate descent cannot find choices that only pay together (it needed hand-made joint decisions for merged projections). Cheap to try on the existing groups. |
-| C3 | Rule hygiene and reporting | Named rulesets, unique rule names, per-rule run reports | Anonymous `@theory` blocks | We cannot say which rule made a graph larger or slower; debugging the Metatheory issues in `egraph_rewrite_layer.md` was done by hand. |
+| C3 | Rule hygiene and reporting | Named rulesets, unique rule names, per-rule run reports | **Done**: every rule has a unique `set.name` (`rule_names()`), `saturate_graph!` logs matches / firings / bans per rule (`rule_report(rw)`), and `provenance(rw; choices)` says which rule created each node of the extracted graph (variants of one family are told apart by their parameters; static `-->` rules cannot report what they create). `compile_searched` prints the summary for the chosen graph. Was: anonymous `@theory` blocks | We cannot say which rule made a graph larger or slower; debugging the Metatheory issues in `egraph_rewrite_layer.md` was done by hand. |
 | C4 | Layout IR | Logical shape and physical layout are separate; layouts are e-class facts the search can choose | `ShapeTracker` views plus explicit `Contiguous`; weight layouts chosen by hand (`HalfWeight`, `MatMulT`, `Q4Weight`, ...) | Needed before kernels can be generated rather than hand-written, and for searching transposes and tilings. Large; defer until generated kernels are on the table. |
 | C5 | Bufferization and arenas | One-shot bufferization with alias analysis, destination-passing, an arena that packs device tensors and scratch, boundary buffers owned by the caller | Reuse and aliasing inside `compile()`; buffers freed by the garbage collector (see the 27B memory notes) | Peak memory is our real limit on gfx1151 (27B, 262k context). A liveness-based plan with caller-owned boundary buffers would replace the chunked-prefill and GC workarounds. |
 | C6 | Bounded dynamic dims and buckets | `SymbolBounds` intervals with interval analysis; one compiled program per bucket; dispatch on `dyn_map`; shared arena | Symbolic dims re-plan buffers when a symbol changes; prefill is padded to power-of-two buckets by hand in `llama_generate` | Replaces the ad hoc padding and the per-position reallocation; with C5, buckets can share one arena. |
@@ -215,8 +215,8 @@ what dominated decode here.
 
 ### Proposed order (each step ends with a go / no-go)
 
-1. **C3, rule names and per-rule reports** in `EGraphRewrite.jl` (small). Go when a search report lists which rules created
-   the chosen graph's nodes.
+1. ~~**C3, rule names and per-rule reports**~~ in `EGraphRewrite.jl`: done; a search now prints which rules created the chosen
+   graph's nodes. (Next: step 2.)
 2. **C2, genome search** over the existing choice groups: sample joint assignments, keep a population, mutate and cross. Go
    if it beats coordinate descent by 2% or more on TinyLlama decode or prefill at equal search time; otherwise keep
    coordinate descent and record the result here.
