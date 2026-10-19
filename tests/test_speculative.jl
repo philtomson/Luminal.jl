@@ -40,20 +40,20 @@ end
     d = MTPDrafter(s)
 
     # 1. the random head's own drafts (mostly wrong): rollback on nearly every cycle
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     spec = generate_ids_speculative(s, d, prompt; max_new_tokens=14, stats=st)
     @test spec == plain
     @test st[:emitted] == 14
 
     # 2. oracle drafts: every draft is the true next token, so every cycle accepts (2 tokens per cycle)
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     oracle(n, draft) = n + 1 <= length(plain) ? plain[n + 1] : draft
     spec = generate_ids_speculative(s, d, prompt; max_new_tokens=14, stats=st, draft_hook=oracle)
     @test spec == plain
     @test st[:accepted] == st[:cycles] && st[:cycles] >= 6
 
     # 3. a mix: right, wrong, right, wrong... (accepts and rollbacks interleaved)
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     flip = Ref(0)
     mixed(n, draft) = (flip[] += 1; isodd(flip[]) && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, model.config.vocab_size))
     spec = generate_ids_speculative(s, d, prompt; max_new_tokens=14, stats=st, draft_hook=mixed)
@@ -68,31 +68,31 @@ end
 
     # 6. two drafts per cycle (a 3-token verify step with two state snapshots): same output for any drafts
     d3 = MTPDrafter(s)
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     @test generate_ids_speculative(s, d3, prompt; max_new_tokens=14, stats=st, ndraft=2) == plain
     @test st[:emitted] == 14
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     @test generate_ids_speculative(s, d3, prompt; max_new_tokens=14, stats=st, ndraft=2, draft_hook=oracle) == plain
     @test st[:accepted2] >= st[:cycles] - 1 && st[:cycles] >= 4   # all 3 tokens per cycle (bar the last, past the end of `plain`)
     flip2 = Ref(0)
     mixed2(n, draft) = (flip2[] += 1; flip2[] % 3 != 0 && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, model.config.vocab_size))
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     @test generate_ids_speculative(s, d3, prompt; max_new_tokens=14, stats=st, ndraft=2, draft_hook=mixed2) == plain
     @test 0 < st[:accepted] && st[:accepted2] < st[:cycles]          # all three outcomes: reject, 2 tokens, 3 tokens
     @test generate_ids_speculative(s, d3, prompt2; max_new_tokens=10, ndraft=2) == plain2
 
     # 7. three drafts per cycle (a 4-token verify step with three state snapshots)
     d4 = MTPDrafter(s)
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3) == plain
     @test st[:emitted] == 14
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3, draft_hook=oracle) == plain
     @test st[:accepted3] >= st[:cycles] - 1 && st[:cycles] >= 3   # all 4 tokens per cycle (bar the last)
     for period in (2, 3, 4, 5)                                     # wrong drafts at different positions of the cycle
         cnt = Ref(0)
         wrongs(n, draft) = (cnt[] += 1; cnt[] % period != 0 && n + 1 <= length(plain) ? plain[n + 1] : mod(draft + 1, model.config.vocab_size))
-        st = Dict{Symbol,Int}()
+        st = Dict{Symbol,Any}()
         @test generate_ids_speculative(s, d4, prompt; max_new_tokens=14, stats=st, ndraft=3, draft_hook=wrongs) == plain
     end
     @test generate_ids_speculative(s, d4, prompt2; max_new_tokens=10, ndraft=3) == plain2
@@ -100,6 +100,6 @@ end
 
     # 5. a restricted draft vocabulary only changes which tokens get drafted, never the output
     d2 = MTPDrafter(s; draft_vocab=model.config.vocab_size ÷ 2)
-    st = Dict{Symbol,Int}()
+    st = Dict{Symbol,Any}()
     @test generate_ids_speculative(s, d2, prompt; max_new_tokens=14, stats=st) == plain
 end

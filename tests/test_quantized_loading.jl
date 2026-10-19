@@ -40,10 +40,11 @@ prompts = [[3, 14, 15, 9, 2, 6, 30], [11, 40, 7, 1, 25]]
     g32, l32, s32 = run(W32)
     # prefill: dequantize + GEMM. On a GPU the GEMM runs on the matrix cores (src/WMMA.jl),
     # which round the activations (and dequantized weights) to Float16: ~2e-4 on these logits.
-    # (int4 weights with M % 16 == 0 use it too, so nearly every tiny-model matmul rounds its activations)
+    # (int4 and int8 weights with M % 16 == 0 use it too, so nearly every tiny-model matmul rounds its activations:
+    # int8 measured 3e-3 / 5e-3 on prefill and 2e-3 on decode, and ~1e-7 / 3e-6 with LUMINAL_WMMA=0)
     gpu = dev isa Luminal.AbstractGPUDevice
-    ptol = gpu ? (T === Luminal.Int4 ? 1e-2 : 1e-3) : 1e-4
-    dtol = gpu && T === Luminal.Int4 ? 1e-2 : 1e-4   # decode continues from the Float16-rounded prefill state
+    ptol = gpu ? (T === Float16 ? 1e-3 : 1e-2) : 1e-4
+    dtol = gpu && T !== Float16 ? 1e-2 : 1e-4   # decode continues from the Float16-rounded prefill state
     @test all(relerr(lq[b], l32[b]) < ptol for b in 1:2)
     @test all(relerr(sq[k], s32[k]) < dtol for k in eachindex(s32))      # decode: GEMV kernels
     @test gq == g32
