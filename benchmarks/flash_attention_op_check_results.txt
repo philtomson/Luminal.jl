@@ -1,0 +1,9 @@
+# FlashAttentionOp against a Float64 reference, CPU op and GPU op (benchmarks/flash_attention_op_check.jl)
+(32, 8, 2, 1) causal=false: CPU op vs ref 2.3e-7   GPU op vs ref 1.4e-7
+(32, 8, 2, 1) causal=true: CPU op vs ref 1.0e-7   GPU op vs ref 9.9e-8
+(64, 16, 2, 1) causal=false: CPU op vs ref 2.0e-7   GPU op vs ref 0.71
+(64, 16, 2, 1) causal=true: CPU op vs ref 1.3e-7   GPU op vs ref 1.0
+(64, 64, 2, 1) causal=false: CPU op vs ref 3.6e-7   GPU op vs ref 1.0
+(64, 64, 2, 1) causal=true: CPU op vs ref 1.5e-7   GPU op vs ref 0.95
+(64, 256, 2, 1) causal=false: CPU op vs ref 3.6e-7   GPU op vs ref 1.0
+(64, 256, 2, 1) causal=true: CPU op vs ref 1.9e-7   GPU op vs ref 1.0

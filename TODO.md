@@ -1162,3 +1162,12 @@ Candidates, most valuable first:
 Pitfalls from the page worth remembering: a matching token prefix is not enough (an edit at 7,001 of 8,192 tokens restores the checkpoint at
 6,144, because the 8,192 one contains the old text); the same tokens do not give the same bytes (kernel tiling and batching change the
 floating-point addition order), so never mix K/V rows from one run with recurrent state from another.
+
+## FlashAttentionOp's GPU kernel is wrong for head sizes of 64 and up (found 2026-10-20)
+
+`flash_attention(q, k, v; causal)` -> `FlashAttentionOp` (`flash_attn_fwd_kernel`, `src/Execution.jl`): on the GPU the output is correct at D=32 but has relative
+error ~1.0 against a Float64 reference at D=64 (S=16..1500) and 0.87 at D=128; the CPU op is exact (`benchmarks/flash_attention_op_check.jl`, results next
+to it). Its launch computes the workgroup size as `1 << (31 - leading_zeros(d - 1) + 1)` capped at 256, which looks wrong for Int64 `leading_zeros`
+(untested guess); the kernel also holds `s_Q`/`s_O` as 128-entry local arrays. It is also 8-12x slower than the composite attention
+(`benchmarks/attn_unmasked.jl`). Nothing in the models uses it (NN uses `CausalAttention` or the composite form); `tests/test_attention.jl` does not
+catch it. Either fix and test it at D=64/128, or delete the op.

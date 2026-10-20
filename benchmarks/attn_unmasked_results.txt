@@ -1,0 +1,5 @@
+D=64  S=256  H=8  B=1   composite     0.139 ms   FlashAttentionOp     1.385 ms   (0.10x)   rel err: composite 8.7e-07, fused 1.0e+00
+D=64  S=750  H=12 B=1   composite     1.331 ms   FlashAttentionOp    16.540 ms   (0.08x)   rel err: composite 9.7e-07, fused 1.0e+00
+D=64  S=1500 H=20 B=1   composite     8.285 ms   FlashAttentionOp   108.024 ms   (0.08x)   rel err: composite 1.4e-06, fused 1.0e+00
+D=128 S=512  H=8  B=1   composite     0.634 ms   FlashAttentionOp     5.303 ms   (0.12x)   rel err: composite 9.0e-07, fused 8.7e-01
+D=64  S=1500 H=20 B=2   composite    16.305 ms   FlashAttentionOp   215.117 ms   (0.08x)   rel err: composite 1.5e-06, fused 1.0e+00
