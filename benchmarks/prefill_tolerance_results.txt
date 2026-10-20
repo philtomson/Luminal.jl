@@ -1,0 +1,13 @@
+relative error of the static extraction (precision=true) against the original graph
+  len 6   zero tokens   logits 1.1e-05   K layer 1 9.8e-07, 22 3.9e-06   V layer 1 1.8e-06, 22 1.3e-05   worst of all outputs 1.7e-05
+  len 6   random tokens logits 7.3e-06   K layer 1 1.2e-06, 22 1.8e-06   V layer 1 1.4e-06, 22 4.3e-06   worst of all outputs 7.3e-06
+  len 8   zero tokens   logits 1.1e-05   K layer 1 1.0e-06, 22 3.9e-06   V layer 1 1.8e-06, 22 1.3e-05   worst of all outputs 1.7e-05
+  len 8   random tokens logits 3.8e-05   K layer 1 1.2e-06, 22 1.4e-06   V layer 1 1.0e-06, 22 3.3e-06   worst of all outputs 3.8e-05
+  len 15  zero tokens   logits 1.1e-05   K layer 1 1.0e-06, 22 4.2e-06   V layer 1 1.8e-06, 22 1.3e-05   worst of all outputs 1.7e-05
+  len 15  random tokens logits 9.5e-06   K layer 1 1.4e-06, 22 1.4e-06   V layer 1 7.9e-07, 22 3.7e-06   worst of all outputs 9.5e-06
+  len 16  zero tokens   logits 8.4e-04   K layer 1 1.0e-06, 22 2.9e-04   V layer 1 1.8e-06, 22 7.0e-04   worst of all outputs 1.3e-03
+  len 16  random tokens logits 3.8e-04   K layer 1 1.5e-06, 22 1.6e-04   V layer 1 1.1e-06, 22 6.1e-04   worst of all outputs 6.6e-04
+  len 32  zero tokens   logits 5.6e-04   K layer 1 0.0e+00, 22 2.0e-04   V layer 1 0.0e+00, 22 5.8e-04   worst of all outputs 6.7e-04
+  len 32  random tokens logits 3.1e-04   K layer 1 0.0e+00, 22 2.5e-04   V layer 1 0.0e+00, 22 6.8e-04   worst of all outputs 1.0e-03
+  len 64  zero tokens   logits 5.6e-04   K layer 1 0.0e+00, 22 2.0e-04   V layer 1 0.0e+00, 22 5.8e-04   worst of all outputs 6.7e-04
+  len 64  random tokens logits 4.2e-04   K layer 1 0.0e+00, 22 2.2e-04   V layer 1 0.0e+00, 22 1.1e-03   worst of all outputs 1.1e-03

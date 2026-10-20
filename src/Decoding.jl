@@ -149,8 +149,11 @@ function _prefill_graph(s::LlamaSession, slen::Int, B::Int)
         else
             @info "Searching equivalent prefill graphs ($(s.search), $slen × $B)..."
             ids = Luminal.to_device(zeros(Float32, slen, B), s.device)
+            # (search_tolerance: from 16 tokens on, the Float16 weights make the prefill GEMMs run on the Float16 matrix cores, which differ from the
+            # original graph by 6e-4 to 1.3e-3 (benchmarks/prefill_tolerance_results.txt; ~1e-5 below 16 tokens), just over the default 1e-3; a broken
+            # candidate is wrong by order 1)
             compile(g; device=s.device, retain=vcat(retain, input.id), search=s.search,
-                    precision=on_gpu, search_inputs=Dict{Int,Any}(input.id => ids))
+                    precision=on_gpu, search_inputs=Dict{Int,Any}(input.id => ids), search_tolerance=1e-2)
         end
         (exec=exec, input_id=input.id, out_id=out.id, kv_ids=[(k.id, v.id) for (k, v) in kvs],
          lens_id=lens === nothing ? 0 : lens.id, last_only=last_only, hidden_id=hidden_id)
