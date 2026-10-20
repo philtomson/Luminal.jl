@@ -267,6 +267,32 @@ end
     @test fused_in_static_extraction((x, w, z) -> Luminal.std_norm(x, 1, 1f-6) * w * Luminal.silu(z), ([8, 3], [8], [8, 3]), Luminal.GatedRMSNormOp)[1] == 1
     @test fused_in_static_extraction((x, w, z) -> Luminal.std_norm(x, 1, 1f-6) * w * Luminal.gelu(z), ([8, 3], [8], [8, 3]), Luminal.GatedRMSNormOp)[1] == 0
     @test fused_in_static_extraction((x, w, z) -> Luminal.std_norm(x, 1, 1f-6) * w * Luminal.silu(z), ([8, 3], [8], [8, 1]), Luminal.GatedRMSNormOp)[1] == 0     # z broadcasts
+
+    # LayerNorm with weight and bias, tanh GELU, and Gemma's (1 + w) RMSNorm (the weight operand is any tensor of shape (H,): here w + 1)
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        d = rdims(rng, rand(rng, 1:3), lo=2, hi=6)
+        x = input!(g, ins, d); wt = input!(g, ins, [d[1]]); bs = input!(g, ins, [d[1]])
+        return [Luminal.layer_norm(x, 1, Float32(rand(rng, [1e-5, 1e-6]))) * wt + bs], ins
+    end)
+    @test w < 1e-5 && n > 1 && get(FIRED, "fusion.layernorm-affine", 0) > 0
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        return [Luminal.gelu(input!(g, ins, rdims(rng, rand(rng, 1:3), lo=2, hi=6)))], ins
+    end; tol=1e-5)
+    @test w < 1e-5 && n > 1 && get(FIRED, "fusion.gelu-tanh", 0) > 0
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        d = rdims(rng, rand(rng, 1:3), lo=2, hi=6)
+        x = input!(g, ins, d); wt = input!(g, ins, [d[1]])
+        return [Luminal.std_norm(x, 1, 1f-6) * (wt + 1f0)], ins
+    end)
+    @test w < 1e-5 && n > 1
+    @test fused_in_static_extraction((x, w, b) -> Luminal.layer_norm(x, 1, 1f-5) * w + b, ([8, 3], [8], [8]), Luminal.LayerNormOp)[1] == 1
+    @test fused_in_static_extraction((x, w) -> Luminal.layer_norm(x, 1, 1f-5) * w, ([8, 3], [8]), Luminal.LayerNormOp)[1] == 0          # no bias
+    @test fused_in_static_extraction(x -> Luminal.gelu(x), ([8, 3],), Luminal.GeluOp) == (1, 2, 24)
+    @test fused_in_static_extraction(x -> Luminal.gelu(x; approximate=false), ([8, 3],), Luminal.GeluOp)[1] == 0                      # the erf form
+    @test fused_in_static_extraction((x, w) -> Luminal.std_norm(x, 1, 1f-6) * (w + 1f0), ([8, 3], [8]), Luminal.RMSNormOp)[1] == 1
 end
 
 # --- coverage: a rule without a test graph fails here ----------------------------------------------------------------------

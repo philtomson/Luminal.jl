@@ -18,7 +18,7 @@ export ShapeTracker
 
 # Core Data Structures
 include("Ops.jl")
-export Op, Add, Mul, LessThan, Floor, Ceil, Round, Trunc, Select, Div, Exp, GatherND, ScatterND, MappingGather, LutKOp, LutKBwdPinsOp, LutKDWOp, SparseMapGather, SparseMapBwdS, SparseMapBwdX, Iota, Cast, TruncCast, TruncDiv, TruncRem, SumReduce, MaxReduce, Scan, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulQ4, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, L2NormOp, GatedRMSNormOp, SwiGLUOp, SoftmaxOp, CausalConv, DeltaRule, DeltaRuleQKV, ConvDeltaRule, AttnPrep, GatedAttnOut, LastToken, CausalAttention, ArgMax, Function, Slice, Pad, FlashAttentionOp, Unfold
+export Op, Add, Mul, LessThan, Floor, Ceil, Round, Trunc, Select, Div, Exp, GatherND, ScatterND, MappingGather, LutKOp, LutKBwdPinsOp, LutKDWOp, SparseMapGather, SparseMapBwdS, SparseMapBwdX, Iota, Cast, TruncCast, TruncDiv, TruncRem, SumReduce, MaxReduce, Scan, Constant, Reshape, Permute, Expand, MatMul, MatMulF16, MatMulQ8, MatMulQ4, MatMulT, RotaryEmbed, DecodeAttention, RMSNormOp, L2NormOp, GatedRMSNormOp, SwiGLUOp, LayerNormOp, GeluOp, SoftmaxOp, CausalConv, DeltaRule, DeltaRuleQKV, ConvDeltaRule, AttnPrep, GatedAttnOut, LastToken, CausalAttention, ArgMax, Function, Slice, Pad, FlashAttentionOp, Unfold
 
 
 include("DTypes.jl")

@@ -263,7 +263,7 @@ end
 
 # Ops whose `execute_op!` writes every element of the output, so it needs no zero fill.
 _writes_all(op) = (is_elementwise(op) && !(op isa Luminal.Constant)) || op isa Luminal.Reshape ||
-    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp || op isa Luminal.L2NormOp || op isa Luminal.GatedRMSNormOp || op isa Luminal.SwiGLUOp ||
+    op isa Luminal.Permute || op isa Luminal.Contiguous || op isa Luminal.RMSNormOp || op isa Luminal.L2NormOp || op isa Luminal.GatedRMSNormOp || op isa Luminal.SwiGLUOp || op isa Luminal.LayerNormOp || op isa Luminal.GeluOp ||
     op isa Luminal.RotaryEmbed || op isa Luminal.SoftmaxOp || op isa Luminal.LastToken ||
     # (their kernels write every element of the output, zeros past a sequence's length included)
     op isa Luminal.CausalConv || op isa Luminal.DeltaRule || op isa Luminal.DeltaRuleQKV || op isa Luminal.ConvDeltaRule || op isa Luminal.AttnPrep || op isa Luminal.GatedAttnOut || op isa Luminal.Slice || op isa Luminal.SumReduce || op isa Luminal.MaxReduce || op isa Luminal.Scan

@@ -290,6 +290,15 @@ GatedRMSNormOp(epsilon::Real) = GatedRMSNormOp(Float32(epsilon), 0, 0)
 # compiler can fold it into the two GEMMs that produce its inputs.
 struct SwiGLUOp <: Op end
 
+# LayerNorm over dim 1 with a weight and a bias, in one kernel: (x - mean) / sqrt(var + epsilon) .* w .+ b, x (H, ...), w and b (H,).
+# (the composite form is two reductions, two expands and ~8 elementwise kernels).
+struct LayerNormOp <: Op
+    epsilon::Float32
+end
+
+# GELU, tanh approximation: 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))), one elementwise kernel.
+struct GeluOp <: Op end
+
 # Linear-attention building blocks (Gated DeltaNet: Qwen3.5 / Qwen3.6). Both
 # carry state across calls in a buffer they update in place, like
 # DecodeAttention's cache write; `fresh` starts from zeros (prefill) instead of

@@ -103,7 +103,7 @@ function _make_dims(g, h, ch)
         a = _dims(g, ch[2]); a === nothing && return nothing
         d, k = _lit(g, ch[1])
         return Shp((a[1:d-1]..., k, a[d:end]...))
-    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp || h === :xL2NormOp || h === :xGatedRMSNormOp
+    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp || h === :xL2NormOp || h === :xGatedRMSNormOp || h === :xLayerNormOp || h === :xGeluOp
         a = _dims(g, ch[2]); a === nothing && return nothing
         return Shp(a)
     elseif h === :xMul || h === :xAdd
@@ -218,7 +218,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
     for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulQ4, Luminal.MatMulT,
-              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp, Luminal.L2NormOp, Luminal.GatedRMSNormOp)
+              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp, Luminal.L2NormOp, Luminal.GatedRMSNormOp, Luminal.LayerNormOp, Luminal.GeluOp)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
@@ -437,7 +437,22 @@ function _gated_rmsnorm_rule(a, w, z, q, k1, k2, k3, k4)
     isequal(a.data.dims, z.data.dims) || return nothing
     return :(xGatedRMSNormOp($((Float32(q[1]), 0, 0)), $a, $w, $z))
 end
-const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 begin
+# gelu(a) as HighLevelOps spells it: a * 0.5 * (1 + tanh(0.7978845608 a (1 + 0.044715 a a))), tanh(u) = sigmoid(2u) * 2 - 1
+const _GELU_CONSTANTS = (0.7978845608, 0.044715, 1.0, 2.0, 1.0, -1.0, 1 / log(2), 1.0, 2.0, -1.0, 1.0, 0.5)
+function _gelu_rule(ga, ks...)
+    ga.data === nothing && return nothing
+    all(i -> _const_is(ks[i], _GELU_CONSTANTS[i]), eachindex(_GELU_CONSTANTS)) || return nothing
+    return :(xGeluOp($(()), $ga))
+end
+function _layernorm_rule(a, w, b, e1, e2, s1, s2, k1, k2, k3, k4)
+    (a.data === nothing || w.data === nothing || b.data === nothing) && return nothing
+    d = a.data.dims
+    (s1 == (1,) && s2 == (1,) && !isempty(d) && d[1] isa Integer && e1 == (1, d[1]) && e2 == (1, d[1])) || return nothing
+    (isequal(w.data.dims, (d[1],)) && isequal(b.data.dims, (d[1],))) || return nothing
+    (_const_is(k1, 1 / d[1]) && _const_is(k3, 1 / d[1]) && _const_is(k2, -1.0) && k4[1] isa AbstractFloat) || return nothing
+    return :(xLayerNormOp($((Float32(k4[1]),)), $a, $w, $b))
+end
+const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 gp1 gp10 gp11 gp12 gp13 gp14 gp15 gp16 gp2 gp3 gp4 gp5 gp6 gp7 gp8 gp9 gk1 gk2 gk3 gk4 gk5 gk6 gk7 gk8 gk9 gk10 gk11 gk12 lpa lpb lpc lp1 lp2 lp3 lp4 lp5 lp6 lp7 lp8 le1 le2 ls1 ls2 lk1 lk2 lk3 lk4 b ga begin
     xMul(p1::Tuple, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), u) =>
         _swiglu_rule(g, u, k1, k2, k3, k4)
     xMul(p1::Tuple, u, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple))))) =>
@@ -457,7 +472,12 @@ const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e
         _gated_rmsnorm_rule(a, w, z, q, k1, k2, k3, k4)
     xMul(p3::Tuple, xMul(p5::Tuple, z, xDiv(p6::Tuple, xConstant(k3::Tuple), xAdd(p7::Tuple, xExp2(p8::Tuple, xMul(p1::Tuple, xMul(p2::Tuple, z, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), xRMSNormOp(q::Tuple, a, w)) =>
         _gated_rmsnorm_rule(a, w, z, q, k1, k2, k3, k4)
-end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight", "l2norm", "gated-rmsnorm-lhs", "gated-rmsnorm-rhs"))
+    # LayerNorm with weight and bias: (x - mean) * recip(sqrt(mean((x - mean)^2) + eps)) * w + b
+    xAdd(lp1::Tuple, xMul(lp2::Tuple, xMul(lp3::Tuple, xAdd(lpa::Tuple, a, xMul(lpb::Tuple, xExpand(le1::Tuple, xMul(lpc::Tuple, xSumReduce(ls1::Tuple, a), xConstant(lk1::Tuple))), xConstant(lk2::Tuple))), xExpand(le2::Tuple, xRecip(lp4::Tuple, xSqrt(lp5::Tuple, xAdd(lp6::Tuple, xMul(lp7::Tuple, xSumReduce(ls2::Tuple, xMul(lp8::Tuple, xAdd(lpa::Tuple, a, xMul(lpb::Tuple, xExpand(le1::Tuple, xMul(lpc::Tuple, xSumReduce(ls1::Tuple, a), xConstant(lk1::Tuple))), xConstant(lk2::Tuple))), xAdd(lpa::Tuple, a, xMul(lpb::Tuple, xExpand(le1::Tuple, xMul(lpc::Tuple, xSumReduce(ls1::Tuple, a), xConstant(lk1::Tuple))), xConstant(lk2::Tuple))))), xConstant(lk3::Tuple)), xConstant(lk4::Tuple)))))), w), b) =>
+        _layernorm_rule(a, w, b, le1, le2, ls1, ls2, lk1, lk2, lk3, lk4)
+    xMul(gp16::Tuple, xMul(gp15::Tuple, ga, xConstant(gk12::Tuple)), xAdd(gp14::Tuple, xAdd(gp13::Tuple, xMul(gp12::Tuple, xDiv(gp11::Tuple, xConstant(gk5::Tuple), xAdd(gp10::Tuple, xExp2(gp9::Tuple, xMul(gp8::Tuple, xMul(gp7::Tuple, xMul(gp6::Tuple, xMul(gp5::Tuple, xMul(gp1::Tuple, ga, xConstant(gk1::Tuple)), xAdd(gp4::Tuple, xMul(gp3::Tuple, xMul(gp2::Tuple, ga, xConstant(gk2::Tuple)), ga), xConstant(gk3::Tuple))), xConstant(gk4::Tuple)), xConstant(gk6::Tuple)), xConstant(gk7::Tuple))), xConstant(gk8::Tuple))), xConstant(gk9::Tuple)), xConstant(gk10::Tuple)), xConstant(gk11::Tuple))) =>
+        _gelu_rule(ga, gk1, gk2, gk3, gk4, gk5, gk6, gk7, gk8, gk9, gk10, gk11, gk12)
+end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight", "l2norm", "gated-rmsnorm-lhs", "gated-rmsnorm-rhs", "layernorm-affine", "gelu-tanh"))
 
 # Backoff scheduling (Metatheory's default) that also tells the rule log what each search found.
 mutable struct ReportingScheduler <: Metatheory.EGraphs.Schedulers.AbstractScheduler

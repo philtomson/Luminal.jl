@@ -122,6 +122,97 @@ function execute_op!(out, op::RMSNormOp, x, w)
     return out
 end
 
+# --- LayerNorm over dim 1 -----------------------------------------------------------
+# One workgroup per column: the mean and then the sum of squared deviations, each by the two-level tree sum of the RMSNorm
+# kernel, then the normalized, weighted and shifted write.
+@kernel function _layernorm_kernel!(out, @Const(x), @Const(w), @Const(b), eps, ::Val{T}) where {T}
+    col = @index(Group, Linear); lid = @index(Local, Linear)
+    H = @uniform size(x, 1)
+    red = @localmem Float32 (T,)
+    part = @localmem Float32 (32,)
+    acc = 0f0
+    i = lid
+    while i <= H
+        @inbounds acc += Float32(x[i, col])
+        i += T
+    end
+    @inbounds red[lid] = acc
+    @synchronize
+    if lid <= 32
+        a = 0f0
+        j = lid
+        while j <= T
+            @inbounds a += red[j]
+            j += 32
+        end
+        @inbounds part[lid] = a
+    end
+    @synchronize
+    s = 0f0
+    for j in 1:32
+        @inbounds s += part[j]
+    end
+    mu = s / H
+    @synchronize
+    acc = 0f0
+    i = lid
+    while i <= H
+        @inbounds d = Float32(x[i, col]) - mu
+        acc += d * d
+        i += T
+    end
+    @inbounds red[lid] = acc
+    @synchronize
+    if lid <= 32
+        a = 0f0
+        j = lid
+        while j <= T
+            @inbounds a += red[j]
+            j += 32
+        end
+        @inbounds part[lid] = a
+    end
+    @synchronize
+    v = 0f0
+    for j in 1:32
+        @inbounds v += part[j]
+    end
+    r = 1f0 / sqrt(v / H + eps)
+    i = lid
+    while i <= H
+        @inbounds out[i, col] = eltype(out)((Float32(x[i, col]) - mu) * r * Float32(w[i]) + Float32(b[i]))
+        i += T
+    end
+end
+
+function execute_op!(out, op::LayerNormOp, x, w, b)
+    H = size(x, 1)
+    xc = x isa DenseArray ? x : copy(x)
+    x2 = Base.reshape(xc, H, :)
+    o2 = Base.reshape(out, H, :)
+    wv = vec(w); bv = vec(b)
+    if !(out isa AnyGPUArray)          # CPU: plain loops
+        for c in axes(x2, 2)
+            v = Float32.(view(x2, :, c))
+            mu = sum(v) / H
+            r = 1f0 / sqrt(sum(abs2, v .- mu) / H + op.epsilon)
+            o2[:, c] .= (v .- mu) .* r .* Float32.(wv) .+ Float32.(bv)
+        end
+        return out
+    end
+    T = H >= 2048 ? 512 : 256
+    _layernorm_kernel!(KernelAbstractions.get_backend(o2), T)(o2, x2, wv, bv, op.epsilon, Val(T); ndrange = size(x2, 2) * T)
+    return out
+end
+
+# --- GELU (tanh approximation) -------------------------------------------------------
+@inline _gelu_tanh(x::Float32) = 0.5f0 * x * (1f0 + tanh(0.7978845608f0 * x * (1f0 + 0.044715f0 * x * x)))
+@inline _gelu_tanh(x::Real) = oftype(x, _gelu_tanh(Float32(x)))
+function execute_op!(out, op::GeluOp, x)
+    out .= _gelu_tanh.(x)
+    return out
+end
+
 # --- L2 normalization over dim 1 ---------------------------------------------------
 # One wave (32 lanes) per column: each lane sums the squares of every 32nd element, a shuffle tree adds the
 # lanes, and the normalized values are written in the output's element type.
