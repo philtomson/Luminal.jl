@@ -1142,9 +1142,13 @@ K/V borrowed from the live cache instead of copied, state sizes. Not worth takin
 memory pinning.
 
 Candidates, most valuable first:
-1. **Restored-vs-uncached equivalence test for every state component** (recurrent states, convolution history, MTP pairs, the DFlash ring rows,
-   the residual stream). A forgotten component fails silently ("almost right" state); our prefix cache already kept a bad DFlash state once
-   (NaN scores after a prefill under GPU contention). Cheapest item; do it first.
+1. ~~**Restored-vs-uncached equivalence test for every state component**~~ **Done: `tests/test_prefix_cache.jl`** (GPU only; tiny Qwen3.5 model, chunk 16).
+   Resumes from a `:sys`, a `:turn` and a `:ckpt` state, with the live cache untouched and (sys, turn) overwritten by another conversation so the entry's own
+   K/V is copied back, and a chain of three requests; each is compared with an uncached run of the same prompt (prompt logits, first token, five decode
+   steps), plus MTP speculative decoding (output == plain greedy, the head's drafts equal, and the head's K/V for the prompt's pairs equal). 24 checks.
+   Checked that it can fail: skipping the restore of either recurrent buffer fails 4 checks each, skipping the residual stream at the resume point fails the
+   MTP K/V checks (a wrong residual barely moves the drafts: first version of the test missed it), skipping the K/V copy-back fails the overwritten cases.
+   Not covered: the block drafter's (DFlash2) ring rows (need a draft model), long contexts, the disk / multi-conversation items below.
 2. **Checkpoints on disk.** gufo restores a 95k-token conversation from disk in 1.4 s (0.86 s restoring) against 57.8 s of prefill; our cold prefill
    at 150k tokens measured ~570 s and we restart the server often. Publication order: write and sync chunks and state, sync directories, then
    atomically rename a manifest; verify checksums on restore; ignore and delete orphan files; only prompt and learned checkpoints go to disk.
