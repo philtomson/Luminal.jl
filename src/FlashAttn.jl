@@ -27,7 +27,7 @@ end
     return x
 end
 
-function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
+function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, qoff, win, ::Val{NT}) where {NT}
     D = 32 * NT
     tid = workitemIdx().x - 1
     l = tid % 32; r = l % 16; hh = l ÷ 16; w = tid ÷ 32; rg = w ÷ 2; dh = w % 2
@@ -41,7 +41,8 @@ function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, qoff, ::Val{NT
     acc = ntuple(_ -> _wmma_zero(), Val(NT))
     NK = qoff + S                      # keys: the qoff cached ones, then the S queries' own
     ktmax = (qoff + min(S, qblk * 32 + 32) - 1) ÷ 64
-    for kt in 0:ktmax
+    kt0 = win > 0 ? max(0, qoff + qblk * 32 - win + 1) ÷ 64 : 0          # sliding window: the tiles before the block's first visible key are skipped
+    for kt in kt0:ktmax
         # scores of the wave's 16 rows against 64 keys: 4 tiles
         s0 = _wmma_zero(); s1 = _wmma_zero(); s2 = _wmma_zero(); s3 = _wmma_zero()
         for ks in 0:2NT-1
@@ -58,7 +59,7 @@ function _flash_prefill_kernel!(O, Qv, Kv, Vv, S, H, KVH, scale2, qoff, ::Val{NT
         mn = m
         for i in 0:7
             row = q0 + 2i + hh
-            sv(t, x) = (kk = kt * 64 + 16t + r; (kk <= qoff + row && kk < NK) ? x * scale2 : -1f30)
+            sv(t, x) = (kk = kt * 64 + 16t + r; (kk <= qoff + row && kk < NK && (win == 0 || qoff + row - kk < win)) ? x * scale2 : -1f30)
             e0 = sv(0, s0[i + 1].value); e1 = sv(1, s1[i + 1].value)
             e2 = sv(2, s2[i + 1].value); e3 = sv(3, s3[i + 1].value)
             tm = _fa_max16(max(max(e0, e1), max(e2, e3)))
@@ -127,7 +128,7 @@ end
     return ex
 end
 
-function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) where {NT}
+function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, win, ::Val{NT}) where {NT}
     D = 32 * NT; NC = D ÷ 8                   # 16-byte chunks per key row
     KS = NT                                   # k steps (16 dims) per wave of the S phase: half of D / 16
     DT = NT ÷ 4                               # output dim tiles per wave (D / 16 / 8) = V chunks per thread
@@ -142,6 +143,7 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
     NK = qoff + S
     max_visible = min(NK, qoff + query_start + 32)
     ntile = cld(max_visible, 16)
+    kt0 = win > 0 ? max(0, qoff + query_start - win + 1) ÷ 16 : 0        # sliding window: start at the first tile with a visible key
     s_tile = wave % 4; s_kh = wave ÷ 4         # this wave's score tile (row block) and dim half
     s_head = first_head + s_tile % 2; s_qoff = (s_tile ÷ 2) * 16
 
@@ -164,14 +166,15 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
 
     v_key = lane % 16; v_slice = (tid ÷ 16) * DT                 # V: lane's key, and the first of its DT chunks
     # first tile's K and V
-    kcur = ntuple(n -> (idx = tid + 256 * (n - 1); Kc[idx % NC + 1, min(idx ÷ NC, NK - 1) + 1, kvh + 1, b + 1]), Val(KR))
-    vlive = v_key < NK
-    vcur = ntuple(j -> vlive ? Vc[v_slice + j, v_key + 1, kvh + 1, b + 1] : zero8, Val(DT))
+    kcur = ntuple(n -> (idx = tid + 256 * (n - 1); Kc[idx % NC + 1, min(kt0 * 16 + idx ÷ NC, NK - 1) + 1, kvh + 1, b + 1]), Val(KR))
+    vkey0 = kt0 * 16 + v_key
+    vlive = vkey0 < NK
+    vcur = ntuple(j -> vlive ? Vc[v_slice + j, vkey0 + 1, kvh + 1, b + 1] : zero8, Val(DT))
 
     # Three barriers per tile. Every wave passes the barrier after the K staging only after its previous P V (which reads Vt and
     # p_lds) is done, so Vt can be restaged right after it, and a barrier before the K staging is not needed (Ks was last read by the
     # previous S, before the previous softmax barriers). The restaged Vt is made visible to P V by the two softmax barriers.
-    for kt in 0:ntile - 1
+    for kt in kt0:ntile - 1
         key_start = kt * 16
         let kc = kcur
             ntuple(Val(KR)) do n
@@ -211,7 +214,7 @@ function _flash_prefill_lds!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}) 
         base_valid = lq < S
         kpos = key_start + col
         qabs = qoff + lq
-        sv(m) = (base_valid && kpos + m <= qabs) ? (s_lds[cc + m + 1, row + 1, rb + 1, 1] + s_lds[cc + m + 1, row + 1, rb + 1, 2]) * scale2 : -Inf32
+        sv(m) = (base_valid && kpos + m <= qabs && (win == 0 || qabs - (kpos + m) < win)) ? (s_lds[cc + m + 1, row + 1, rb + 1, 1] + s_lds[cc + m + 1, row + 1, rb + 1, 2]) * scale2 : -Inf32
         v0 = sv(0); v1 = sv(1); v2 = sv(2); v3 = sv(3)
         pmax = max(max(v0, v1), max(v2, v3))
         pmax = max(pmax, AMDGPU.Device.shfl_xor(pmax, Cint(1)))
@@ -289,7 +292,7 @@ end
 #   keys and writes them as 8 packed dwords of V^T (row = dim, the 16 keys contiguous, 12 dwords per row) instead of 16 two-byte stores, with
 #   16 dwords of padding after every 8 dims so the 32 lanes of a store hit 32 different banks. 16.5 -> 17.4 TFLOP/s at 2048 tokens from an
 #   empty context, 18.6 -> 19.8 at depth 8192, 19.1 -> 20.3 at 32256 (S = 512, D = 256, 24 / 4 heads).
-function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, ::Val{HS} = Val(false)) where {NT,HS}
+function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, win, ::Val{NT}, ::Val{HS} = Val(false)) where {NT,HS}
     SW = 16                                   # padding of the transposed V tile (dwords per 8 dims; see below)
     D = 32 * NT; NC = D ÷ 8                   # NT = 8: D = 256, 32 16-byte chunks per key row
     KS = NT                                   # k steps (16 dims) per wave of the S phase: half of D / 16
@@ -303,6 +306,8 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT},
     NK = qoff + S
     max_visible = min(NK, qoff + query_start + 64)
     ntile = cld(max_visible, 16)
+    kt0 = win > 0 ? max(0, qoff + query_start - win + 1) ÷ 16 : 0        # sliding window: start at the first tile with a visible key
+    k0 = kt0 * 16
     s_tile = wave % 8; s_kh = wave ÷ 8
     s_head = first_head + s_tile % 2; s_qoff = (s_tile ÷ 2) * 16
 
@@ -323,15 +328,15 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT},
     running_max = -Inf32; running_sum = 0f0
     zero8 = ntuple(_ -> VecElement(Float16(0)), Val(8))
 
-    kcur = Kc[tid % NC + 1, min(tid ÷ NC, NK - 1) + 1, kvh + 1, b + 1]
+    kcur = Kc[tid % NC + 1, min(k0 + tid ÷ NC, NK - 1) + 1, kvh + 1, b + 1]
     # V staging (waves 0-7): lane = 4 dim groups x 8 key pairs; this lane's 8 dims (chunk vc) of keys 2 vp and 2 vp + 1
     vp = lane ÷ 4; vc = (wave % 8) * 4 + lane % 4 + 1
     vdo = wave < 8
-    vA = vdo && 2vp < NK ? Vc[vc, 2vp + 1, kvh + 1, b + 1] : zero8
-    vB = vdo && 2vp + 1 < NK ? Vc[vc, 2vp + 2, kvh + 1, b + 1] : zero8
+    vA = vdo && k0 + 2vp < NK ? Vc[vc, k0 + 2vp + 1, kvh + 1, b + 1] : zero8
+    vB = vdo && k0 + 2vp + 1 < NK ? Vc[vc, k0 + 2vp + 2, kvh + 1, b + 1] : zero8
     vbase = (vc - 1) * 8 * 12 + (vc - 1) * SW + vp + 1         # dword index of (dim 8 (vc - 1), pair vp); dim steps of 12 dwords (+ SW per 8 dims)
 
-    for kt in 0:ntile - 1
+    for kt in kt0:ntile - 1
         key_start = kt * 16
         Ks[tid % NC + 1, tid ÷ NC + 1] = kcur
         sync_workgroup()                # (all waves are past the previous P V: Vt may be restaged)
@@ -360,7 +365,7 @@ function _flash_prefill_lds2!(O, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT},
         base_valid = lq < S
         kpos = key_start + col
         qabs = qoff + lq
-        sv(m) = (base_valid && kpos + m <= qabs) ? (s_lds[cc + m + 1, row + 1, rb + 1, 1] + s_lds[cc + m + 1, row + 1, rb + 1, 2]) * scale2 : -Inf32
+        sv(m) = (base_valid && kpos + m <= qabs && (win == 0 || qabs - (kpos + m) < win)) ? (s_lds[cc + m + 1, row + 1, rb + 1, 1] + s_lds[cc + m + 1, row + 1, rb + 1, 2]) * scale2 : -Inf32
         v0 = sv(0); v1 = sv(1); v2 = sv(2); v3 = sv(3)
         pmax = max(max(v0, v1), max(v2, v3))
         pmax = max(pmax, AMDGPU.Device.shfl_xor(pmax, Cint(1)))
@@ -424,16 +429,16 @@ end
 # True when `_launch_flash_lds!` takes the 128-row kernel, which also reads a Float32 query and can write the (D, H, S, B) output layout.
 _flash_rows128(NT) = NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64" && HAS_LAUNCH_BOUNDS
 
-function _launch_flash_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, nb; hs::Bool = false) where {NT}
+function _launch_flash_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, ::Val{NT}, nb; hs::Bool = false, win::Int = 0) where {NT}
     @static if HAS_LAUNCH_BOUNDS
         if NT == 8 && get(ENV, "LUMINAL_FLASH_ROWS", "128") != "64"
             # D = 256: the 128-row, 512-thread block (needs the launch bounds: 252 VGPRs)
-            @roc_bounded 512 0 groupsize=512 gridsize=(cld(S, 64), nb) _flash_prefill_lds2!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT), Val(hs))
+            @roc_bounded 512 0 groupsize=512 gridsize=(cld(S, 64), nb) _flash_prefill_lds2!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, win, Val(NT), Val(hs))
             return nothing
         end
-        @roc_bounded 256 0 groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
+        @roc_bounded 256 0 groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, win, Val(NT))
     else
-        @roc groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, Val(NT))
+        @roc groupsize=256 gridsize=(cld(S, 32), nb) _flash_prefill_lds!(out, Qv, Kc, Vc, S, H, KVH, scale2, qoff, win, Val(NT))
     end
     return nothing
 end
@@ -443,7 +448,7 @@ _lds_attn_ok(D, H, KVH) = D % 128 == 0 && H % KVH == 0 && (H ÷ KVH) % 2 == 0
 
 # out (D, S, H, B) Float32 <- attention over q (D, S, H, B), k, v (D, S, KVH, B) (any real eltype,
 # arrays or views); D % 32 == 0, S >= 1.
-function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
+function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32, window::Int = 0)
     D, S, H, B = size(q); KVH = size(k, 3)
     D % 32 == 0 && H % KVH == 0 && size(out) == size(q) ||
         throw(ArgumentError("flash_prefill!: need D % 32 == 0 and H % KVH == 0"))
@@ -453,14 +458,14 @@ function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
     if _lds_attn_ok(D, H, KVH)
         v16 = similar(out, Float16, D, S, KVH, B); v16 .= v
         _launch_flash_lds!(out, reinterpret(WMMA_V8H, q16), reinterpret(WMMA_V8H, k16), reinterpret(WMMA_V8H, v16), S, H, KVH, scale2, 0,
-                           Val(D ÷ 32), (H ÷ 2) * B)
+                           Val(D ÷ 32), (H ÷ 2) * B; win = window)
         AMDGPU.unsafe_free!(v16)
     else
         Spad = cld(S, 64) * 64
         vt = AMDGPU.zeros(Float16, Spad, D, KVH, B)
         view(vt, 1:S, :, :, :) .= PermutedDimsArray(v, (2, 1, 3, 4))
         Qv = reinterpret(WMMA_V8H, q16); Kv = reinterpret(WMMA_V8H, k16); Vv = reinterpret(WMMA_V8H, vt)
-        @roc groupsize=128 gridsize=(cld(S, 32), H * B) _flash_prefill_kernel!(out, Qv, Kv, Vv, S, H, KVH, scale2, 0, Val(D ÷ 32))
+        @roc groupsize=128 gridsize=(cld(S, 32), H * B) _flash_prefill_kernel!(out, Qv, Kv, Vv, S, H, KVH, scale2, 0, window, Val(D ÷ 32))
         AMDGPU.unsafe_free!(vt)
     end
     AMDGPU.unsafe_free!(q16); AMDGPU.unsafe_free!(k16)
@@ -564,7 +569,7 @@ function chunk_attention!(out, q, pk, pv, kn, vn, posv, scale::Float32)
             end
             Qv = reinterpret(WMMA_V8H, q16); Kb = reinterpret(WMMA_V8H, kt); Vv = reinterpret(WMMA_V8H, vt)
             @roc groupsize=128 gridsize=(cld(S, 32), H) _flash_prefill_kernel!(
-                ob, Qv, Kb, Vv, S, H, KVH, scale2, pos, Val(D ÷ 32))
+                ob, Qv, Kb, Vv, S, H, KVH, scale2, pos, 0, Val(D ÷ 32))
             AMDGPU.unsafe_free!(vt); q8 && AMDGPU.unsafe_free!(kt)
         end
         o4 .= PermutedDimsArray(ob, (1, 3, 2, 4))

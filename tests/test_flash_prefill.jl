@@ -40,6 +40,18 @@ if Luminal.wmma_supported()
             @test relerr(o, Luminal.causal_attention_ref(q, k, v, Float32(1 / sqrt(D)))) < 2e-3
         end
     end
+    # sliding windows: the three kernels (D = 64 generic, 128 LDS, 256 128-row block), windows below, around and above the 16- / 64-key tiles
+    @testset "flash_prefill! with a sliding window" begin
+        for (D, S, H, KVH, B) in ((256, 150, 8, 2, 1), (128, 130, 6, 3, 1), (64, 200, 4, 2, 2), (32, 65, 2, 1, 1)),
+            window in (1, 7, 16, 33, 64, 100, 400)
+            q = randn(Float32, D, S, H, B); k = randn(Float32, D, S, KVH, B); v = randn(Float32, D, S, KVH, B)
+            out = AMDGPU.zeros(Float32, D, S, H, B)
+            Luminal.flash_prefill!(out, ROCArray(q), ROCArray(k), ROCArray(v), Float32(1 / sqrt(D)), window)
+            o = Array(out)
+            @test !any(isnan, o)
+            @test relerr(o, Luminal.causal_attention_ref(q, k, v, Float32(1 / sqrt(D)), window)) < 2e-3
+        end
+    end
 end
 
 @testset "CausalAttention op in a graph ($(nameof(typeof(dev))))" for dev in
