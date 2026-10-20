@@ -258,7 +258,12 @@ what dominated decode here.
    tensor of shape (H,)), and two new fused ops with kernels, `LayerNormOp` (affine) and `GeluOp` (tanh form).
    `benchmarks/c1_norms.jl` (GPU): fused LayerNorm is 2.4-3.5x faster than its primitive graph, with the same error against Float64
    (~1.5e-7), which also covers the kernel at 768-5120-wide rows; fused GELU is equal to the primitives (0.98-1.01x), since the
-   executor already fuses the elementwise chain. Not done: attention, the erf GELU, LayerNorm without a bias or weight, the tiled
+   executor already fuses the elementwise chain. Causal attention in NN's composite form (GQA or
+   multi-head; scale, triu mask, softmax over keys, weighted V) is recognised as `CausalAttention` where the flash kernel applies (head size a
+   multiple of 32, 16+ tokens): `benchmarks/c1_attention.jl`, TinyLlama prefill, composite + rule vs the hand-built flash graph:
+   41.75 vs 41.61 ms at 16 tokens, 62.60 vs 62.08 at 64, 187.2 vs 185.1 at 256 (the unrecognised composite: 41.94, 63.52, 205.0, i.e. 10%
+   slower at 256). Cost: the first saturation in a process compiles the large pattern (~88 s on the first attention graph, then free).
+   Not done: sliding-window and unmasked attention, decode attention, the erf GELU, LayerNorm without a bias or weight, the tiled
    `GatedRMSNormOp` that `Qwen35.jl` builds.
 5. **C6 + C5, bounds, buckets and a bufferization plan**, together: bounds and buckets decide which programs exist, the plan
    decides their memory. Go if peak memory of a 32k-token 27B prefill drops without a throughput loss.

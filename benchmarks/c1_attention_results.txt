@@ -1,0 +1,24 @@
+
+== prefill, 16 tokens
+flash         graph (CausalAttention, nodes) = (22, 868), compile 6.2 s
+composite     graph (CausalAttention, nodes) = (0, 1252), compile 0.2 s
+composite+C1  graph (CausalAttention, nodes) = (0, 1252), compile 88.3 s
+  flash            41.61 ms   (1.00x flash)   logits rel. diff vs flash 0.0e+00
+  composite        41.94 ms   (0.99x flash)   logits rel. diff vs flash 4.6e-04
+  composite+C1     41.75 ms   (1.00x flash)   logits rel. diff vs flash 2.2e-04
+
+== prefill, 64 tokens
+flash         graph (CausalAttention, nodes) = (22, 868), compile 0.0 s
+composite     graph (CausalAttention, nodes) = (0, 1252), compile 0.0 s
+composite+C1  graph (CausalAttention, nodes) = (0, 1252), compile 0.4 s
+  flash            62.08 ms   (1.00x flash)   logits rel. diff vs flash 0.0e+00
+  composite        63.52 ms   (0.98x flash)   logits rel. diff vs flash 4.1e-04
+  composite+C1     62.60 ms   (0.99x flash)   logits rel. diff vs flash 4.4e-04
+
+== prefill, 256 tokens
+flash         graph (CausalAttention, nodes) = (22, 868), compile 0.0 s
+composite     graph (CausalAttention, nodes) = (0, 1252), compile 0.0 s
+composite+C1  graph (CausalAttention, nodes) = (0, 1252), compile 0.3 s
+  flash           185.06 ms   (1.00x flash)   logits rel. diff vs flash 0.0e+00
+  composite       205.04 ms   (0.90x flash)   logits rel. diff vs flash 5.9e-04
+  composite+C1    187.23 ms   (0.99x flash)   logits rel. diff vs flash 6.6e-04
