@@ -235,8 +235,13 @@ what dominated decode here.
    partly winner's curse) and -0.49% at 64 tokens (30.18 vs 30.33 ms). The median neighbour is 8% / 15% slower. Neither reaches
    the 2% gate, and the 16-token gain is about the timing noise (a few percent per single timing). **Decision: no-go on a genome
    search; keep coordinate descent.** Revisit only if the search space grows (new decisions from C1 fusions) or capture-mode
-   timing, which this probe could not use, moves the optimum. Note: the measured search crashes with HIP graph capture (`hipErrorStreamCaptureUnsupported` from a
-   `Reshape` copy in some candidate; same failure at `51b13c4`, so not a regression).
+   timing, which this probe could not use, moves the optimum. Note: the measured search crashed with HIP graph capture (`hipErrorStreamCaptureUnsupported`); **fixed**
+   (branch `capture_fix`): the `Reshape`, `Contiguous` and `Slice` executors copied with `copyto!`, a device-to-device memcpy on the null stream that
+   aborts a capture, and the compiler aliases most such nodes away so only the search's candidates keep them. They now copy with a kernel
+   (`_device_copy!`, `tests/test_hip_capture.jl`); the capture-mode measured search of a TinyLlama decode graph completes (364 s, ~10 ms/step).
+   Found on the way, and older than C1 (it reproduces at `de41772`): a session built with `search=:measured` fails its prefill compile for a prompt
+   padded to 16 tokens or more ("the static extraction failed verification") at the default `search_tolerance` of 1e-3, which the Float16 matrix-core
+   paths exceed; the benchmarks pass `search_tolerance=1e-2`, `Decoding.jl` does not. Shorter prefills (and the decode graph) pass.
 3. ~~**C7, rule equivalence tests**~~: done (`tests/test_rule_equivalence.jl`). For every named rule, seeded random graphs
    (random ranks, sizes, axes, batch dims) trigger it, and the static extraction plus every alternative of every decision
    is run and compared with the original graph (exact rules to 1e-5; int8 / int4 against a matmul by the dequantized
