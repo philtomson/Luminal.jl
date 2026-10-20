@@ -1,0 +1,30 @@
+== tr_cpu.bin
+  hand         vs reference (cpu hand): 0.00e+00
+  hand2        vs reference (cpu hand): 0.00e+00
+  hand+swiglu  vs reference (cpu hand): 2.02e-06
+  prim         vs reference (cpu hand): 1.28e-06
+  prim+C1      vs reference (cpu hand): 2.02e-06
+  hand vs hand2 (same graph twice): 0.00e+00
+== tr_gpu.bin
+  hand         vs reference (cpu hand): 8.43e-04
+  hand2        vs reference (cpu hand): 8.43e-04
+  hand+swiglu  vs reference (cpu hand): 6.10e-04
+  prim         vs reference (cpu hand): 6.71e-04
+  prim+C1      vs reference (cpu hand): 6.10e-04
+  hand vs hand2 (same graph twice): 0.00e+00
+== tr_gpu_nowmma.bin
+  hand         vs reference (cpu hand): 1.31e-05
+  hand2        vs reference (cpu hand): 1.31e-05
+  hand+swiglu  vs reference (cpu hand): 1.09e-05
+  prim         vs reference (cpu hand): 1.49e-05
+  prim+C1      vs reference (cpu hand): 6.10e-04
+  hand vs hand2 (same graph twice): 0.00e+00
+
+# After the fix (the attention rule and CausalAttention honour LUMINAL_WMMA=0), GPU with LUMINAL_WMMA=0:
+== tr_gpu_nowmma2.bin
+  hand         vs reference (cpu hand): 1.31e-05
+  hand2        vs reference (cpu hand): 1.31e-05
+  hand+swiglu  vs reference (cpu hand): 1.09e-05
+  prim         vs reference (cpu hand): 1.49e-05
+  prim+C1      vs reference (cpu hand): 1.09e-05
+  hand vs hand2 (same graph twice): 0.00e+00

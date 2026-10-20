@@ -457,6 +457,7 @@ end
 # k and v, followed by the permute that gives the composite's (S, D, H, B) layout. Only where the fused kernel applies (D % 32 == 0,
 # S >= 16, KV heads dividing the heads).
 function _attention_rule(gqa, aq, ak, av, pq, pv, r1, r2, e1, e2, ks, ar, x3, x4, ex1, ex2, kz, kn, mr, mr2, sr, ee, k1, k2)
+    Luminal.wmma_enabled() || return nothing          # the fused kernel runs on Float16 matrix cores (LUMINAL_WMMA=0 asks for exact Float32)
     (aq.data === nothing || ak.data === nothing || av.data === nothing) && return nothing
     dq, dk, dv = aq.data.dims, ak.data.dims, av.data.dims
     (length(dq) == 4 && length(dk) == 4 && all(x -> x isa Integer, dq) && all(x -> x isa Integer, dk)) || return nothing

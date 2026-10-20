@@ -303,7 +303,8 @@ end
         mask && (w = w + Luminal.expand(Luminal.expand(Luminal.triu(q.graph_ref, S, 1) * -9f9, 3, H), 4, B))
         Luminal.matmul(Luminal.softmax(w, 2), Luminal.permute(values, [2, 1, 3, 4]))
     end
-    for kvh_equal in (false, true)
+    # the attention rule needs the matrix-core kernel (Luminal.wmma_enabled(): a gfx11 GPU and LUMINAL_WMMA != 0)
+    Luminal.wmma_enabled() && for kvh_equal in (false, true)
         w, n = check((g, rng, dev) -> begin
             ins = Pair{Luminal.GraphTensor,Any}[]
             D = rand(rng, [32, 64]); S = rand(rng, [16, 18]); KV = rand(rng, [1, 2]); H = kvh_equal ? KV : KV * rand(rng, [2, 3]); B = rand(rng, [1, 2])
@@ -314,7 +315,7 @@ end
         @test get(FIRED, "fusion.causal-attention-$(kvh_equal ? "mha" : "gqa")", 0) > 0
     end
     att_shapes = ([32, 16, 4, 1], [32, 16, 2, 1], [32, 16, 2, 1])
-    @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), att_shapes, Luminal.CausalAttention) == (1, 5, 34)
+    Luminal.wmma_enabled() && @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), att_shapes, Luminal.CausalAttention) == (1, 5, 34)
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v; mask=false), att_shapes, Luminal.CausalAttention)[1] == 0        # no causal mask
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([8, 16, 4, 1], [8, 16, 2, 1], [8, 16, 2, 1]), Luminal.CausalAttention)[1] == 0   # head size the kernel does not take
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([32, 8, 4, 1], [32, 8, 2, 1], [32, 8, 2, 1]), Luminal.CausalAttention)[1] == 0    # short sequence
@@ -323,7 +324,7 @@ end
 # --- coverage: a rule without a test graph fails here ----------------------------------------------------------------------
 
 @testset "every rule is exercised" begin
-    expected = rule_names(precision=GPU ? ALL_FEATURES : false)
+    expected = filter(n -> Luminal.wmma_enabled() || !startswith(n, "fusion.causal-attention"), rule_names(precision=GPU ? ALL_FEATURES : false))
     missing_rules = [n for n in expected if get(FIRED, n, 0) == 0]
     @test isempty(missing_rules)
     isempty(missing_rules) || @info "rules with no firing test graph" missing_rules

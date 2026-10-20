@@ -253,8 +253,11 @@ what dominated decode here.
    Timing (`benchmarks/c1_fusion.jl`, TinyLlama prefill, Float32 matmuls): primitives through the static extraction match the
    hand-fused graph (41.97 vs 41.91 ms at 16 tokens, 62.28 vs 62.33 ms at 64), so the go criterion holds. There is no speed-up:
    the executor's elementwise fusion already compiles the primitive spelling within 1% of the hand-fused one (42.29 / 63.05 ms), so
-   the value is backend-neutral model code and a search space with fused alternatives. Logits differ from the hand-fused graph by
-   ~5e-4 relative in every variant, including the untouched primitive graph; not yet traced to its source. Also recognised now: L2Norm, RMSNorm times silu(gate) (`GatedRMSNormOp`), Gemma's (1 + w) RMSNorm (the weight is any
+   the value is backend-neutral model code and a search space with fused alternatives. Traced (`benchmarks/logits_trace.jl`, results in `logits_trace_results.txt`): on the CPU every variant agrees to ~2e-6;
+   on the GPU every variant, the hand-fused one included, is 6-8e-4 from the exact CPU result because of the Float16 matrix cores
+   (flash attention), and with `LUMINAL_WMMA=0` all agree with the CPU to ~1e-5. The GPU is deterministic (the same graph twice gives
+   identical logits). The trace also found that the attention rule (and `CausalAttention`'s executor, which tested `wmma_supported()`
+   instead of `wmma_enabled()`) used the Float16 kernel under `LUMINAL_WMMA=0`: fixed, the rule now needs `wmma_enabled()`. Also recognised now: L2Norm, RMSNorm times silu(gate) (`GatedRMSNormOp`), Gemma's (1 + w) RMSNorm (the weight is any
    tensor of shape (H,)), and two new fused ops with kernels, `LayerNormOp` (affine) and `GeluOp` (tanh form).
    `benchmarks/c1_norms.jl` (GPU): fused LayerNorm is 2.4-3.5x faster than its primitive graph, with the same error against Float64
    (~1.5e-7), which also covers the kernel at 768-5120-wide rows; fused GELU is equal to the primitives (0.98-1.01x), since the
