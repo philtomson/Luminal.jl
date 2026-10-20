@@ -460,6 +460,19 @@ end
 # The replaced entries (kept until now because the resumed one is read after the prefill: its MTP K/V).
 release_stale!(pc::Union{Nothing,PrefixCache}) = pc === nothing || (foreach(_free_entry!, pc.stale); empty!(pc.stale); nothing)
 
+# A prefill that ends in non-finite logits (a Float16 overflow in the K/V or a hidden state) has poisoned everything it wrote: the live K/V, the
+# state checkpoints and entries it saved, and the block drafter's ring rows. Drop all of that (earlier entries are copies and stay valid), so the
+# next request cannot resume from it, and fail the request instead of sampling from NaN.
+function _fail_prefill!(prefix, dflash, n::Int)
+    if prefix !== nothing
+        foreach(_free_entry!, prefix.pending); empty!(prefix.pending)
+        foreach(_free_ckpt!, prefix.ckpts); empty!(prefix.ckpts)
+        prefix.live = Int[]; prefix.live_mtp = 0; prefix.live_df = 0; prefix.resumed = nothing
+    end
+    dflash === nothing || (dflash.nrows = 0)
+    error("the prefill of $n tokens produced non-finite logits (NaN/Inf); the prefix cache state of this prompt was dropped")
+end
+
 function _register!(pc::PrefixCache, new::Vector{PrefixEntry}, used::Union{Nothing,PrefixEntry})
     used === nothing || (i = findfirst(e -> e === used, pc.entries); i === nothing || push!(pc.entries, popat!(pc.entries, i)))
     for e in new
@@ -613,6 +626,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     cache.positions .= n
     prefix === nothing || (prefix.live = copy(prompt); prefix.live_df = dflash === nothing ? 0 : n)       # the live K/V below n is this prompt's (MTP: set once primed)
     PREFILL_TIMES[:chunks] = _tic() - t_chunks - get(PREFILL_TIMES, :save, 0.0)
+    all(isfinite, logits) || _fail_prefill!(prefix, dflash, n)
     t_reg = time()
     prefix === nothing || _register!(prefix, prefix.pending, best)
     PREFILL_TIMES[:register] = time() - t_reg

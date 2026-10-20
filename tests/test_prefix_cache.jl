@@ -12,6 +12,16 @@ using Test
 using Luminal
 using Luminal.NN
 
+# A prefill that ends in NaN/Inf logits fails the request and drops the state it wrote (no resume from poisoned K/V, checkpoints or ring rows)
+@testset "a prefill with non-finite logits drops its prefix cache state" begin
+    pc = PrefixCache(min_tokens=8, ckpt_every=16)
+    pc.live = collect(1:40); pc.live_mtp = 40; pc.live_df = 40
+    pc.ckpts = Luminal.Decoding.StateCkpt[]
+    @test_throws ErrorException Luminal.Decoding._fail_prefill!(pc, nothing, 40)
+    @test isempty(pc.live) && pc.live_mtp == 0 && pc.live_df == 0 && isempty(pc.pending) && isempty(pc.ckpts)
+    @test_throws ErrorException Luminal.Decoding._fail_prefill!(nothing, nothing, 40)
+end
+
 if Luminal.get_device() isa CPUDevice
     @info "no GPU: skipping the prefix cache test"
 else
