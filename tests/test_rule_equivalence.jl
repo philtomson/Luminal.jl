@@ -319,6 +319,31 @@ end
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v; mask=false), att_shapes, Luminal.CausalAttention)[1] == 0        # no causal mask
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([8, 16, 4, 1], [8, 16, 2, 1], [8, 16, 2, 1]), Luminal.CausalAttention)[1] == 0   # head size the kernel does not take
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([32, 8, 4, 1], [32, 8, 2, 1], [32, 8, 2, 1]), Luminal.CausalAttention)[1] == 0    # short sequence
+
+    # a gated RMSNorm followed by the tiled head regrouping (head h = k * G + g goes to slot g * nk + k): one GatedRMSNormOp with tiled_nk = nk
+    tiled_chain(x, w, z, dv, G, nk, S, B) = Luminal.reshape(Luminal.permute(Luminal.reshape(Luminal.std_norm(x, 1, 1f-6) * w * Luminal.silu(z),
+                                          [dv, G, nk, S, B]), [1, 3, 2, 4, 5]), [dv, G * nk, S, B])
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        dv = rdim(rng); nk = rand(rng, 1:3); G = rand(rng, 1:3); S = rdim(rng, 1, 3); B = rand(rng, 1:2)
+        x = input!(g, ins, [dv, G * nk, S, B]); wt = input!(g, ins, [dv]); z = input!(g, ins, [dv, G * nk, S, B])
+        return [tiled_chain(x, wt, z, dv, G, nk, S, B)], ins
+    end)
+    @test w < 1e-5 && n > 1 && get(FIRED, "fusion.gated-rmsnorm-tiled", 0) > 0
+    let (dv, G, nk, S, B) = (4, 3, 2, 2, 1)
+        gg = Graph()
+        x = Luminal.tensor(gg, [dv, G * nk, S, B]); wt = Luminal.tensor(gg, [dv]); z = Luminal.tensor(gg, [dv, G * nk, S, B])
+        out = tiled_chain(x, wt, z, dv, G, nk, S, B)
+        rw = to_egraph(gg, [out.id]); saturate_graph!(rw)
+        ng, _ = extract_graph(rw)
+        ops = [n.op for n in ng.nodes if n.op isa Luminal.GatedRMSNormOp]
+        @test length(ops) == 1 && ops[1].tiled_nk == nk && ops[1].nv == G * nk && length(ng.nodes) == 4        # inputs, the op, and the root
+    end
+    # not recognised: the same regrouping of a tensor that is not a gated RMSNorm, and a different regrouping
+    @test fused_in_static_extraction((x, w, z) -> Luminal.reshape(Luminal.permute(Luminal.reshape(x * z, [4, 3, 2, 2, 1]), [1, 3, 2, 4, 5]), [4, 6, 2, 1]),
+                                     ([4, 6, 2, 1], [4], [4, 6, 2, 1]), Luminal.GatedRMSNormOp)[1] == 0
+    @test fused_in_static_extraction((x, w, z) -> Luminal.reshape(Luminal.permute(Luminal.reshape(Luminal.std_norm(x, 1, 1f-6) * w * Luminal.silu(z), [4, 3, 2, 2, 1]), [1, 2, 3, 5, 4]), [4, 6, 2, 1]),
+                                     ([4, 6, 2, 1], [4], [4, 6, 2, 1]), Luminal.GatedRMSNormOp)[1] == 1       # the plain gated norm is still fused, the regrouping is not folded in
 end
 
 # --- coverage: a rule without a test graph fails here ----------------------------------------------------------------------
