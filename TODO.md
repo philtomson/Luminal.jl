@@ -1132,3 +1132,33 @@ to gain, expected to show even less). Next for decode: deeper MTP drafting (kyoj
 Kyojin (~/devel/AI/kyojin, an ExLlamaV3 fork for gfx1151, its own ~3 bpw EXL3 quantization, MoE models): decode is bytes-bound there too; its notes' transferable parts are the cost
 model ms/forward = a + b * rows (extra verify rows are free for a dense model, 9 ms each for its MoE), MTP depth sweeps with dynamic drafting, an LDS bank-conflict found by arithmetic
 (innermost extent of a one-dword shared array must be coprime with 32), and the warning that run-to-run drift is > 1 tok/s so claims under ~2 tok/s need repeats.
+
+## Prefix cache: ideas from gufo's hybrid-model cache (2026-10-20)
+
+Source: https://gufo.blog/blog/how-gufo-caches-a-hybrid-model (read through a summarizer; check the page before relying on its numbers). Our side is
+`PrefixCache` in `src/Decoding.jl` (checkpoints of the recurrent states every `ckpt_every` = 4096 tokens along the live prompt, ~150 MB each on the
+27B, K/V taken from the live cache; plus `max_sys` / `max_turn` entries). Already matching gufo: recurrent-state checkpoints on a token grid,
+K/V borrowed from the live cache instead of copied, state sizes. Not worth taking: cross-slot chunk sharing and provenance (we run one slot),
+memory pinning.
+
+Candidates, most valuable first:
+1. **Restored-vs-uncached equivalence test for every state component** (recurrent states, convolution history, MTP pairs, the DFlash ring rows,
+   the residual stream). A forgotten component fails silently ("almost right" state); our prefix cache already kept a bad DFlash state once
+   (NaN scores after a prefill under GPU contention). Cheapest item; do it first.
+2. **Checkpoints on disk.** gufo restores a 95k-token conversation from disk in 1.4 s (0.86 s restoring) against 57.8 s of prefill; our cold prefill
+   at 150k tokens measured ~570 s and we restart the server often. Publication order: write and sync chunks and state, sync directories, then
+   atomically rename a manifest; verify checksums on restore; ignore and delete orphan files; only prompt and learned checkpoints go to disk.
+   Needs a compatibility identity per checkpoint (model, weights, tokenizer, chat template, state layout, speculative-decoding config).
+3. **Checkpoints that survive a change of conversation.** Ours live only along the current prompt (plus 2 system and 2 turn entries); gufo keeps
+   many conversations in RAM under a byte budget (half of free RAM, capped at 32 GiB; at most 128 checkpoints) behind one prefix index (a
+   compressed token tree), deepest exact-prefix match wins, live beats RAM beats disk. opencode subagents interleave different system prompts,
+   so measure our hit rate first (log every hit / miss with its reason).
+4. **Learned divergence points.** When a new prompt diverges from the cached one at position p, capture a checkpoint near p (only if it saves
+   >= 512 tokens; merge captures within 64 tokens). gufo also always captures the end of the prompt and a "stable boundary" the client resends.
+   Lower value for us: earlier-context edits are rare.
+5. **Log every cache admission, eviction and miss.** Cheap; makes misses debuggable. Eviction order in gufo: retry copies, cheap checkpoints
+   (state > 8x the rows they restore), idle conversations LRU, reused ones last; covered near-duplicates first within a conversation.
+
+Pitfalls from the page worth remembering: a matching token prefix is not enough (an edit at 7,001 of 8,192 tokens restores the checkpoint at
+6,144, because the 8,192 one contains the old text); the same tokens do not give the same bytes (kernel tiling and batching change the
+floating-point addition order), so never mix K/V rows from one run with recurrent state from another.
