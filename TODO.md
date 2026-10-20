@@ -1163,7 +1163,11 @@ Pitfalls from the page worth remembering: a matching token prefix is not enough 
 6,144, because the 8,192 one contains the old text); the same tokens do not give the same bytes (kernel tiling and batching change the
 floating-point addition order), so never mix K/V rows from one run with recurrent state from another.
 
-## FlashAttentionOp's GPU kernel is wrong for head sizes of 64 and up (found 2026-10-20)
+## FlashAttentionOp's GPU kernel was wrong for head sizes of 64 and up (found and fixed 2026-10-20)
+
+**Fixed** (branch `flash_attention_fix`): the launch used `1 << (31 - leading_zeros(d - 1) + 1)`, which is 0 for Int64 arguments, so every group had 32 threads and the head dimension was silently truncated to 32. It now uses `clamp(nextpow(2, d), 32, 256)`, the local arrays hold 256 entries and a head size above 256 throws; `tests/test_attention.jl` tests D = 32, 48, 64, 100, 128, 256 (it used D = 16 before, which hid the bug). The op is still 8-12x slower than the composite attention, so nothing should use it.
+
+Original report:
 
 `flash_attention(q, k, v; causal)` -> `FlashAttentionOp` (`flash_attn_fwd_kernel`, `src/Execution.jl`): on the GPU the output is correct at D=32 but has relative
 error ~1.0 against a Float64 reference at D=64 (S=16..1500) and 0.87 at D=128; the CPU op is exact (`benchmarks/flash_attention_op_check.jl`, results next

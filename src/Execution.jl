@@ -3285,9 +3285,9 @@ end
     
     # Shared memory for row accumulation
     # Note: Using a fixed size for d (head_dim) and acc (reduction) to ensure compatibility.
-    # Typical head dims: 64, 128. acc max threads: 256.
-    s_Q = @localmem Float32 (128,)
-    s_O = @localmem Float32 (128,)
+    # Head dims up to 256; the group has nextpow2(d) threads (at least 32).
+    s_Q = @localmem Float32 (256,)
+    s_O = @localmem Float32 (256,)
     s_acc = @localmem Float32 (256,)
 
     # Load Q row
@@ -3472,9 +3472,11 @@ function execute_op!(out, op::FlashAttentionOp, q, k, v)
         backend = KernelAbstractions.get_backend(q)
         # Grid: (N, B*H)
         # Block: (max(d, 32),)
-        threads = max(32, 1 << (31 - leading_zeros(d - 1) + 1)) # Next power of 2
-        # Ensure we don't exceed max threads
-        threads = min(threads, 256)
+        # One thread per head-dimension element: the next power of two of d, at least a wave (32), at most 256 (the kernel's local arrays).
+        # (The old expression `1 << (31 - leading_zeros(d - 1) + 1)` is 0 for Int64 arguments, so the group was always 32 threads and a
+        # head size above 32 was silently truncated.)
+        d <= 256 || throw(ArgumentError("FlashAttentionOp: head size $d exceeds 256"))
+        threads = clamp(nextpow(2, d), 32, 256)
         
         kernel! = flash_attn_fwd_kernel(backend)
         kernel!(out, q, k, v, B, H, N, d, op.scale, op.causal, 

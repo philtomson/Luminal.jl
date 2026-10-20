@@ -7,3 +7,12 @@
 (64, 64, 2, 1) causal=true: CPU op vs ref 1.5e-7   GPU op vs ref 0.95
 (64, 256, 2, 1) causal=false: CPU op vs ref 3.6e-7   GPU op vs ref 1.0
 (64, 256, 2, 1) causal=true: CPU op vs ref 1.9e-7   GPU op vs ref 1.0
+# After the fix (workgroup = next power of two of d, local arrays 256):
+(32, 8, 2, 1) causal=false: CPU op vs ref 1.6e-7   GPU op vs ref 1.2e-7
+(32, 8, 2, 1) causal=true: CPU op vs ref 1.6e-7   GPU op vs ref 9.7e-8
+(64, 16, 2, 1) causal=false: CPU op vs ref 2.3e-7   GPU op vs ref 2.3e-7
+(64, 16, 2, 1) causal=true: CPU op vs ref 9.3e-8   GPU op vs ref 1.2e-7
+(64, 64, 2, 1) causal=false: CPU op vs ref 2.7e-7   GPU op vs ref 3.4e-7
+(64, 64, 2, 1) causal=true: CPU op vs ref 1.8e-7   GPU op vs ref 1.4e-7
+(64, 256, 2, 1) causal=false: CPU op vs ref 5.5e-7   GPU op vs ref 6.9e-7
+(64, 256, 2, 1) causal=true: CPU op vs ref 1.6e-7   GPU op vs ref 1.6e-7

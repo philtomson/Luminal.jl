@@ -26,3 +26,18 @@ end
         @test Array(res) ≈ reference_attention(q_val, k_val, v_val, 1f0 / sqrt(Float32(D)), causal) rtol = 1e-4
     end
 end
+
+# Head sizes above 32 (the launch used to truncate them to 32 elements on the GPU), including sizes that are not a power of two
+@testset "Flash Attention: head sizes" begin
+    for D in (32, 48, 64, 100, 128, 256), causal in (false, true)
+        S, H, B = 12, 2, 1
+        q_val, k_val, v_val = randn(Float32, D, S, H, B), randn(Float32, D, S, H, B), randn(Float32, D, S, H, B)
+        for dev in unique([CPUDevice(), Luminal.get_device()])
+            g = Graph()
+            q, k, v = tensor(g, [D, S, H, B]), tensor(g, [D, S, H, B]), tensor(g, [D, S, H, B])
+            out = flash_attention(q, k, v; causal=causal)
+            res = Luminal.execute(g, out.id, Dict(q.id => q_val, k.id => k_val, v.id => v_val), dev)
+            @test Array(res) ≈ reference_attention(q_val, k_val, v_val, 1f0 / sqrt(Float32(D)), causal) rtol = 1e-4
+        end
+    end
+end
