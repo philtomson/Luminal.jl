@@ -296,11 +296,14 @@ end
     @test fused_in_static_extraction((x, w) -> Luminal.std_norm(x, 1, 1f-6) * (w + 1f0), ([8, 3], [8]), Luminal.RMSNormOp)[1] == 1
 
     # causal attention in NN's composite form (GQA or plain multi-head): q (D, S, H, B), k and v (D, S, KVH, B)
-    attention(q, k, v; scale=0.25f0, mask=true) = begin
+    attention(q, k, v; scale=0.25f0, mask=true, window=0) = begin
         D, S, H, B = Luminal.realized_dims(q.shape); KV = Luminal.realized_dims(k.shape)[3]
         keys = NN.repeat_kv(k, H ÷ KV); values = NN.repeat_kv(v, H ÷ KV)
         w = Luminal.matmul(Luminal.permute(q, [2, 1, 3, 4]), keys) * scale
-        mask && (w = w + Luminal.expand(Luminal.expand(Luminal.triu(q.graph_ref, S, 1) * -9f9, 3, H), 4, B))
+        if mask
+            m = window > 0 ? (Luminal.triu(q.graph_ref, S, 1) + Luminal.band_mask(q.graph_ref, S, window)) * -9f9 : Luminal.triu(q.graph_ref, S, 1) * -9f9
+            w = w + Luminal.expand(Luminal.expand(m, 3, H), 4, B)
+        end
         Luminal.matmul(Luminal.softmax(w, 2), Luminal.permute(values, [2, 1, 3, 4]))
     end
     # the attention rule needs the matrix-core kernel (Luminal.wmma_enabled(): a gfx11 GPU and LUMINAL_WMMA != 0)
@@ -315,6 +318,24 @@ end
         @test get(FIRED, "fusion.causal-attention-$(kvh_equal ? "mha" : "gqa")", 0) > 0
     end
     att_shapes = ([32, 16, 4, 1], [32, 16, 2, 1], [32, 16, 2, 1])
+    # ... with a sliding window (Gemma's local layers): keys `window` or more behind the query are masked too
+    Luminal.wmma_enabled() && for kvh_equal in (false, true)
+        w, n = check((g, rng, dev) -> begin
+            ins = Pair{Luminal.GraphTensor,Any}[]
+            D = rand(rng, [32, 64]); S = rand(rng, [16, 18]); KV = rand(rng, [1, 2]); H = kvh_equal ? KV : KV * rand(rng, [2, 3]); B = rand(rng, [1, 2])
+            q = input!(g, ins, [D, S, H, B]); k = input!(g, ins, [D, S, KV, B]); v = input!(g, ins, [D, S, KV, B])
+            return [attention(q, k, v; scale=Float32(1 / sqrt(D)), window=rand(rng, [1, 3, 5, 8]))], ins
+        end; cases=4, tol=GPU ? 2e-2 : 1e-5)
+        @test w < (GPU ? 2e-2 : 1e-5) && n > 1
+        @test get(FIRED, "fusion.causal-attention-$(kvh_equal ? "mha" : "gqa")-window", 0) > 0
+    end
+    Luminal.wmma_enabled() && @test fused_in_static_extraction((q, k, v) -> attention(q, k, v; window=5), att_shapes, Luminal.CausalAttention)[1] == 1
+    # the window mask itself (any device): 1 where i - j >= window
+    let g = Luminal.Graph(), W = 3, S = 7
+        m = Luminal.band_mask(g, S, W)
+        r = Array(Luminal.compile(g; device=DEV, retain=[m.id])(Dict{Int,Any}(); device=DEV)[m.id])
+        @test r == Float32[(i - j >= W) for i in 0:S-1, j in 0:S-1]
+    end
     Luminal.wmma_enabled() && @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), att_shapes, Luminal.CausalAttention) == (1, 5, 34)
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v; mask=false), att_shapes, Luminal.CausalAttention)[1] == 0        # no causal mask
     @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([8, 16, 4, 1], [8, 16, 2, 1], [8, 16, 2, 1]), Luminal.CausalAttention)[1] == 0   # head size the kernel does not take

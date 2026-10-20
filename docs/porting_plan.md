@@ -278,8 +278,9 @@ what dominated decode here.
    (`flash_prefill!`, all three) and `CausalAttention` now take a `window` (`CausalAttention(scale, window)`; 0 = full causal); each kernel starts
    at the first key tile a block can see. `benchmarks/flash_window.jl` (GPU, 8 heads / 4 KV heads): correct at S = 2048 (3-4.5e-4 against the host
    reference, the Float16 level), and faster than full causal attention by 2.1-2.5x at a 256-key window already at S = 2048, and at S = 16384
-   by 2.1-2.4x (window 4096), 5.5-6.5x (1024) and 9.5-15x (256). What is still missing is the rule that recognises Gemma's windowed composite
-   (its mask is an `Iota` node with a closure, which a pattern cannot inspect; it would need a primitive spelling of the mask). Not done: sliding-window and unmasked attention, decode attention (no composite
+   by 2.1-2.4x (window 4096), 5.5-6.5x (1024) and 9.5-15x (256). Gemma's windowed composite is now recognised too: its mask used to be an `Iota` node with a closure (opaque to a pattern), so `NN` builds it from
+   primitives (`(triu + band_mask) * -9e9`, same values) and two rules (`causal-attention-{gqa,mha}-window`) read the window off the band's constant
+   and emit `CausalAttention((scale, window))` (GPU tests pass; not timed on a model). Not done: sliding-window and unmasked attention, decode attention (no composite
    spelling exists: the cached decode path builds `DecodeAttention` directly), the erf GELU, LayerNorm without a bias or weight. The tiled
    `GatedRMSNormOp` that `Qwen35.jl` builds is recognised from its primitive spelling (the plain gated norm, then reshape (dv, G, nk, S, B), permute
    the two head axes, reshape back: `fusion.gated-rmsnorm-tiled`); `Qwen35.jl` itself still builds the tiled op directly, so the rule only fires on graphs

@@ -486,7 +486,7 @@ function (sa::SelfAttention)(x::Luminal.GraphTensor, prev_seq::Int; rope_base=10
         # query are masked too (weights are (S_q, S_k, H, B))
         W = sa.window
         mask = W > 0 && seq > W ?
-            Luminal.iota(x.graph_ref, [seq, seq], (i, j) -> (j > i || i - j >= W) ? -9f9 : 0f0) :
+            (Luminal.triu(x.graph_ref, seq, 1) + Luminal.band_mask(x.graph_ref, seq, W)) * -9f9 :
             Luminal.triu(x.graph_ref, seq, 1) * -9f9
         # Expand mask (S, S) to (S, S, H, B)
         mask_expanded = Luminal.expand(Luminal.expand(mask, 3, sa.n_heads), 4, batch)

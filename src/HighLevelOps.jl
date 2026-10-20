@@ -625,6 +625,19 @@ function triu(graph::Graph, size::DimType, diagonal::Int=0)
     return cast(v - (diagonal - 1) > h, Float32)
 end
 
+"""
+    band_mask(graph, size, window)
+
+A Float32 0/1 mask (size, size) that is 1 where key `j` lies `window` or more positions behind query `i` (`i - j >= window`): the part of a
+sliding-window mask that `triu(graph, size, 1)` (keys ahead of the query) does not cover. Built from primitives, like `triu`, so that the
+e-graph's fusion rules can recognise the windowed attention mask.
+"""
+function band_mask(graph::Graph, size::DimType, window::Int)
+    v = expand(arange(graph, size), 1, size)         # v[i, j] = j - 1
+    h = expand(arange(graph, size), 2, size)         # h[i, j] = i - 1
+    return cast(h - (window - 1) > v, Float32)
+end
+
 function gather(matrix::GraphTensor, indexes::GraphTensor)
     @assert matrix.graph_ref === indexes.graph_ref "Tensors must be from the same graph"
     m_cont = contiguous(matrix)
