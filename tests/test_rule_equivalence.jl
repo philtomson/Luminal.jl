@@ -245,6 +245,28 @@ end
     @test fused_in_static_extraction((a, b) -> Luminal.gelu(a) * b, ([4, 3], [4, 3]), Luminal.SwiGLUOp)[1] == 0        # another activation
     @test fused_in_static_extraction((a, b) -> Luminal.silu(a) * b, ([4, 3], [4, 1]), Luminal.SwiGLUOp)[1] == 0        # up broadcasts
     @test fused_in_static_extraction(a -> Luminal.std_norm(a, 1, 1f-5), ([8, 3],), Luminal.RMSNormOp)[1] == 0          # no weight
+
+    # L2Norm and RMSNorm-times-silu(gate) (Gated DeltaNet)
+    l2(x, eps) = x * Luminal.expand(Luminal.reciprocal(Luminal.sqrt(Luminal.sum(x * x, 1) + eps)), 1, Luminal.realized_dims(x.shape)[1])
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        return [l2(input!(g, ins, rdims(rng, rand(rng, 1:3), lo=2, hi=6)), Float32(rand(rng, [1e-6, 1e-5])))], ins
+    end)
+    @test w < 1e-5 && n > 1 && get(FIRED, "fusion.l2norm", 0) > 0
+    for side in (:lhs, :rhs)
+        w, n = check((g, rng, dev) -> begin
+            ins = Pair{Luminal.GraphTensor,Any}[]
+            d = rdims(rng, rand(rng, 1:3), lo=2, hi=6)
+            x = input!(g, ins, d); wt = input!(g, ins, [d[1]]); z = input!(g, ins, d)
+            nx = Luminal.std_norm(x, 1, 1f-6) * wt
+            return [side === :lhs ? nx * Luminal.silu(z) : Luminal.silu(z) * nx], ins
+        end)
+        @test w < 1e-5 && n > 1 && get(FIRED, "fusion.gated-rmsnorm-$side", 0) > 0
+    end
+    @test fused_in_static_extraction(x -> l2(x, 1f-6), ([8, 3],), Luminal.L2NormOp) == (1, 2, 9)
+    @test fused_in_static_extraction((x, w, z) -> Luminal.std_norm(x, 1, 1f-6) * w * Luminal.silu(z), ([8, 3], [8], [8, 3]), Luminal.GatedRMSNormOp)[1] == 1
+    @test fused_in_static_extraction((x, w, z) -> Luminal.std_norm(x, 1, 1f-6) * w * Luminal.gelu(z), ([8, 3], [8], [8, 3]), Luminal.GatedRMSNormOp)[1] == 0
+    @test fused_in_static_extraction((x, w, z) -> Luminal.std_norm(x, 1, 1f-6) * w * Luminal.silu(z), ([8, 3], [8], [8, 1]), Luminal.GatedRMSNormOp)[1] == 0     # z broadcasts
 end
 
 # --- coverage: a rule without a test graph fails here ----------------------------------------------------------------------

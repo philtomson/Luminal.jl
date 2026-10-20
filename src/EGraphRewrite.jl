@@ -103,7 +103,7 @@ function _make_dims(g, h, ch)
         a = _dims(g, ch[2]); a === nothing && return nothing
         d, k = _lit(g, ch[1])
         return Shp((a[1:d-1]..., k, a[d:end]...))
-    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp
+    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp || h === :xL2NormOp || h === :xGatedRMSNormOp
         a = _dims(g, ch[2]); a === nothing && return nothing
         return Shp(a)
     elseif h === :xMul || h === :xAdd
@@ -218,7 +218,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
     for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulQ4, Luminal.MatMulT,
-              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp)
+              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp, Luminal.L2NormOp, Luminal.GatedRMSNormOp)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
@@ -424,7 +424,20 @@ function _rmsnorm_rule(a, w, e1, s1, k1, k2)
     _const_is(k1, 1 / d[1]) && k2[1] isa AbstractFloat || return nothing
     return :(xRMSNormOp($((Float32(k2[1]),)), $a, $w))
 end
-const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 g u a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 begin
+function _l2norm_rule(a, e1, s1, k1)
+    a.data === nothing && return nothing
+    d = a.data.dims
+    (s1 == (1,) && !isempty(d) && d[1] isa Integer && e1 == (1, d[1]) && k1[1] isa AbstractFloat) || return nothing
+    return :(xL2NormOp($((Float32(k1[1]),)), $a))
+end
+# rmsnorm(x, w) * silu(z): the RMSNorm is already an RMSNormOp in the class (`rmsnorm-weight`), z has the shape of x
+function _gated_rmsnorm_rule(a, w, z, q, k1, k2, k3, k4)
+    (a.data === nothing || z.data === nothing) && return nothing
+    (_const_is(k1, -1.0) && _const_is(k2, 1 / log(2)) && _const_is(k3, 1.0) && _const_is(k4, 1.0)) || return nothing
+    isequal(a.data.dims, z.data.dims) || return nothing
+    return :(xGatedRMSNormOp($((Float32(q[1]), 0, 0)), $a, $w, $z))
+end
+const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 begin
     xMul(p1::Tuple, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), u) =>
         _swiglu_rule(g, u, k1, k2, k3, k4)
     xMul(p1::Tuple, u, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple))))) =>
@@ -436,7 +449,15 @@ const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 g u a w e1 e2 e3 m1 m2
     # RMSNorm with a weight: x * recip(sqrt(sum(x*x) / H + eps)) * w
     xMul(p1::Tuple, xMul(p2::Tuple, a, xExpand(e1::Tuple, xRecip(p3::Tuple, xSqrt(p4::Tuple, xAdd(p5::Tuple, xMul(p6::Tuple, xSumReduce(s1::Tuple, xMul(p7::Tuple, a, a)), xConstant(k1::Tuple)), xConstant(k2::Tuple)))))), w) =>
         _rmsnorm_rule(a, w, e1, s1, k1, k2)
-end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight"))
+    # L2 normalization over dim 1: x * recip(sqrt(sum(x*x) + eps))
+    xMul(p1::Tuple, a, xExpand(e1::Tuple, xRecip(p2::Tuple, xSqrt(p3::Tuple, xAdd(p4::Tuple, xSumReduce(s1::Tuple, xMul(p5::Tuple, a, a)), xConstant(k1::Tuple)))))) =>
+        _l2norm_rule(a, e1, s1, k1)
+    # RMSNorm times silu of a gate (Gated DeltaNet's output norm)
+    xMul(p3::Tuple, xRMSNormOp(q::Tuple, a, w), xMul(p5::Tuple, z, xDiv(p6::Tuple, xConstant(k3::Tuple), xAdd(p7::Tuple, xExp2(p8::Tuple, xMul(p1::Tuple, xMul(p2::Tuple, z, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple))))) =>
+        _gated_rmsnorm_rule(a, w, z, q, k1, k2, k3, k4)
+    xMul(p3::Tuple, xMul(p5::Tuple, z, xDiv(p6::Tuple, xConstant(k3::Tuple), xAdd(p7::Tuple, xExp2(p8::Tuple, xMul(p1::Tuple, xMul(p2::Tuple, z, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), xRMSNormOp(q::Tuple, a, w)) =>
+        _gated_rmsnorm_rule(a, w, z, q, k1, k2, k3, k4)
+end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight", "l2norm", "gated-rmsnorm-lhs", "gated-rmsnorm-rhs"))
 
 # Backoff scheduling (Metatheory's default) that also tells the rule log what each search found.
 mutable struct ReportingScheduler <: Metatheory.EGraphs.Schedulers.AbstractScheduler
