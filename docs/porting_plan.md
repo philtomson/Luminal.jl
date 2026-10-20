@@ -254,8 +254,12 @@ what dominated decode here.
    hand-fused graph (41.97 vs 41.91 ms at 16 tokens, 62.28 vs 62.33 ms at 64), so the go criterion holds. There is no speed-up:
    the executor's elementwise fusion already compiles the primitive spelling within 1% of the hand-fused one (42.29 / 63.05 ms), so
    the value is backend-neutral model code and a search space with fused alternatives. Logits differ from the hand-fused graph by
-   ~5e-4 relative in every variant, including the untouched primitive graph; not yet traced to its source. Not done: Gemma's (1 + w)
-   norm, LayerNorm, GELU, L2Norm, attention.
+   ~5e-4 relative in every variant, including the untouched primitive graph; not yet traced to its source. Also recognised now: L2Norm, RMSNorm times silu(gate) (`GatedRMSNormOp`), Gemma's (1 + w) RMSNorm (the weight is any
+   tensor of shape (H,)), and two new fused ops with kernels, `LayerNormOp` (affine) and `GeluOp` (tanh form).
+   `benchmarks/c1_norms.jl` (GPU): fused LayerNorm is 2.4-3.5x faster than its primitive graph, with the same error against Float64
+   (~1.5e-7), which also covers the kernel at 768-5120-wide rows; fused GELU is equal to the primitives (0.98-1.01x), since the
+   executor already fuses the elementwise chain. Not done: attention, the erf GELU, LayerNorm without a bias or weight, the tiled
+   `GatedRMSNormOp` that `Qwen35.jl` builds.
 5. **C6 + C5, bounds, buckets and a bufferization plan**, together: bounds and buckets decide which programs exist, the plan
    decides their memory. Go if peak memory of a 32k-token 27B prefill drops without a throughput loss.
 6. **C4, layout IR**, only if we commit to generated kernels.

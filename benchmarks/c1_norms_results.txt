@@ -1,0 +1,12 @@
+layernorm  (2048, 1)       prim    0.045 ms   fused    0.017 ms   (2.69x)   max rel err vs Float64: prim 9.6e-08, fused 9.6e-08
+layernorm  (2048, 64)      prim    0.047 ms   fused    0.018 ms   (2.65x)   max rel err vs Float64: prim 1.0e-07, fused 1.7e-07
+layernorm  (2048, 512)     prim    0.122 ms   fused    0.043 ms   (2.80x)   max rel err vs Float64: prim 1.5e-07, fused 1.3e-07
+layernorm  (4096, 64)      prim    0.050 ms   fused    0.020 ms   (2.45x)   max rel err vs Float64: prim 1.4e-07, fused 1.6e-07
+layernorm  (4096, 512)     prim    0.206 ms   fused    0.059 ms   (3.47x)   max rel err vs Float64: prim 1.8e-07, fused 1.9e-07
+layernorm  (768, 512)      prim    0.068 ms   fused    0.025 ms   (2.67x)   max rel err vs Float64: prim 9.2e-08, fused 1.2e-07
+layernorm  (5120, 16)      prim    0.046 ms   fused    0.019 ms   (2.39x)   max rel err vs Float64: prim 9.6e-08, fused 1.3e-07
+gelu       (5632, 1)       prim    0.012 ms   fused    0.013 ms   (0.99x)   max rel err vs Float64: prim 6.0e-08, fused 6.0e-08
+gelu       (5632, 64)      prim    0.019 ms   fused    0.020 ms   (0.98x)   max rel err vs Float64: prim 5.2e-08, fused 4.3e-08
+gelu       (5632, 512)     prim    0.077 ms   fused    0.078 ms   (0.99x)   max rel err vs Float64: prim 5.0e-08, fused 4.2e-08
+gelu       (10240, 512)    prim    0.217 ms   fused    0.218 ms   (1.00x)   max rel err vs Float64: prim 5.4e-08, fused 4.6e-08
+gelu       (10240, 4096)   prim    1.603 ms   fused    1.595 ms   (1.01x)   max rel err vs Float64: prim 4.5e-08, fused 3.8e-08
