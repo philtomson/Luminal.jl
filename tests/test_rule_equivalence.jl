@@ -5,6 +5,7 @@
 using Test
 using Luminal
 using Luminal.EGraphRewrite
+using Luminal.NN
 using Metatheory
 using Random
 
@@ -293,6 +294,30 @@ end
     @test fused_in_static_extraction(x -> Luminal.gelu(x), ([8, 3],), Luminal.GeluOp) == (1, 2, 24)
     @test fused_in_static_extraction(x -> Luminal.gelu(x; approximate=false), ([8, 3],), Luminal.GeluOp)[1] == 0                      # the erf form
     @test fused_in_static_extraction((x, w) -> Luminal.std_norm(x, 1, 1f-6) * (w + 1f0), ([8, 3], [8]), Luminal.RMSNormOp)[1] == 1
+
+    # causal attention in NN's composite form (GQA or plain multi-head): q (D, S, H, B), k and v (D, S, KVH, B)
+    attention(q, k, v; scale=0.25f0, mask=true) = begin
+        D, S, H, B = Luminal.realized_dims(q.shape); KV = Luminal.realized_dims(k.shape)[3]
+        keys = NN.repeat_kv(k, H ÷ KV); values = NN.repeat_kv(v, H ÷ KV)
+        w = Luminal.matmul(Luminal.permute(q, [2, 1, 3, 4]), keys) * scale
+        mask && (w = w + Luminal.expand(Luminal.expand(Luminal.triu(q.graph_ref, S, 1) * -9f9, 3, H), 4, B))
+        Luminal.matmul(Luminal.softmax(w, 2), Luminal.permute(values, [2, 1, 3, 4]))
+    end
+    for kvh_equal in (false, true)
+        w, n = check((g, rng, dev) -> begin
+            ins = Pair{Luminal.GraphTensor,Any}[]
+            D = rand(rng, [32, 64]); S = rand(rng, [16, 18]); KV = rand(rng, [1, 2]); H = kvh_equal ? KV : KV * rand(rng, [2, 3]); B = rand(rng, [1, 2])
+            q = input!(g, ins, [D, S, H, B]); k = input!(g, ins, [D, S, KV, B]); v = input!(g, ins, [D, S, KV, B])
+            return [attention(q, k, v; scale=Float32(1 / sqrt(D)))], ins
+        end; cases=3, tol=GPU ? 2e-2 : 1e-5)         # the GPU kernel runs on Float16 matrix cores
+        @test w < (GPU ? 2e-2 : 1e-5) && n > 1
+        @test get(FIRED, "fusion.causal-attention-$(kvh_equal ? "mha" : "gqa")", 0) > 0
+    end
+    att_shapes = ([32, 16, 4, 1], [32, 16, 2, 1], [32, 16, 2, 1])
+    @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), att_shapes, Luminal.CausalAttention) == (1, 5, 34)
+    @test fused_in_static_extraction((q, k, v) -> attention(q, k, v; mask=false), att_shapes, Luminal.CausalAttention)[1] == 0        # no causal mask
+    @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([8, 16, 4, 1], [8, 16, 2, 1], [8, 16, 2, 1]), Luminal.CausalAttention)[1] == 0   # head size the kernel does not take
+    @test fused_in_static_extraction((q, k, v) -> attention(q, k, v), ([32, 8, 4, 1], [32, 8, 2, 1], [32, 8, 2, 1]), Luminal.CausalAttention)[1] == 0    # short sequence
 end
 
 # --- coverage: a rule without a test graph fails here ----------------------------------------------------------------------

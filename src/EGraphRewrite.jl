@@ -103,7 +103,7 @@ function _make_dims(g, h, ch)
         a = _dims(g, ch[2]); a === nothing && return nothing
         d, k = _lit(g, ch[1])
         return Shp((a[1:d-1]..., k, a[d:end]...))
-    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp || h === :xL2NormOp || h === :xGatedRMSNormOp || h === :xLayerNormOp || h === :xGeluOp
+    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp || h === :xL2NormOp || h === :xGatedRMSNormOp || h === :xLayerNormOp || h === :xGeluOp || h === :xCausalAttention
         a = _dims(g, ch[2]); a === nothing && return nothing
         return Shp(a)
     elseif h === :xMul || h === :xAdd
@@ -218,7 +218,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
     for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulQ4, Luminal.MatMulT,
-              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp, Luminal.L2NormOp, Luminal.GatedRMSNormOp, Luminal.LayerNormOp, Luminal.GeluOp)
+              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp, Luminal.L2NormOp, Luminal.GatedRMSNormOp, Luminal.LayerNormOp, Luminal.GeluOp, Luminal.CausalAttention)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
@@ -452,7 +452,30 @@ function _layernorm_rule(a, w, b, e1, e2, s1, s2, k1, k2, k3, k4)
     (_const_is(k1, 1 / d[1]) && _const_is(k3, 1 / d[1]) && _const_is(k2, -1.0) && k4[1] isa AbstractFloat) || return nothing
     return :(xLayerNormOp($((Float32(k4[1]),)), $a, $w, $b))
 end
-const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 gp1 gp10 gp11 gp12 gp13 gp14 gp15 gp16 gp2 gp3 gp4 gp5 gp6 gp7 gp8 gp9 gk1 gk2 gk3 gk4 gk5 gk6 gk7 gk8 gk9 gk10 gk11 gk12 lpa lpb lpc lp1 lp2 lp3 lp4 lp5 lp6 lp7 lp8 le1 le2 ls1 ls2 lk1 lk2 lk3 lk4 b ga begin
+# Causal self-attention as NN's composite form spells it (GQA by expand + reshape, scale, the triu mask, softmax over the key axis,
+# then the weighted sum of V; q (D, S, H, B), k and v (D, S, KVH, B)): the fused `CausalAttention` (flash attention) on the unrepeated
+# k and v, followed by the permute that gives the composite's (S, D, H, B) layout. Only where the fused kernel applies (D % 32 == 0,
+# S >= 16, KV heads dividing the heads).
+function _attention_rule(gqa, aq, ak, av, pq, pv, r1, r2, e1, e2, ks, ar, x3, x4, ex1, ex2, kz, kn, mr, mr2, sr, ee, k1, k2)
+    (aq.data === nothing || ak.data === nothing || av.data === nothing) && return nothing
+    dq, dk, dv = aq.data.dims, ak.data.dims, av.data.dims
+    (length(dq) == 4 && length(dk) == 4 && all(x -> x isa Integer, dq) && all(x -> x isa Integer, dk)) || return nothing
+    D, S, H, B = dq
+    (isequal(dk, dv) && dk[1] == D && dk[2] == S && dk[4] == B && H % dk[3] == 0) || return nothing
+    (D % 32 == 0 && S >= 16) || return nothing
+    (pq == ((2, 1, 3, 4),) || pq == (2, 1, 3, 4)) && (pv == ((2, 1, 3, 4),) || pv == (2, 1, 3, 4)) || return nothing
+    if gqa
+        g = H ÷ dk[3]
+        (g > 1 && e1 == (3, g) && e2 == (3, g) && r1 == ((D, S, H, B),) && r2 == ((D, S, H, B),)) || return nothing
+    else
+        dk[3] == H || return nothing
+    end
+    (ks[1] isa AbstractFloat && _const_is(kz, 0.0) && _const_is(kn, -9e9) && _const_is(k1, -1.0) && _const_is(k2, -1.0)) || return nothing
+    (ar[1] == "ARange" && ar[2] == (S,) && x3 == (3, H) && x4 == (4, B) && ex1 == (1, S) && ex2 == (2, S)) || return nothing
+    (mr == (2,) && mr2 == (2,) && sr == (2,) && ee == (2, S)) || return nothing
+    return :(xPermute($(((2, 1, 3, 4),)), xCausalAttention($((Float32(ks[1]),)), $aq, $ak, $av)))
+end
+const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 gp1 gp10 gp11 gp12 gp13 gp14 gp15 gp16 gp2 gp3 gp4 gp5 gp6 gp7 gp8 gp9 gk1 gk2 gk3 gk4 gk5 gk6 gk7 gk8 gk9 gk10 gk11 gk12 lpa lpb lpc lp1 lp2 lp3 lp4 lp5 lp6 lp7 lp8 le1 le2 ls1 ls2 lk1 lk2 lk3 lk4 b ga atr1 ate1 atr2 ate2 atq1 atpq atm1 atks atar atx4 atx3 atmm atc atlt atex2 ata1 atex1 atkz atkn atw atd ate ata2 atm2 atee atmr atk1 atee2 atsr ate2x ata3 atm3 atee3 atmr2 atk2 atq2 atpv aq ak av begin
     xMul(p1::Tuple, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), u) =>
         _swiglu_rule(g, u, k1, k2, k3, k4)
     xMul(p1::Tuple, u, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple))))) =>
@@ -477,7 +500,12 @@ const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e
         _layernorm_rule(a, w, b, le1, le2, ls1, ls2, lk1, lk2, lk3, lk4)
     xMul(gp16::Tuple, xMul(gp15::Tuple, ga, xConstant(gk12::Tuple)), xAdd(gp14::Tuple, xAdd(gp13::Tuple, xMul(gp12::Tuple, xDiv(gp11::Tuple, xConstant(gk5::Tuple), xAdd(gp10::Tuple, xExp2(gp9::Tuple, xMul(gp8::Tuple, xMul(gp7::Tuple, xMul(gp6::Tuple, xMul(gp5::Tuple, xMul(gp1::Tuple, ga, xConstant(gk1::Tuple)), xAdd(gp4::Tuple, xMul(gp3::Tuple, xMul(gp2::Tuple, ga, xConstant(gk2::Tuple)), ga), xConstant(gk3::Tuple))), xConstant(gk4::Tuple)), xConstant(gk6::Tuple)), xConstant(gk7::Tuple))), xConstant(gk8::Tuple))), xConstant(gk9::Tuple)), xConstant(gk10::Tuple)), xConstant(gk11::Tuple))) =>
         _gelu_rule(ga, gk1, gk2, gk3, gk4, gk5, gk6, gk7, gk8, gk9, gk10, gk11, gk12)
-end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight", "l2norm", "gated-rmsnorm-lhs", "gated-rmsnorm-rhs", "layernorm-affine", "gelu-tanh"))
+    # causal attention from primitives (see _attention_rule)
+    xMatMul(atq2::Tuple, xDiv(atd::Tuple, xExp(ate::Tuple, xAdd(ata2::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), xReshape(atr1::Tuple, xExpand(ate1::Tuple, ak))), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))), xMul(atm2::Tuple, xExpand(atee::Tuple, xMaxReduce(atmr::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), xReshape(atr1::Tuple, xExpand(ate1::Tuple, ak))), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))))), xConstant(atk1::Tuple)))), xExpand(atee2::Tuple, xSumReduce(atsr::Tuple, xExp(ate2x::Tuple, xAdd(ata3::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), xReshape(atr1::Tuple, xExpand(ate1::Tuple, ak))), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))), xMul(atm3::Tuple, xExpand(atee3::Tuple, xMaxReduce(atmr2::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), xReshape(atr1::Tuple, xExpand(ate1::Tuple, ak))), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))))), xConstant(atk2::Tuple))))))), xPermute(atpv::Tuple, xReshape(atr2::Tuple, xExpand(ate2::Tuple, av)))) =>
+        _attention_rule(true, aq, ak, av, atpq, atpv, atr1, atr2, ate1, ate2, atks, atar, atx3, atx4, atex1, atex2, atkz, atkn, atmr, atmr2, atsr, atee, atk1, atk2)
+    xMatMul(atq2::Tuple, xDiv(atd::Tuple, xExp(ate::Tuple, xAdd(ata2::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), ak), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))), xMul(atm2::Tuple, xExpand(atee::Tuple, xMaxReduce(atmr::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), ak), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))))), xConstant(atk1::Tuple)))), xExpand(atee2::Tuple, xSumReduce(atsr::Tuple, xExp(ate2x::Tuple, xAdd(ata3::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), ak), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))), xMul(atm3::Tuple, xExpand(atee3::Tuple, xMaxReduce(atmr2::Tuple, xAdd(atw::Tuple, xMul(atm1::Tuple, xMatMul(atq1::Tuple, xPermute(atpq::Tuple, aq), ak), xConstant(atks::Tuple)), xExpand(atx4::Tuple, xExpand(atx3::Tuple, xMul(atmm::Tuple, xCast(atc::Tuple, xLessThan(atlt::Tuple, xExpand(atex2::Tuple, xFunction(atar::Tuple)), xAdd(ata1::Tuple, xExpand(atex1::Tuple, xFunction(atar::Tuple)), xConstant(atkz::Tuple)))), xConstant(atkn::Tuple))))))), xConstant(atk2::Tuple))))))), xPermute(atpv::Tuple, av)) =>
+        _attention_rule(false, aq, ak, av, atpq, atpv, nothing, nothing, nothing, nothing, atks, atar, atx3, atx4, atex1, atex2, atkz, atkn, atmr, atmr2, atsr, atee, atk1, atk2)
+end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight", "l2norm", "gated-rmsnorm-lhs", "gated-rmsnorm-rhs", "layernorm-affine", "gelu-tanh", "causal-attention-gqa", "causal-attention-mha"))
 
 # Backoff scheduling (Metatheory's default) that also tells the rule log what each search found.
 mutable struct ReportingScheduler <: Metatheory.EGraphs.Schedulers.AbstractScheduler
