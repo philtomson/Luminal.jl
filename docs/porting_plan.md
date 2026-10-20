@@ -269,8 +269,12 @@ what dominated decode here.
    Unmasked attention is not recognised on purpose: the only fused op,
    `FlashAttentionOp`, is 8-12x slower than the composite on the GPU (`benchmarks/attn_unmasked.jl`: 0.14 vs 1.4 ms at D=64, S=256, H=8; 8.3 vs
    108 ms at S=1500, H=20) and its GPU kernel returns wrong results for head size 64 and up (correct at D=32; relative error ~1.0, while the CPU
-   op is exact; `benchmarks/flash_attention_op_check.jl`), a bug the existing tests do not cover. Sliding-window attention needs window support in
-   the matrix-core flash kernel first (`flash_prefill!` has none). Not done: sliding-window and unmasked attention, decode attention (no composite
+   op is exact; `benchmarks/flash_attention_op_check.jl`), a bug the existing tests do not cover. Sliding-window attention: the matrix-core flash kernels
+   (`flash_prefill!`, all three) and `CausalAttention` now take a `window` (`CausalAttention(scale, window)`; 0 = full causal); each kernel starts
+   at the first key tile a block can see. `benchmarks/flash_window.jl` (GPU, 8 heads / 4 KV heads): correct at S = 2048 (3-4.5e-4 against the host
+   reference, the Float16 level), and faster than full causal attention by 2.1-2.5x at a 256-key window already at S = 2048, and at S = 16384
+   by 2.1-2.4x (window 4096), 5.5-6.5x (1024) and 9.5-15x (256). What is still missing is the rule that recognises Gemma's windowed composite
+   (its mask is an `Iota` node with a closure, which a pattern cannot inspect; it would need a primitive spelling of the mask). Not done: sliding-window and unmasked attention, decode attention (no composite
    spelling exists: the cached decode path builds `DecodeAttention` directly), the erf GELU, LayerNorm without a bias or weight, the tiled
    `GatedRMSNormOp` that `Qwen35.jl` builds.
 5. **C6 + C5, bounds, buckets and a bufferization plan**, together: bounds and buckets decide which programs exist, the plan
