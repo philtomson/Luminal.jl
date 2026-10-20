@@ -1,0 +1,24 @@
+
+== prefill, 16 tokens
+hand         graph (RMSNormOp, SwiGLUOp, nodes) = (45, 0, 868), compile 6.0 s
+hand+swiglu  graph (RMSNormOp, SwiGLUOp, nodes) = (45, 22, 734), compile 0.0 s
+prim         graph (RMSNormOp, SwiGLUOp, nodes) = (0, 0, 1230), compile 0.0 s
+prim+C1      graph (RMSNormOp, SwiGLUOp, nodes) = (0, 0, 1230), compile 18.5 s
+hand+C1      graph (RMSNormOp, SwiGLUOp, nodes) = (45, 0, 868), compile 0.1 s
+  hand            41.91 ms   (1.00x hand)   logits rel. diff vs hand 0.0e+00
+  hand+swiglu     41.71 ms   (1.00x hand)   logits rel. diff vs hand 5.6e-04
+  prim            42.29 ms   (0.99x hand)   logits rel. diff vs hand 4.7e-04
+  prim+C1         41.97 ms   (1.00x hand)   logits rel. diff vs hand 5.6e-04
+  hand+C1         41.96 ms   (1.00x hand)   logits rel. diff vs hand 5.6e-04
+
+== prefill, 64 tokens
+hand         graph (RMSNormOp, SwiGLUOp, nodes) = (45, 0, 868), compile 0.0 s
+hand+swiglu  graph (RMSNormOp, SwiGLUOp, nodes) = (45, 22, 734), compile 0.0 s
+prim         graph (RMSNormOp, SwiGLUOp, nodes) = (0, 0, 1230), compile 0.0 s
+prim+C1      graph (RMSNormOp, SwiGLUOp, nodes) = (0, 0, 1230), compile 0.1 s
+hand+C1      graph (RMSNormOp, SwiGLUOp, nodes) = (45, 0, 868), compile 0.1 s
+  hand            62.33 ms   (1.00x hand)   logits rel. diff vs hand 0.0e+00
+  hand+swiglu     62.29 ms   (1.00x hand)   logits rel. diff vs hand 3.8e-04
+  prim            63.05 ms   (0.99x hand)   logits rel. diff vs hand 4.1e-04
+  prim+C1         62.28 ms   (1.00x hand)   logits rel. diff vs hand 3.8e-04
+  hand+C1         62.35 ms   (1.00x hand)   logits rel. diff vs hand 3.8e-04
