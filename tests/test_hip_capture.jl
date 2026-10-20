@@ -27,7 +27,7 @@ else
         for o in values(outs); fill!(o, 0f0); end
         for _ in 1:2
             Luminal.Device._launch_hip_graph(g); AMDGPU.synchronize()
-            @test Array(outs[:reshape]) == reshape(host, 4, 12, 2)
+            @test Array(outs[:reshape]) == Base.reshape(host, 4, 12, 2)
             @test Array(outs[:contiguous]) == host
             @test Array(outs[:slice]) == host[3:5, :, :]
             @test Array(outs[:slice_mid]) == host[:, 2:3, :]
