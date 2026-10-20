@@ -196,6 +196,57 @@ if GPU
     end
 end
 
+# --- fusion: ops the front end spells out of primitives are recognised as their fused ops (C1) ------------------------------
+
+# The fused op `kind` appears in the statically extracted graph of `build`'s output, and the primitives it replaced are gone
+function fused_in_static_extraction(build, shapes, kind)
+    g = Graph()
+    ts = [Luminal.tensor(g, s) for s in shapes]
+    out = build(ts...)
+    rw = to_egraph(g, [out.id])
+    saturate_graph!(rw)
+    ng, _ = extract_graph(rw)
+    return count(n -> n.op isa kind, ng.nodes), length(ng.nodes), length(g.nodes)
+end
+
+@testset "fusion: SwiGLU, softmax and RMSNorm from primitives" begin
+    for side in (:lhs, :rhs)
+        w, n = check((g, rng, dev) -> begin
+            ins = Pair{Luminal.GraphTensor,Any}[]
+            d = rdims(rng, rand(rng, 1:3))
+            gate = input!(g, ins, d); up = input!(g, ins, d)
+            return [side === :lhs ? Luminal.silu(gate) * up : up * Luminal.silu(gate)], ins
+        end)
+        @test w < 1e-5 && n > 1
+        @test get(FIRED, "fusion.swiglu-silu-$side", 0) > 0
+    end
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        x = input!(g, ins, rdims(rng, rand(rng, 1:4), lo=2, hi=6))
+        return [Luminal.softmax(x, 1)], ins
+    end)
+    @test w < 1e-5 && n > 1 && get(FIRED, "fusion.softmax-dim1", 0) > 0
+    w, n = check((g, rng, dev) -> begin
+        ins = Pair{Luminal.GraphTensor,Any}[]
+        d = rdims(rng, rand(rng, 1:3), lo=2, hi=6)
+        x = input!(g, ins, d); wt = input!(g, ins, [d[1]])
+        return [Luminal.std_norm(x, 1, Float32(rand(rng, [1e-5, 1e-6]))) * wt], ins
+    end)
+    @test w < 1e-5 && n > 1 && get(FIRED, "fusion.rmsnorm-weight", 0) > 0
+
+    # the static extraction takes the fused op, and only recognises the exact operation
+    k, after, before = fused_in_static_extraction((a, b) -> Luminal.silu(a) * b, ([4, 3], [4, 3]), Luminal.SwiGLUOp)
+    @test k == 1 && after == 3 && before > 3
+    k, after, before = fused_in_static_extraction(a -> Luminal.softmax(a, 1), ([8, 3],), Luminal.SoftmaxOp)
+    @test k == 1 && after == 2
+    k, after, before = fused_in_static_extraction((a, w) -> Luminal.std_norm(a, 1, 1f-5) * w, ([8, 3], [8]), Luminal.RMSNormOp)
+    @test k == 1 && after == 3
+    @test fused_in_static_extraction(a -> Luminal.softmax(a, 2), ([8, 3],), Luminal.SoftmaxOp)[1] == 0                 # another dimension
+    @test fused_in_static_extraction((a, b) -> Luminal.gelu(a) * b, ([4, 3], [4, 3]), Luminal.SwiGLUOp)[1] == 0        # another activation
+    @test fused_in_static_extraction((a, b) -> Luminal.silu(a) * b, ([4, 3], [4, 1]), Luminal.SwiGLUOp)[1] == 0        # up broadcasts
+    @test fused_in_static_extraction(a -> Luminal.std_norm(a, 1, 1f-5), ([8, 3],), Luminal.RMSNormOp)[1] == 0          # no weight
+end
+
 # --- coverage: a rule without a test graph fails here ----------------------------------------------------------------------
 
 @testset "every rule is exercised" begin

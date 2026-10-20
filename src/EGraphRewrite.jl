@@ -103,6 +103,9 @@ function _make_dims(g, h, ch)
         a = _dims(g, ch[2]); a === nothing && return nothing
         d, k = _lit(g, ch[1])
         return Shp((a[1:d-1]..., k, a[d:end]...))
+    elseif h === :xSwiGLUOp || h === :xSoftmaxOp || h === :xRMSNormOp
+        a = _dims(g, ch[2]); a === nothing && return nothing
+        return Shp(a)
     elseif h === :xMul || h === :xAdd
         a, b = _dims(g, ch[2]), _dims(g, ch[3])
         (a === nothing || b === nothing) && return nothing
@@ -215,7 +218,7 @@ function to_egraph(graph::Graph, roots::Vector{Int})
                     Set{Int}(first(k) for k in keys(graph.tensors)), Any[])
     CTX[] = ctx
     for T in (Luminal.Reshape, Luminal.Mul, Luminal.Add, Luminal.MatMul, Luminal.MatMulF16, Luminal.MatMulQ8, Luminal.MatMulQ4, Luminal.MatMulT,
-              Luminal.Expand, Luminal.Pad, Luminal.Slice)
+              Luminal.Expand, Luminal.Pad, Luminal.Slice, Luminal.SwiGLUOp, Luminal.SoftmaxOp, Luminal.RMSNormOp)
         ctx.optypes[Symbol("x", nameof(T))] = T
     end
     g = EGraph{Expr,Shp}()
@@ -394,6 +397,47 @@ const KERNEL_RULES = _named((@theory q p r a b begin
         (_is_swap12(p) && _is_swap12(r)) ? :(xMatMulT($((true, true)), $a, $b)) : nothing
 end), "kernel", ("matmul-transpose-lhs", "matmul-transpose-rhs", "matmul-transpose-both"))
 
+# ---------------------------------------------------------------------------
+# Fusions recognised from primitives (C1)
+# ---------------------------------------------------------------------------
+# `silu(g) * u` as the front end spells it (`sigmoid(a) = 1 / (1 + exp2(-a * log2(e)))`, `silu(a) = a * sigmoid(a)`) becomes one
+# `SwiGLUOp` node in the same e-class, so extraction (static cost, or the measured search) chooses between the primitives and the
+# fused kernel. The constants are matched by value: only the exact silu is recognised.
+_const_is(k, v) = (k[1] isa Real && isapprox(Float64(k[1]), v; rtol=1e-6))
+_same_dims(a, b) = a.data !== nothing && b.data !== nothing && isequal(a.data.dims, b.data.dims)
+function _swiglu_rule(g, u, k1, k2, k3, k4)
+    (_const_is(k1, -1.0) && _const_is(k2, 1 / log(2)) && _const_is(k3, 1.0) && _const_is(k4, 1.0)) || return nothing
+    _same_dims(g, u) || return nothing
+    return :(xSwiGLUOp($(()), $g, $u))
+end
+function _softmax_rule(a, e1, e2, e3, m1, m2, s1, k1, k2)
+    a.data === nothing && return nothing
+    d = a.data.dims
+    (m1 == (1,) && m2 == (1,) && s1 == (1,) && e1 == e2 && e1 == e3 && !isempty(d) && e1 == (1, d[1])) || return nothing
+    (_const_is(k1, -1.0) && _const_is(k2, -1.0)) || return nothing
+    return :(xSoftmaxOp($(()), $a))
+end
+function _rmsnorm_rule(a, w, e1, s1, k1, k2)
+    (a.data === nothing || w.data === nothing) && return nothing
+    d = a.data.dims
+    (s1 == (1,) && !isempty(d) && d[1] isa Integer && e1 == (1, d[1]) && isequal(w.data.dims, (d[1],))) || return nothing
+    _const_is(k1, 1 / d[1]) && k2[1] isa AbstractFloat || return nothing
+    return :(xRMSNormOp($((Float32(k2[1]),)), $a, $w))
+end
+const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 g u a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 begin
+    xMul(p1::Tuple, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), u) =>
+        _swiglu_rule(g, u, k1, k2, k3, k4)
+    xMul(p1::Tuple, u, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple))))) =>
+        _swiglu_rule(g, u, k1, k2, k3, k4)
+    # softmax over dim 1: exp(x - max(x)) / sum(exp(x - max(x))), the max and the sum broadcast back along dim 1
+    xDiv(p1::Tuple, xExp(p2::Tuple, xAdd(p3::Tuple, a, xMul(p4::Tuple, xExpand(e1::Tuple, xMaxReduce(m1::Tuple, a)), xConstant(k1::Tuple)))),
+         xExpand(e2::Tuple, xSumReduce(s1::Tuple, xExp(p5::Tuple, xAdd(p6::Tuple, a, xMul(p7::Tuple, xExpand(e3::Tuple, xMaxReduce(m2::Tuple, a)), xConstant(k2::Tuple))))))) =>
+        _softmax_rule(a, e1, e2, e3, m1, m2, s1, k1, k2)
+    # RMSNorm with a weight: x * recip(sqrt(sum(x*x) / H + eps)) * w
+    xMul(p1::Tuple, xMul(p2::Tuple, a, xExpand(e1::Tuple, xRecip(p3::Tuple, xSqrt(p4::Tuple, xAdd(p5::Tuple, xMul(p6::Tuple, xSumReduce(s1::Tuple, xMul(p7::Tuple, a, a)), xConstant(k1::Tuple)), xConstant(k2::Tuple)))))), w) =>
+        _rmsnorm_rule(a, w, e1, s1, k1, k2)
+end), "fusion", ("swiglu-silu-lhs", "swiglu-silu-rhs", "softmax-dim1", "rmsnorm-weight"))
+
 # Backoff scheduling (Metatheory's default) that also tells the rule log what each search found.
 mutable struct ReportingScheduler <: Metatheory.EGraphs.Schedulers.AbstractScheduler
     inner::Metatheory.EGraphs.Schedulers.BackoffScheduler
@@ -449,7 +493,7 @@ rule_names(; precision=false) = String[r.name for r in _theory(precision)]
 
 function _theory(precision)
     f = _precision_features(precision)
-    return vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES,
+    return vcat(CANONICAL_RULES, ALGEBRAIC_RULES, KERNEL_RULES, FUSION_RULES,
                 :weights in f ? PRECISION_RULES : RewriteRule[],
                 :activations in f ? ACTIVATION_RULES : RewriteRule[],
                 :int8 in f ? INT8_RULES : RewriteRule[],

@@ -161,7 +161,7 @@ end
     all_features = (:weights, :activations, :int8, :int4)
     names = rule_names(precision=all_features)
     @test allunique(names) && all(n -> occursin(r"^[a-z0-9]+\.[a-z0-9_-]+$", n), names)
-    @test rule_names() == filter(n -> startswith(n, r"canonical|algebra|kernel"), names)
+    @test rule_names() == filter(n -> startswith(n, r"canonical|algebra|kernel|fusion"), names)
     @test length(rule_names(precision=:int8)) == length(rule_names()) + 4
 
     g = Graph()
