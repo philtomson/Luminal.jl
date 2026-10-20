@@ -2958,7 +2958,7 @@ function execute_slice!(out, input, ranges)
         end_idx = min(size(v, i), e)
         v = selectdim(v, i, start_idx:end_idx)
     end
-    copyto!(out, v)
+    _device_copy!(out, v)
     return out
 end
 
@@ -3126,7 +3126,7 @@ function execute_op!(out, op::Reshape, a)
     if length(out) != length(a)
         error("Length mismatch in Reshape!: $(length(out)) vs $(length(a)). size(out)=$(size(out)), size(a)=$(size(a))")
     end
-    copyto!(out, a)
+    _device_copy!(out, a)
     return out
 end
 
@@ -3135,7 +3135,25 @@ function execute_op!(out, op::Permute, a)
     return out
 end
 
-execute_op!(out, op::Contiguous, a) = copyto!(out, a)
+execute_op!(out, op::Contiguous, a) = (_device_copy!(out, a); out)
+
+# `copyto!(out, a)` of two dense device arrays is a device-to-device memcpy on the null stream, which aborts HIP graph capture
+# (hipErrorStreamCaptureUnsupported): a kernel copy captures (see also `_copy_kernel!` for ScatterND). A Reshape or Contiguous node that
+# the compiler could not alias is rare in a hand-built graph but common in the e-graph search's candidates, and so is a Slice (merged projections).
+# Two dense arrays need only agree in length (the kernel copies by linear index); a view of a device array and an output of its shape are copied
+# by a broadcast kernel; anything else (other element types, host arrays) keeps the generic `copyto!`.
+function _device_copy!(out, a)
+    if out isa AMDGPU.ROCArray && eltype(out) === eltype(a)
+        if a isa AMDGPU.ROCArray && length(out) == length(a)
+            length(out) == 0 || _copy_kernel!(KernelAbstractions.get_backend(out), 256)(out, a; ndrange=length(out))
+            return out
+        elseif a isa SubArray && parent(a) isa AMDGPU.ROCArray && size(out) == size(a)      # a slice of a device array: the broadcast is a kernel too
+            broadcast!(identity, out, a)
+            return out
+        end
+    end
+    return copyto!(out, a)
+end
 execute_op!(out, op::MatMul, a, b) = batch_matmul!(out, a, b)
 function execute_op!(out, op::MatMulF16, a, b)   # `a` is a HalfWeight(N) once compiled
     a isa HalfWeight && return _half_matmul!(out, a, b; group=op.group)
