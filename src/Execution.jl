@@ -748,10 +748,10 @@ end
 
 function execute_op!(out, op::CausalAttention, q, k, v)
     D = size(q, 1)
-    if out isa AMDGPU.ROCArray && wmma_enabled() && D % 32 == 0
+    if out isa AMDGPU.ROCArray && wmma_enabled() && D % 32 == 0 && op.window == 0
         flash_prefill!(out, q, k, v, op.scale)
     else
-        copyto!(out, causal_attention_ref(q, k, v, op.scale))
+        copyto!(out, causal_attention_ref(q, k, v, op.scale, op.window))
     end
     return out
 end

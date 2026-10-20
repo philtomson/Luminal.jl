@@ -468,7 +468,7 @@ function flash_prefill!(out::ROCArray{Float32,4}, q, k, v, scale::Float32)
 end
 
 # Reference (CPU arrays, or any other device through the host).
-function causal_attention_ref(q, k, v, scale::Float32)
+function causal_attention_ref(q, k, v, scale::Float32, window::Int = 0)
     q = Array{Float32}(q); k = Array{Float32}(k); v = Array{Float32}(v)
     D, S, H, B = size(q); KVH = size(k, 3); G = H ÷ KVH
     out = similar(q)
@@ -476,7 +476,7 @@ function causal_attention_ref(q, k, v, scale::Float32)
         kv = (h - 1) ÷ G + 1
         sc = (q[:, :, h, b]' * k[:, :, kv, b]) .* scale          # (queries, keys)
         for j in 1:S, i in 1:S
-            j > i && (sc[i, j] = -Inf32)
+            (j > i || (window > 0 && i - j >= window)) && (sc[i, j] = -Inf32)
         end
         sc .-= maximum(sc; dims = 2)
         p = exp.(sc); p ./= sum(p; dims = 2)

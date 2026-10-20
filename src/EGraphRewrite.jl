@@ -474,7 +474,7 @@ function _attention_rule(gqa, aq, ak, av, pq, pv, r1, r2, e1, e2, ks, ar, x3, x4
     (ks[1] isa AbstractFloat && _const_is(kz, 0.0) && _const_is(kn, -9e9) && _const_is(k1, -1.0) && _const_is(k2, -1.0)) || return nothing
     (ar[1] == "ARange" && ar[2] == (S,) && x3 == (3, H) && x4 == (4, B) && ex1 == (1, S) && ex2 == (2, S)) || return nothing
     (mr == (2,) && mr2 == (2,) && sr == (2,) && ee == (2, S)) || return nothing
-    return :(xPermute($(((2, 1, 3, 4),)), xCausalAttention($((Float32(ks[1]),)), $aq, $ak, $av)))
+    return :(xPermute($(((2, 1, 3, 4),)), xCausalAttention($((Float32(ks[1]), 0)), $aq, $ak, $av)))
 end
 const FUSION_RULES = _named((@theory p1 p2 p3 p4 p5 p6 p7 p8 g u z q a w e1 e2 e3 m1 m2 s1 k1 k2 k3 k4 gp1 gp10 gp11 gp12 gp13 gp14 gp15 gp16 gp2 gp3 gp4 gp5 gp6 gp7 gp8 gp9 gk1 gk2 gk3 gk4 gk5 gk6 gk7 gk8 gk9 gk10 gk11 gk12 lpa lpb lpc lp1 lp2 lp3 lp4 lp5 lp6 lp7 lp8 le1 le2 ls1 ls2 lk1 lk2 lk3 lk4 b ga atr1 ate1 atr2 ate2 atq1 atpq atm1 atks atar atx4 atx3 atmm atc atlt atex2 ata1 atex1 atkz atkn atw atd ate ata2 atm2 atee atmr atk1 atee2 atsr ate2x ata3 atm3 atee3 atmr2 atk2 atq2 atpv aq ak av begin
     xMul(p1::Tuple, xMul(p2::Tuple, g, xDiv(p3::Tuple, xConstant(k3::Tuple), xAdd(p4::Tuple, xExp2(p5::Tuple, xMul(p6::Tuple, xMul(p7::Tuple, g, xConstant(k1::Tuple)), xConstant(k2::Tuple))), xConstant(k4::Tuple)))), u) =>

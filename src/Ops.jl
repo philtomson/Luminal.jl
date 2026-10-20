@@ -389,9 +389,13 @@ struct LastToken <: Op end
 #   (RoPE and norms applied; query head h uses KV head (h - 1) ÷ (H ÷ KVH) + 1); output
 #   (D, S, H, B) = softmax(scale * q'k + causal mask) v'. Padding positions past a prompt's end
 #   only affect themselves (causal), as in the composite form.
+#   With `window` > 0 (sliding-window attention, Gemma3's local layers) a query attends only to its last `window` positions, itself included
+#   (key j is visible to query i iff i - window < j <= i); 0 means every earlier position.
 struct CausalAttention <: Op
     scale::Float32
+    window::Int
 end
+CausalAttention(scale) = CausalAttention(scale, 0)
 
 # Single-token (decode) attention over a KV cache, in one kernel. Inputs:
 #   q (D, 1, H, B), past_k and past_v (D, max_seq, KVH, B), k_new and v_new

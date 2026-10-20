@@ -6,15 +6,16 @@ using AMDGPU
 
 relerr(a, b) = maximum(abs.(a .- b)) / maximum(abs.(b))
 
-function naive(q, k, v, scale)   # the composite form: scores, mask, softmax, weighted sum
+function naive(q, k, v, scale, window = 0)   # the composite form: scores, mask, softmax, weighted sum; window > 0: the last `window` keys only
     D, S, H, B = size(q); G = H ÷ size(k, 3)
     out = zeros(Float32, D, S, H, B)
     for b in 1:B, h in 1:H
         kv = (h - 1) ÷ G + 1
         for i in 1:S
-            s = [scale * sum(q[:, i, h, b] .* k[:, j, kv, b]) for j in 1:i]
+            js = window > 0 ? (max(1, i - window + 1):i) : (1:i)
+            s = [scale * sum(q[:, i, h, b] .* k[:, j, kv, b]) for j in js]
             p = exp.(s .- maximum(s)); p ./= sum(p)
-            out[:, i, h, b] = sum(p[j] * v[:, j, kv, b] for j in 1:i)
+            out[:, i, h, b] = sum(p[t] * v[:, j, kv, b] for (t, j) in enumerate(js))
         end
     end
     return out
@@ -23,6 +24,9 @@ end
 @testset "causal attention reference" begin
     q = randn(Float32, 8, 12, 4, 2); k = randn(Float32, 8, 12, 2, 2); v = randn(Float32, 8, 12, 2, 2)
     @test relerr(Luminal.causal_attention_ref(q, k, v, 0.35f0), naive(q, k, v, 0.35f0)) < 1e-5
+    for window in (1, 3, 5, 12, 30)       # a window of 1 is the query alone; one of at least S is plain causal attention
+        @test relerr(Luminal.causal_attention_ref(q, k, v, 0.35f0, window), naive(q, k, v, 0.35f0, window)) < 1e-5
+    end
 end
 
 if Luminal.wmma_supported()
@@ -43,12 +47,15 @@ end
     D, S, H, KVH = 32, 40, 4, 2
     g = Luminal.Graph()
     q = Luminal.tensor(g, [D, S, H, 1]); k = Luminal.tensor(g, [D, S, KVH, 1]); v = Luminal.tensor(g, [D, S, KVH, 1])
+    ow = Luminal.add_op!(g, Luminal.CausalAttention(0.2f0, 7), [(t.id, 0, t.shape) for t in (q, k, v)],
+                         Luminal.ShapeTracker([D, S, H, 1]))
     o = Luminal.add_op!(g, Luminal.CausalAttention(0.2f0), [(t.id, 0, t.shape) for t in (q, k, v)],
                         Luminal.ShapeTracker([D, S, H, 1]))
     qa = randn(Float32, D, S, H, 1); ka = randn(Float32, D, S, KVH, 1); va = randn(Float32, D, S, KVH, 1)
-    exec = Luminal.compile(g; device = dev, retain = [o.id])
+    exec = Luminal.compile(g; device = dev, retain = [o.id, ow.id])
     res = exec(Dict{Int,Any}(q.id => qa, k.id => ka, v.id => va); device = dev)
     @test relerr(Array(res[o.id]), naive(qa, ka, va, 0.2f0)) < 2e-3
+    @test relerr(Array(res[ow.id]), naive(qa, ka, va, 0.2f0, 7)) < 2e-3          # sliding window of 7
 end
 
 # chunk_attention! (the prefill-chunk attention over the KV cache): the 128-row kernel reads the Float32 query and writes the (D, H, S, B)
