@@ -1,0 +1,7 @@
+
+== prefill, 4096 tokens (window 1024)
+composite  CausalAttention nodes (windows) in the source graph: [0], compile 0.0 s
+fused      CausalAttention nodes (windows) in the source graph: [0], compile 242.3 s
+  composite   14691.07 ms   (1.00x composite)   vs exact: rel diff 4.2e-03, argmax agree 1.0000   vs composite: rel diff 0.0e+00, argmax agree 1.0000
+  fused       11000.67 ms   (1.34x composite)   vs exact: rel diff 7.1e-03, argmax agree 0.9961   vs composite: rel diff 8.9e-03, argmax agree 0.9961
+exit 0

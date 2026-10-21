@@ -40,9 +40,20 @@ function interleaved(runs, rounds)
     return [1e3 * median(t) for t in ts]
 end
 
+# 256 positions spread over the prompt (the later ones have keys outside the window), copied to the host
+keep(x, plen) = (idx = unique(round.(Int, range(1, plen, length=256))); Array(view(x, :, idx, :)))
+
 for plen in LENGTHS
     println("\n== prefill, $plen tokens (window $(model.config.sliding_window))")
     ids = Luminal.to_device(Float32.(rand(0:V-1, plen, 1)), DEV)
+    # exact reference: the composite with every matrix-core kernel off (LUMINAL_WMMA=0: Float32 attention), built, compiled and run once
+    exact = withenv("LUMINAL_WMMA" => "0") do
+        g, inp, out, retain = build(plen)
+        inputs = Dict{Int,Any}(inp.id => ids)
+        exec = compile(g; device=DEV, retain=retain)
+        keep(exec(inputs; device=DEV)[out.id], plen)
+    end
+    GC.gc()
     runs = Base.Function[]; names = String[]; logits = Any[]
     for (name, search) in (("composite", :none), ("fused", :static))
         g, inp, out, retain = build(plen)
@@ -53,7 +64,7 @@ for plen in LENGTHS
         ctime = time() - t0
         run1() = exec(inputs; device=DEV)
         r = run1()
-        push!(logits, Array(r[out.id]))
+        push!(logits, keep(r[out.id], plen))
         # (the compiled graph is the one that runs: count its fused attention nodes)
         gc = hasproperty(exec, :graph) ? exec.graph : g
         @printf("%-10s CausalAttention nodes (windows) in the source graph: %s, compile %.1f s\n", name, string(sort!(collect(Set(attn_nodes(g))))), ctime)
@@ -61,10 +72,10 @@ for plen in LENGTHS
         push!(names, name)
     end
     t = interleaved(runs, 5)
-    ref = logits[1]
     for (i, name) in enumerate(names)
-        err = maximum(abs.(logits[i] .- ref)) / max(maximum(abs.(ref)), 1f-6)
-        @printf("  %-10s %9.2f ms   (%.2fx composite)   logits rel. diff vs composite %.1e   argmax agree %.4f\n", name, t[i], t[1] / t[i], err,
-                mean(argmax(logits[i], dims=1) .== argmax(ref, dims=1)))
+        rel(ref) = maximum(abs.(logits[i] .- ref)) / max(maximum(abs.(ref)), 1f-6)
+        agree(ref) = mean(argmax(logits[i], dims=1) .== argmax(ref, dims=1))
+        @printf("  %-10s %9.2f ms   (%.2fx composite)   vs exact: rel diff %.1e, argmax agree %.4f   vs composite: rel diff %.1e, argmax agree %.4f\n",
+                name, t[i], t[1] / t[i], rel(exact), agree(exact), rel(logits[1]), agree(logits[1]))
     end
 end
