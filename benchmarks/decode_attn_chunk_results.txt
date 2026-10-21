@@ -1,0 +1,29 @@
+Precompiling packages...
+ 127210.9 ms  ✓ Luminal
+  1 dependency successfully precompiled in 128 seconds. 206 already precompiled.
+== DA_CH = 256 (ch256)
+  T= 32768 S=1:   0.760 ms/layer    176.7 GB/s   rel diff vs ref 0.0e+00
+  T= 32768 S=4:   0.924 ms/layer    145.3 GB/s   rel diff vs ref 0.0e+00
+  T=131072 S=1:   2.630 ms/layer    204.2 GB/s   rel diff vs ref 0.0e+00
+  T=131072 S=4:   3.304 ms/layer    162.5 GB/s   rel diff vs ref 0.0e+00
+Precompiling packages...
+ 126247.4 ms  ✓ Luminal
+  1 dependency successfully precompiled in 127 seconds. 206 already precompiled.
+== DA_CH = 128 (ch128)
+  T= 32768 S=1:   0.760 ms/layer    176.5 GB/s   rel diff vs ref 3.2e-04
+  T= 32768 S=4:   1.125 ms/layer    119.3 GB/s   rel diff vs ref 3.1e-04
+  T=131072 S=1:   2.794 ms/layer    192.1 GB/s   rel diff vs ref 2.9e-04
+  T=131072 S=4:   4.301 ms/layer    124.8 GB/s   rel diff vs ref 2.6e-04
+Precompiling packages...
+ 126617.4 ms  ✓ Luminal
+  1 dependency successfully precompiled in 127 seconds. 206 already precompiled.
+== DA_CH = 512 (ch512)
+  T=32768 S=1: failed: Failed to compile to GCN with the AMDGPU back-end:
+error: /tmp/claude-1000/-home-phil-devel-Luminal-jl/9bd5efe5-958c-4d5
+  T=32768 S=4: failed: Failed to compile to GCN with the AMDGPU back-end:
+error: /tmp/claude-1000/-home-phil-devel-Luminal-jl/9bd5efe5-958c-4d5
+  T=131072 S=1: failed: Failed to compile to GCN with the AMDGPU back-end:
+error: /tmp/claude-1000/-home-phil-devel-Luminal-jl/9bd5efe5-958c-4d5
+  T=131072 S=4: failed: Failed to compile to GCN with the AMDGPU back-end:
+error: /tmp/claude-1000/-home-phil-devel-Luminal-jl/9bd5efe5-958c-4d5
+exit 0
