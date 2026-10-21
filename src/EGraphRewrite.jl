@@ -143,6 +143,8 @@ _params(op::Op) = ntuple(i -> _freeze(getfield(op, i)), nfields(op))
 _thaw(::Type{T}, p) where {T <: AbstractVector} = convert(T, collect(p))
 _thaw(::Type, p) = p
 _rebuild_op(T::DataType, params) = T((_thaw(fieldtype(T, i), params[i]) for i in 1:fieldcount(T))...)
+# (a Constant's `value::Any` is a Vector for a table such as the RoPE inverse frequencies: `_freeze` made it a Tuple, element type kept)
+_rebuild_op(::Type{Luminal.Constant}, params) = Luminal.Constant(params[1] isa Tuple ? collect(params[1]) : params[1])
 
 # ---------------------------------------------------------------------------
 # Rule log: what each named rule matched, fired and created
