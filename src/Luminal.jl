@@ -69,6 +69,19 @@ export compile
 # Graph-level rewrite layer on Metatheory e-graphs; used by compile(...; search=...)
 include("EGraphRewrite.jl")
 
+# The e-graph's rule matchers (the fusion patterns are large) are compiled by Julia the first time `saturate_graph!` runs: about 80 s of a
+# session's first `compile(...; search=...)` (measured 220 s with the attention patterns of C1). Saturating a tiny graph while the package
+# is precompiled stores that work in the package image (the graph is built with `tensor`, no device is touched).
+if ccall(:jl_generating_output, Cint, ()) == 1
+    let g = Graph()
+        a = tensor(g, [4, 4]); b = tensor(g, [4, 4])
+        out = softmax(matmul(a, b) + a, 1)
+        rw = EGraphRewrite.to_egraph(g, [out.id])
+        EGraphRewrite.saturate_graph!(rw)
+        EGraphRewrite.extract_graph(rw)
+    end
+end
+
 # Tokenizers
 include("LlamaTokenizer.jl")
 using .LlamaTokenization
