@@ -22,6 +22,28 @@ using Luminal.NN
     @test_throws ErrorException Luminal.Decoding._fail_prefill!(nothing, nothing, 40)
 end
 
+# The cache's own account of each prefill (`prefix_summary`, `prefix_stats`): where it resumed, how much cached text was recomputed and why
+@testset "the prefix cache explains each prefill" begin
+    D = Luminal.Decoding
+    entry(kind, n) = D.PrefixEntry(kind, collect(1:n), Any[], Any[], nothing, nothing)
+    note(pc, prompt, c, a, kind) = (pc.resumed_kind = kind; D._note_decision!(pc, prompt, length(prompt), c, false, a); pc.last)
+    other(n, from) = vcat(collect(1:from), collect(1000:1000 + n - from - 1))          # shares the first `from` tokens with 1:n
+    pc = PrefixCache(min_tokens=8)
+    push!(pc.entries, entry(:sys, 40))
+    @test note(pc, other(70, 40), 0, 40, :sys).cause == :full                          # everything shared (the entry's 40 tokens) was reused
+    @test note(pc, other(70, 20), 0, 0, :none).cause == :no_state                      # diverges inside the entry: no state to resume from
+    @test note(pc, collect(5000:5069), 0, 0, :none).cause == :new_conversation
+    @test note(pc, other(100, 90), 90, 40, :sys).cause == :between_states              # the live prompt shares 90, the deepest state is at 40
+    @test note(pc, other(100, 90), 90, 40, :sys).shared == 90
+    push!(pc.entries, entry(:turn, 60))
+    @test note(pc, other(100, 90), 90, 40, :sys).cause == :limited                     # a state at 60 matches but was not used
+    @test occursin("recomputed (limited)", prefix_summary(pc))
+    @test occursin("new conversation", (note(pc, collect(5000:5069), 0, 0, :none); prefix_summary(pc)))
+    st = prefix_stats(pc)
+    @test st.requests == 7 && st.causes[:between_states] == 2 && st.causes[:full] == 1 && st.recomputed_shared == 20 + 50 + 50 + 50
+    @test st.tokens == 70 + 70 + 70 + 100 + 100 + 100 + 70
+end
+
 if Luminal.get_device() isa CPUDevice
     @info "no GPU: skipping the prefix cache test"
 else
@@ -78,6 +100,8 @@ else
                 overwritten && request(toks(60, 31); prefix=pc)                             # an unrelated conversation takes over the live caches
                 got = request(target; prefix=pc, prefix_at=at)
                 @test pc.resumed_kind == kind                                                # it did resume from that kind
+                @test pc.last.at == Dict(:sys => 40, :turn => 64, :ckpt => 48)[kind]         # ... at that position, and the cache's account agrees
+                @test pc.last.cause == (kind === :ckpt ? :between_states : :full)            # (the checkpoint at 48 is short of the 50 shared tokens)
                 @test same(got, ref)
             end
 

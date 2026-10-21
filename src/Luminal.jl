@@ -90,7 +90,7 @@ export LlamaTokenizer, encode, decode, chat_prompt
 # Decoding & Inference
 include("Decoding.jl")
 using .Decoding
-export greedy_decode, transcribe, WhisperSession, llama_generate, LlamaSession, generate, generate_ids, PrefixCache, release_stale!, Sampler, sample_token, MTPDrafter, DFlash2, dflash_append!, dflash_draft!, dflash_append_rows!, generate_ids_dflash, generate_ids_speculative, generate_speculative, weight_preset, awq_scales, awq_apply!
+export greedy_decode, transcribe, WhisperSession, llama_generate, LlamaSession, generate, generate_ids, PrefixCache, release_stale!, prefix_summary, prefix_stats, Sampler, sample_token, MTPDrafter, DFlash2, dflash_append!, dflash_draft!, dflash_append_rows!, generate_ids_dflash, generate_ids_speculative, generate_speculative, weight_preset, awq_scales, awq_apply!
 
 # Next-Concept Modeling generator
 include("PagedAttention.jl")

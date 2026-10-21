@@ -12,7 +12,7 @@ using AMDGPU
 using JSON3
 using Random
 
-export PrefixCache, release_stale!, Sampler, sample_token, greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative, DFlash2, dflash_append!, dflash_append_rows!, dflash_draft!, generate_ids_dflash
+export PrefixCache, release_stale!, prefix_summary, prefix_stats, Sampler, sample_token, greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative, DFlash2, dflash_append!, dflash_append_rows!, dflash_draft!, generate_ids_dflash
 
 """
     weight_preset(name) -> (weight name -> Type)
@@ -430,9 +430,12 @@ mutable struct PrefixCache
     ckpts::Vector{StateCkpt}          # state checkpoints along the live prompt, ascending position
     ckpt_every::Int                   # distance between checkpoints (0: none)
     resumed_kind::Symbol              # what the last prefill resumed from: :sys, :turn, :ckpt or :none
+    last::Any                         # the last prefill's decision (a NamedTuple, see `prefix_summary`), `nothing` before the first
+    events::Vector{String}            # what the last prefill saved and what it evicted
+    counts::Dict{Symbol,Int}          # running totals over the requests: see `prefix_stats`
 end
 PrefixCache(; max_sys::Int=2, max_turn::Int=2, min_tokens::Int=1024, ckpt_every::Int=parse(Int, get(ENV, "LUMINAL_CKPT_EVERY", "4096"))) =
-    PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, 0, false, StateCkpt[], ckpt_every, :none)
+    PrefixCache(PrefixEntry[], max_sys, max_turn, min_tokens, PrefixEntry[], nothing, PrefixEntry[], Int[], 0, 0, false, StateCkpt[], ckpt_every, :none, nothing, String[], Dict{Symbol,Int}())
 
 function _free_ckpt!(k::StateCkpt)
     for (a, b) in k.states; Luminal._free_now!(a); Luminal._free_now!(b); end
@@ -473,19 +476,79 @@ function _fail_prefill!(prefix, dflash, n::Int)
     error("the prefill of $n tokens produced non-finite logits (NaN/Inf); the prefix cache state of this prompt was dropped")
 end
 
+# Why a prefill resumed where it did (or did not). `shared`: the longest prefix of the prompt that any saved state's text (the live prompt, an entry)
+# also starts with; `at`: where the prefill resumed. The tokens between the two were recomputed although their text was cached, and `cause` says why:
+#   :full             everything that was shared was reused
+#   :new_conversation nothing is shared with anything saved
+#   :no_state         text is shared but no saved state matches this prompt (the divergence is before every entry / checkpoint)
+#   :between_states   a state matches, but it is shorter than the shared text (states exist only at the entries' and checkpoints' positions)
+#   :limited          a deeper matching state exists but the drafter's ring or the MTP head's K/V could not use it
+function _note_decision!(pc::PrefixCache, prompt, n::Int, c::Int, need_mtp::Bool, a::Int)
+    shared = c
+    avail = 0
+    for e in pc.entries
+        L = length(e.ids)
+        shared = max(shared, min(_lcp(prompt, e.ids), n - 1))
+        L < n && view(prompt, 1:L) == e.ids && (avail = max(avail, L))
+    end
+    for k in pc.ckpts; avail = max(avail, k.pos); end              # (already cut to the live prompt's shared part)
+    cause = shared == 0 ? :new_conversation : a >= shared ? :full : avail > a ? :limited : avail == 0 ? :no_state : :between_states
+    pc.last = (; n, shared, at = a, kind = pc.resumed_kind, cause, mtp = need_mtp)
+    pc.counts[:requests] = get(pc.counts, :requests, 0) + 1
+    pc.counts[Symbol(:cause_, cause)] = get(pc.counts, Symbol(:cause_, cause), 0) + 1
+    pc.counts[Symbol(:kind_, pc.resumed_kind)] = get(pc.counts, Symbol(:kind_, pc.resumed_kind), 0) + 1
+    pc.counts[:tokens] = get(pc.counts, :tokens, 0) + n
+    pc.counts[:reused] = get(pc.counts, :reused, 0) + a
+    pc.counts[:recomputed_shared] = get(pc.counts, :recomputed_shared, 0) + max(shared - a, 0)
+    return nothing
+end
+
+"""
+    prefix_summary(pc) -> String
+
+One line about the last prefill through `pc`: where it resumed, how much of the prompt's text was cached, how much of that it had to recompute
+and why, and what it saved and evicted.
+"""
+function prefix_summary(pc::PrefixCache)
+    d = pc.last
+    d === nothing && return "no prefill yet"
+    s = d.at == 0 ? "cold start" : string("resumed ", d.kind, " at ", d.at)
+    s *= string(" of ", d.n, " tokens; ", d.shared, " shared with saved text")
+    d.shared > d.at && (s *= string(", ", d.shared - d.at, " of them recomputed (", d.cause, ")"))
+    d.shared == 0 && (s *= " (new conversation)")
+    isempty(pc.events) || (s *= "; " * join(pc.events, ", "))
+    return s
+end
+
+"""
+    prefix_stats(pc) -> NamedTuple
+
+Totals over the requests that went through `pc`: requests, prompt tokens, tokens reused from a saved state (`reused`), tokens whose text was cached
+but that were recomputed (`recomputed_shared`), and how many requests ended each way (`causes`, `kinds`).
+"""
+function prefix_stats(pc::PrefixCache)
+    c = pc.counts
+    pick(prefix) = Dict(Symbol(replace(String(k), prefix => "")) => v for (k, v) in c if startswith(String(k), prefix))
+    return (; requests = get(c, :requests, 0), tokens = get(c, :tokens, 0), reused = get(c, :reused, 0),
+            recomputed_shared = get(c, :recomputed_shared, 0), causes = pick("cause_"), kinds = pick("kind_"))
+end
+
 function _register!(pc::PrefixCache, new::Vector{PrefixEntry}, used::Union{Nothing,PrefixEntry})
     used === nothing || (i = findfirst(e -> e === used, pc.entries); i === nothing || push!(pc.entries, popat!(pc.entries, i)))
     for e in new
         if e.kind == :turn                                    # the conversation moved on: the entry it extends is stale
             for old in filter(o -> o.kind == :turn && length(o.ids) < length(e.ids) && view(e.ids, 1:length(o.ids)) == o.ids, pc.entries)
                 push!(pc.stale, old); filter!(o -> o !== old, pc.entries)
+                push!(pc.events, string("replaced ", old.kind, "@", length(old.ids)))
             end
         end
         push!(pc.entries, e)
+        push!(pc.events, string("saved ", e.kind, "@", length(e.ids)))
     end
     for (kind, mx) in ((:sys, pc.max_sys), (:turn, pc.max_turn))
         while count(e -> e.kind == kind, pc.entries) > mx
             i = findfirst(e -> e.kind == kind, pc.entries)
+            push!(pc.events, string("evicted ", kind, "@", length(pc.entries[i].ids)))
             push!(pc.stale, pc.entries[i]); deleteat!(pc.entries, i)
         end
     end
@@ -515,7 +578,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     resume_max = dflash === nothing ? n : max(ring_ok, n - _DF_WIN)
     if prefix !== nothing
         release_stale!(prefix)
-        prefix.pending = PrefixEntry[]; prefix.resumed = nothing
+        prefix.pending = PrefixEntry[]; prefix.resumed = nothing; empty!(prefix.events)
         for e in prefix.entries
             L = length(e.ids)
             L < n && L <= resume_max && (!need_mtp || e.mtp !== nothing) && (best === nothing || L > length(best.ids)) && view(prompt, 1:L) == e.ids && (best = e)
@@ -531,6 +594,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     end
     resume = best !== nothing || ck !== nothing
     a = ck !== nothing ? ck.pos : best !== nothing ? length(best.ids) : 0; off = resume ? a - 1 : 0
+    prefix === nothing || _note_decision!(prefix, prompt, n, c, need_mtp, a)
     skip_kv = ck !== nothing || (best !== nothing && get(ENV, "LUMINAL_SKIP_RESTORE", "1") != "0" && length(prefix.live) >= a && view(prefix.live, 1:a) == best.ids)   # the live K/V already is the entry's
     mtp_live = skip_kv && prefix.live_mtp >= a - 1
     ck !== nothing && (best = nothing)
@@ -615,6 +679,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
             end
             hh = Luminal.zero_tensor(s.device, Float32, Hd, 1, 1); view(hh, :, 1:1, :) .= view(Hall, :, a-off:a-off, :)
             kind == :ckpt ? push!(prefix.ckpts, StateCkpt(a, states, hh)) : push!(prefix.pending, PrefixEntry(kind, prompt[1:a], states, kv, hh, nothing))
+            kind == :ckpt && push!(prefix.events, string("checkpoint@", a))
             PREFILL_TIMES[:save] = get(PREFILL_TIMES, :save, 0.0) + (_tic() - t_sv)
         end
         # the chunk's intermediates that the graph did not free itself are only released by the GC: at ~32 MB per

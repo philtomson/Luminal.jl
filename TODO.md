@@ -1160,7 +1160,7 @@ Candidates, most valuable first:
 4. **Learned divergence points.** When a new prompt diverges from the cached one at position p, capture a checkpoint near p (only if it saves
    >= 512 tokens; merge captures within 64 tokens). gufo also always captures the end of the prompt and a "stable boundary" the client resends.
    Lower value for us: earlier-context edits are rare.
-5. **Log every cache admission, eviction and miss.** Cheap; makes misses debuggable. Eviction order in gufo: retry copies, cheap checkpoints
+5. ~~**Log every cache admission, eviction and miss.**~~ **Done (branch `prefix_log`)**: `prefix_summary(pc)` (one line per prefill: resumed kind and position, tokens shared with saved text, how many of those were recomputed and why: `:between_states`, `:no_state`, `:limited`, `:new_conversation`, `:full`; plus saved / replaced / evicted entries and checkpoints) is logged by `examples/qwen35_server.jl` after each request, and `prefix_stats(pc)` keeps running totals (hit rate by kind, recomputed-shared tokens). Use it to measure the hit rate before items 2-4. Original note: Cheap; makes misses debuggable. Eviction order in gufo: retry copies, cheap checkpoints
    (state > 8x the rows they restore), idle conversations LRU, reused ones last; covered near-duplicates first within a conversation.
 
 Pitfalls from the page worth remembering: a matching token prefix is not enough (an edit at 7,001 of 8,192 tokens restores the checkpoint at

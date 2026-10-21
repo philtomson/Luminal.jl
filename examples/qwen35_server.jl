@@ -463,6 +463,7 @@ function run_job!(s, d, tok, job::Job, use_spec::Bool)
         cached = get(stats, :prefill_reused, 0); tf = t_first[] == 0.0 ? t1 : t_first[]
         spec = haskey(stats, :cycles) && stats[:cycles] > 0 ? spec_summary(stats) : ""
         isempty(spec) || logline("  speculation: " * spec)
+        logline("  prefix cache: " * prefix_summary(PREFIX))
         LAST_FULL[] = vcat(ids, gen); LAST_NP[] = length(ids)
         reason == :cancel && logline(@sprintf("  cancelled: the client closed the connection after %d generated tokens (%.1f s)", length(gen), t1 - t0))
         put!(job.events, (:done, (finish = parser.ncalls > 0 && reason == :stop ? "tool_calls" : reason == :length ? "length" : "stop",
