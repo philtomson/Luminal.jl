@@ -1,0 +1,15 @@
+# examples/qwen35_context_bench.jl, Qwen3.8-27B-UD-Q4_K_XL (native), random K/V, 10 reps: Float16 vs --kv-int8
+== Float16 KV
+context  plain step   tok/s | verify3 step  (ms)   tokens/s at 2.2 tokens/step
+   1024     112.8 ms   8.87 |    119.5 ms   18.40
+  32000     106.5 ms   9.39 |    120.8 ms   18.21
+  64000     116.3 ms   8.60 |    132.4 ms   16.61
+ 100000     127.9 ms   7.82 |    145.7 ms   15.10
+ 128000     135.7 ms   7.37 |    156.5 ms   14.05
+== --kv-int8
+context  plain step   tok/s | verify3 step  (ms)   tokens/s at 2.2 tokens/step
+   1024     111.5 ms   8.97 |    117.9 ms   18.65
+  32000     102.1 ms   9.79 |    116.8 ms   18.84
+  64000     108.9 ms   9.18 |    127.9 ms   17.20
+ 100000     116.8 ms   8.56 |    140.0 ms   15.72
+ 128000     123.2 ms   8.12 |    149.8 ms   14.69

@@ -1167,6 +1167,26 @@ Pitfalls from the page worth remembering: a matching token prefix is not enough 
 6,144, because the 8,192 one contains the old text); the same tokens do not give the same bytes (kernel tiling and batching change the
 floating-point addition order), so never mix K/V rows from one run with recurrent state from another.
 
+## Int8 KV cache with the DFlash2 server and the prefix cache (2026-10-22; branch `kv_int8_dflash`)
+
+`--kv-int8` on `examples/qwen35_server.jl` (default stays Float16). The block drafter, the prefix cache entries and the end-of-generation
+checkpoint no longer require a Float16 cache (three gates in `DFlashLoop.jl`, `Decoding.jl`, `Speculative.jl`); the entries copy the cache's
+rows as bytes, scales included. `tests/test_prefix_cache.jl` runs on both caches (the int8 one on a random head_dim-128 model, since the int8
+kernel needs 128 or 256): resumed == from scratch, 35 checks each.
+- Quality (`examples/qwen35_quant_quality.jl kv`, 27B native, `benchmarks/kv_int8_quality_results.txt`): ctx 16384, 10 prompts: top-1 100%,
+  KL 0.0001 nats, true-token log-prob +0.0012 +- 0.0011, greedy continuations identical for 9 of 10 (32 tokens); ctx 256, 100 prompts: 94 of 100
+  continuations identical (16 tokens; the prompt logits do not read the cache). Not measured: decode-step logits up to the first divergence,
+  opencode transcripts with tool calls, contexts above 16k.
+- Speed (`benchmarks/kv_int8_context_results.txt`, random K/V, ms per step, Float16 -> int8): plain decode 106.5 -> 102.1 at 32k, 127.9 -> 116.8 at
+  100k, 135.7 -> 123.2 at 128k (-9%); verify of 3 tokens 145.7 -> 140.0 at 100k, 156.5 -> 149.8 at 128k (-4%); no change at 1k.
+- Real server (DFlash2, opencode, 4 hours at 99k-148k tokens): GPU memory 51 GiB against 72 GiB for the Float16 server at 122k (it also held a second
+  99k conversation's entries), available RAM 55 GiB against 10; generation 12.0-15.2 tok/s, verify 169-199 ms/cycle, 2.5-3.5 tokens/cycle, first draft
+  accepted 72-82% (same as Float16); prefix cache resumed 5 of 7 requests from checkpoints with nothing recomputed beyond the 1.7k-token gap between
+  checkpoints, no errors. Prefill at ~115k was 208 tok/s against ~230 (Float16), about 10% slower (the per-chunk dequantization of the cached prefix),
+  one data point; the cold 99k prefill ran 313 tok/s overall against 320 for Float16 at 104k.
+- opencode's compaction request (a 115-token system text and the whole history as one 99k user message) shares nothing with the conversation, so it
+  cold-starts (317 s for 99k tokens) and drops the checkpoints of the conversation; the cache cannot help there.
+
 ## FlashAttentionOp's GPU kernel was wrong for head sizes of 64 and up (found and fixed 2026-10-20)
 
 **Fixed** (branch `flash_attention_fix`): the launch used `1 << (31 - leading_zeros(d - 1) + 1)`, which is 0 for Int64 arguments, so every group had 32 threads and the head dimension was silently truncated to 32. It now uses `clamp(nextpow(2, d), 32, 256)`, the local arrays hold 256 entries and a head size above 256 throws; `tests/test_attention.jl` tests D = 32, 48, 64, 100, 128, 256 (it used D = 16 before, which hid the bug). The op is still 8-12x slower than the composite attention, so nothing should use it.
