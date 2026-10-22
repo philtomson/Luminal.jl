@@ -1,0 +1,27 @@
+# int8 KV cache, prefill (Qwen3.8-27B-UD-Q4_K_XL native, chunk 256). A variant of the 128-row flash kernel that dequantized the int8 cache while
+# staging K and V (no Float16 copy of the cached prefix) was built and dropped: commit 5c41394 of the deleted branch q8_flash_prefill (reflog).
+
+## examples/qwen35_prefill_bench.jl --repeat=1400 --chunk=256 (f16 = Float16 KV; copy = int8 KV, Float16 copy of the prefix; fused = int8 KV, the dropped kernel)
+== f16
+pre-flight: ~8.2 GB scratch needed, 86.5 GB available
+prompt tokens   prefill s   tokens/s
+       32768       82.27      398.3
+       98304      328.12      299.6
+== copy
+pre-flight: ~8.2 GB scratch needed, 86.3 GB available
+prompt tokens   prefill s   tokens/s
+       32768       85.39      383.8
+       98304      356.01      276.1
+== fused
+pre-flight: ~8.2 GB scratch needed, 86.2 GB available
+prompt tokens   prefill s   tokens/s
+       32768       85.64      382.6
+       98304      357.09      275.3
+
+## benchmarks/chunk_attn_q8.jl at the time (ms per layer, 256 queries; int8 copy / int8 fused / Float16)
+   depth    Float16 KV      int8, copy     int8, fused  (ms per layer, 256 queries)
+    1024      0.545 ms        0.798 ms        0.608 ms   fused is 1.31x the copy path, 0.90x Float16
+    8192      3.410 ms        4.237 ms        3.904 ms   fused is 1.09x the copy path, 0.87x Float16
+   32768     12.879 ms       18.459 ms       16.448 ms   fused is 1.12x the copy path, 0.78x Float16
+   65536     25.961 ms       35.301 ms       32.530 ms   fused is 1.09x the copy path, 0.80x Float16
+  131072     50.919 ms       70.161 ms       64.259 ms   fused is 1.09x the copy path, 0.79x Float16

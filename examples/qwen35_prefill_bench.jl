@@ -3,7 +3,7 @@
 #
 # Usage:
 #   julia -t auto,1 --project=. examples/qwen35_prefill_bench.jl <base.gguf> [--int4|--int8] [--kv-int8] [--max-ctx=33000]
-#       [--lens=512,2048,8192,16384] [--chunk=512] [--layers=N] [--min-avail=20] [--swap-gb=3] [--no-check]
+#       [--lens=512,2048,8192,16384] [--repeat=400 (copies of the text: 400 give ~35k tokens)] [--chunk=512] [--layers=N] [--min-avail=20] [--swap-gb=3] [--no-check]
 using Luminal
 using Luminal.NN
 using Printf
@@ -44,7 +44,7 @@ function main()
     nl = parse(Int, flag("layers", string(cfg.n_layers)))
     nl < cfg.n_layers && (cfg = merge(cfg, (n_layers = nl, layer_types = cfg.layer_types[1:nl])))
     tok = LlamaTokenizer(f)
-    ids = Int.(Luminal.LlamaTokenization.encode(tok, repeat(TEXT, 400); bos = false))
+    ids = Int.(Luminal.LlamaTokenization.encode(tok, repeat(TEXT, parse(Int, flag("repeat", "400"))); bos = false))
     W = load_qwen35_gguf(base, cfg; quantize = _ -> T)
     s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = maxctx, weights = W, decode_weights = T,
                      kv_dtype = ("--kv-int8" in ARGS ? Int8 : Float16))

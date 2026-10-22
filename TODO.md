@@ -1186,6 +1186,16 @@ kernel needs 128 or 256): resumed == from scratch, 35 checks each.
   one data point; the cold 99k prefill ran 313 tok/s overall against 320 for Float16 at 104k.
 - opencode's compaction request (a 115-token system text and the whole history as one 99k user message) shares nothing with the conversation, so it
   cold-starts (317 s for 99k tokens) and drops the checkpoints of the conversation; the cache cannot help there.
+- Prefill with the int8 cache is slower than with Float16 (`examples/qwen35_prefill_bench.jl --repeat=1400`, 27B, chunk 256, tok/s): 8192: 461 -> 454;
+  32768: 398 -> 384; 98304: 300 -> 276 (-8%). The chunk attention dequantizes the cached prefix to Float16 per layer and chunk (`_kv_dequant_kernel!`, plus two
+  zero-filled Float16 buffers) and runs the flash kernel over it. I expected that copy to be the cost and built a variant of the 128-row flash kernel that
+  reads the int8 cache directly (exact integers staged with the decode kernel's bit trick, K's scale applied to the scores and V's to the probabilities):
+  correct (6e-4 against the copy path) and 9-12% faster than the copy path at depth in `benchmarks/chunk_attn_q8.jl` (64.3 vs 70.2 ms per layer at 128k;
+  Float16 50.9), but 0.4% at 32k and -0.3% at 98k for the whole model, so it was dropped (commit 5c41394 of the deleted branch `q8_flash_prefill`, in the reflog;
+  results in `benchmarks/kv_int8_prefill_results.txt`). Why: the flash kernel is bound by its per-16-key-tile dependency chain (~16 TFLOP/s), not by data
+  movement, and the int8 kernel is 26% slower than the Float16 one even though it reads half the bytes with 2.7% more instructions, 256 VGPRs and no spills;
+  untested guesses: the 272-byte row stride (rows straddle cache lines) and the 8-byte loads (V staging covers 32 contiguous bytes per key row instead of 64).
+  A profiler run (rocprofv3 counters) would be the next step if int8 prefill speed ever matters.
 
 ## FlashAttentionOp's GPU kernel was wrong for head sizes of 64 and up (found and fixed 2026-10-20)
 
