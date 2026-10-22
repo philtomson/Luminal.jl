@@ -396,7 +396,7 @@ end
 # it resumes here instead of prefilling the answer again. `emitted_pending`: the last cycle's emitted tokens when the head's K/V does not
 # cover them yet (the generation stopped before the draft step); `hid` holds the hidden states of that cycle's verify columns.
 function _save_end_ckpt!(s::LlamaSession, d, prefix::PrefixCache, prompt::Vector{Int}, out::Vector{Int}, cache, hid, nreal, K, y, emitted_pending)
-    (prefix.ckpt_every > 0 && s.kv_dtype === Float16 && length(prompt) >= prefix.min_tokens) || return 0
+    (prefix.ckpt_every > 0 && s.kv_dtype in (Float16, Int8) && length(prompt) >= prefix.min_tokens) || return 0
     P = length(prompt) + length(out) - 1
     cache.positions[1] == P || return 0
     emitted_pending === nothing || _mtp_step!(d, [emitted_pending; fill(y, K - nreal)], hid, nreal)

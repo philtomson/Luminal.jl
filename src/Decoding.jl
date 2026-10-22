@@ -393,8 +393,8 @@ other request may overwrite. Pass the cache as `prefix=` to `generate_ids` / `ge
 `:sys => n` (the end of the system message: shared by every conversation with that system prompt) and `:turn => n` (the start of the last
 assistant header: a later prompt of the same conversation shares everything before it however the reply is re-rendered). The longest entry
 that prefixes the prompt is resumed; the rest is prefilled and the new entries replace older ones (a turn entry that the new one extends,
-the least recently used beyond `max_sys` / `max_turn`). Prompts shorter than `min_tokens` are not saved. Chunked prefill only (Float16 KV,
-Qwen3.5), batch 1.
+the least recently used beyond `max_sys` / `max_turn`). Prompts shorter than `min_tokens` are not saved. Chunked prefill only (Float16 or Int8 KV:
+the entries copy the cache's rows as they are, scales included; Qwen3.5), batch 1.
 """
 # seconds spent in the phases of the last chunked prefill / MTP priming (restore, chunks, save, mtp_restore, mtp_prime, mtp_save): for the server's log
 const PREFILL_TIMES = Dict{Symbol,Float64}()
@@ -563,7 +563,7 @@ function _prefill_chunked!(s::LlamaSession, prompt::Vector{Int}; chunk::Int=pref
     n = length(prompt)
     n < s.max_seq || error("prompt longer than max_seq=$(s.max_seq)")
     n + chunk <= s.max_seq || error("chunked prefill of $n tokens needs max_seq >= $(n + chunk) (the last chunk is padded)")
-    s.kv_dtype === Float16 || (prefix = nothing)
+    s.kv_dtype in (Float16, Int8) || (prefix = nothing)
     empty!(PREFILL_TIMES); t_start = _tic()
     gr0 = _chunk_graph(s, chunk)
     cache = gr0.cache

@@ -43,13 +43,13 @@ end
     generate_ids_dflash(session, drafter::DFlash2, prompt; max_new_tokens=200, sampler=nothing, on_token=nothing, prefix=nothing,
                         prefix_at=[], stats=nothing, nprop=0) -> Vector{Int}
 
-`generate_ids_speculative` with the block drafter (0-based token ids; needs the Float16 KV cache and the chunked prefill). `nprop` fixes the drafts per
+`generate_ids_speculative` with the block drafter (0-based token ids; needs the Float16 or Int8 KV cache and the chunked prefill). `nprop` fixes the drafts per
 cycle (1..7); 0 picks them from the recent acceptance. With a `prefix` cache the generation also leaves the state checkpoint of its end (see `_save_end_ckpt!`).
 """
 function generate_ids_dflash(s::LlamaSession, df::DFlash2, prompt::Vector{Int}; max_new_tokens::Int=200, stats=nothing, sampler=nothing, on_token=nothing,
                              prefix=nothing, prefix_at=Int[], on_progress=nothing, nprop::Int=0)
     df.session === s || error("the drafter belongs to another session")
-    s.kv_dtype === Float16 && _can_chunk(s) || error("the block drafter needs the Float16 KV cache and the chunked prefill")
+    s.kv_dtype in (Float16, Int8) && _can_chunk(s) || error("the block drafter needs the Float16 or Int8 KV cache and the chunked prefill")
     nprop in 0:7 || error("nprop must be 0 (adaptive) or 1..7")
     n = length(prompt)
     t_pf = time()

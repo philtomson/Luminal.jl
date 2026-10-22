@@ -65,9 +65,34 @@ else
 
     relerr(a, b) = maximum(abs.(a .- b)) / maximum(abs.(b))
 
-    @testset "a resumed prefill == a prefill from scratch" begin
-        model = model_template(REF)
-        s = LlamaSession(model, nothing, REF; max_seq=160, decode_weights=Float32, device=DEV, kv_dtype=Float16)
+    # random weights for every registered tensor of a model (small, so the activations stay finite)
+    function random_weights(cfg, dev)
+        g = Luminal.Graph(); reg = Luminal.NN.WeightRegistry()
+        Qwen35(g, reg; cfg...)
+        W = Dict{String,Any}()
+        for (name, id) in reg.mapping
+            dims = Tuple(Int.(Luminal.realized_dims(g.shapes[id])))
+            scale = occursin("A_log", name) ? 0.0f0 : occursin("norm", name) || occursin("dt_bias", name) ? 0.1f0 : 0.1f0
+            W[name] = Luminal.to_device(scale .* randn(Float32, dims...), dev)
+        end
+        return W
+    end
+
+    # :float16 -- the tiny reference model (head_dim 16); :int8 -- a random model with head_dim 128 (the int8 cache's kernel needs 128 or 256) and
+    # the int8 K/V cache. Every resume is compared with an uncached run of the same session, so the two caches are never compared with each other.
+    function make_session(kind)
+        if kind === :float16
+            model = model_template(REF)
+            return model, LlamaSession(model, nothing, REF; max_seq=160, decode_weights=Float32, device=DEV, kv_dtype=Float16)
+        end
+        cfg = merge(qwen35_config(REF), (head_dim=128, n_heads=4, n_kv_heads=2, rotary_dim=32))
+        model = Qwen35(Luminal.Graph(), nothing; cfg...)
+        return model, LlamaSession(model, nothing, REF; max_seq=160, decode_weights=Float32, device=DEV, kv_dtype=Int8, weights=random_weights(cfg, DEV))
+    end
+
+    @testset "a resumed prefill == a prefill from scratch ($kind KV cache)" for kind in (:float16, :int8)
+        kind === :int8 && !(DEV isa Luminal.AMDDevice) && continue
+        model, s = make_session(kind)
         merge!(s.weights, random_mtp_weights(model, DEV))
         V = model.config.vocab_size
         toks(n, seed) = mod.(seed .* collect(1:n) .+ 3, V)
@@ -85,6 +110,10 @@ else
         withenv("LUMINAL_PREFILL_CHUNK" => "16") do
             sysp = toks(40, 7)
             first_prompt = vcat(sysp, toks(32, 11))                  # 72 tokens: a system message of 40, a conversation of 32 more
+
+            # the model must be sensitive to the context (a random model could ignore it, and then any resume would pass): the same last
+            # 30 tokens after a different first 40 give different logits
+            @test !same(request(vcat(sysp, toks(30, 13))), request(vcat(toks(40, 9), toks(30, 13))))
 
             # `overwritten`: another request goes through the cache between the save and the resume, so the live K/V no longer holds the
             # saved prompt and the entry's own K/V has to be copied back (a checkpoint only exists along the live prompt: no such variant)
