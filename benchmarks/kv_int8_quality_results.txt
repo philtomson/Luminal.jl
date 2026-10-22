@@ -1,0 +1,21 @@
+# examples/qwen35_quant_quality.jl kv: Qwen3.8-27B-UD-Q4_K_XL (native), Float16 vs Int8 KV cache, same weights and prompts
+# ctx 256 (100 prompts, 16 new tokens; prompt logits come from the prefill, which does not read the cache), then ctx 16384 (10 prompts, 32 new tokens, chunked prefill)
+
+== ctx 256, 100 prompts
+native, Int8 KV (test) against native, Float16 KV (reference), 100 prompts
+  top-1 agreement        100.0 %
+  same top-5 set         100.0 %
+  mean KL(ref || test)   0.0000 nats (median 0.0000, max 0.000)
+  true next-token logp   ref -2.1354   test -2.1354   (test - ref 0.0000 +- 0.0000 s.e.)
+  perplexity ratio test / ref  1.0000
+  greedy continuations of 16 tokens: identical for 94 of 100 prompts; mean agreeing prefix 15.6 tokens
+exit 0
+
+== ctx 16384, 10 prompts
+native, Int8 KV (test) against native, Float16 KV (reference), 10 prompts
+  top-1 agreement        100.0 %
+  same top-5 set         100.0 %
+  mean KL(ref || test)   0.0001 nats (median 0.0000, max 0.000)
+  true next-token logp   ref -1.5637   test -1.5625   (test - ref 0.0012 +- 0.0011 s.e.)
+  perplexity ratio test / ref  0.9988
+  greedy continuations of 32 tokens: identical for 9 of 10 prompts; mean agreeing prefix 30.6 tokens
