@@ -45,6 +45,8 @@ include("LaunchBounds.jl")
 include("WMMA.jl")
 include("FlashAttn.jl")
 include("DecodeAttn.jl")
+include("DecodeAttnGather.jl")
+include("LatentSparseSelect.jl")
 include("Execution.jl")
 export execute
 
@@ -58,6 +60,8 @@ include("GGUF.jl")
 include("NativeWeights.jl")
 export WeightRegistry, register_weight!, tie_weight!, load_weights!, load_weights_hf!
 
+include("LatentSparse.jl")                  # the CPU reference of Latent Sparse Attention - Luminal.LatentSparse
+include("LSADecode.jl")                    # Latent Sparse Attention in the decode step
 include("NN.jl")
 export NN
 

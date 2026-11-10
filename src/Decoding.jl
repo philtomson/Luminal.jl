@@ -12,7 +12,7 @@ using AMDGPU
 using JSON3
 using Random
 
-export PrefixCache, release_stale!, prefix_summary, prefix_stats, Sampler, sample_token, greedy_decode, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative, DFlash2, dflash_append!, dflash_append_rows!, dflash_draft!, generate_ids_dflash
+export PrefixCache, release_stale!, prefix_summary, prefix_stats, Sampler, sample_token, greedy_decode, lsa_enable!, lsa_disable!, llama_generate, LlamaSession, generate, generate_ids, weight_preset, MTPDrafter, generate_ids_speculative, generate_speculative, DFlash2, dflash_append!, dflash_append_rows!, dflash_draft!, generate_ids_dflash
 
 """
     weight_preset(name) -> (weight name -> Type)
@@ -165,7 +165,10 @@ function _decode_graph(s::LlamaSession, B::Int)
     get!(s.decode, B) do
         g = Base.invokelatest(Graph); reg = WeightRegistry()
         m = _rebuild_model_like(s.model, g, reg; rope_base=s.rope_base)
-        idg = build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype)
+        lsa = B == 1 ? get(Luminal.LSA_SESSIONS, s, nothing) : nothing        # Latent Sparse Attention (see `lsa_enable!`), one sequence only
+        idg = Luminal.with_lsa(lsa) do
+            build_llama_decode_step!(m, g, 0; max_seq=s.max_seq, batch=B, rope_base=s.rope_base, kv_dtype=s.kv_dtype)
+        end
         load_weights!(g, reg, s.weights; device=s.device)
         retain = vcat(idg.logits_id, idg.new_self_k_ids, idg.new_self_v_ids,
                       idg.token_input_id, idg.pos_input_id, idg.self_k_ids, idg.self_v_ids,
@@ -193,6 +196,7 @@ function _decode_graph(s::LlamaSession, B::Int)
                     precision=wd === Luminal.Int4 ? :int4 : wd === Int8 ? :int8 : wd === Float16 ? :weights : false)
         end
         cache = LlamaKVCacheState(s.model; batch=B, max_seq=s.max_seq, device=s.device, kv_dtype=s.kv_dtype)
+        lsa === nothing || Luminal.lsa_register_cache!(lsa, cache)
         (exec=exec, idg=idg, cache=cache)
     end
 end
@@ -763,7 +767,9 @@ function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; 
     if B == 1 && (plens[1] > prefill_chunk() || prefix !== nothing) && _can_chunk(s)
         logits, Hall, off = _prefill_chunked!(s, prompt_ids[1]; prefix, prefix_at, need_mtp, on_progress)
         pf = (last_only=true, hidden_id=1, chunked=true, off=off)
-        return pf, Dict{Any,Any}(1 => Hall), _decode_graph(s, 1), plens, logits
+        dc = _decode_graph(s, 1)
+        _lsa_after_prefill!(s, dc.cache, plens)
+        return pf, Dict{Any,Any}(1 => Hall), dc, plens, logits
     end
 
     # Prefill. Recurrent layers' states are bound straight to the decode cache's
@@ -797,7 +803,54 @@ function _prefill_into_cache!(s::LlamaSession, prompt_ids::Vector{Vector{Int}}; 
             _store_kv!(cache.self_cache[i][2], res[v], plens[b], b)
         end
     end
+    _lsa_after_prefill!(s, cache, plens)
     return pf, res, dc, plens, logits
+end
+
+# Latent Sparse Attention: the index keys and buckets of a prefilled prompt (one sequence; a no-op for a session without it)
+function _lsa_after_prefill!(s::LlamaSession, cache, plens)
+    st = get(Luminal.LSA_SESSIONS, s, nothing)
+    (st === nothing || length(plens) != 1) && return nothing
+    Luminal.lsa_after_prefill!(st, cache, plens[1])
+    return nothing
+end
+
+"""
+    lsa_enable!(session, config) -> session
+
+Make a session's decode step read the keys Latent Sparse Attention selects, on every full-attention layer `config` has a map for (an
+`Luminal.LSAConfig`, see `Luminal.lsa_load_maps`). The decode and chunk graphs built so far, and their caches, are dropped, so the next decode rebuilds them. One
+sequence, one token a step, a Float16 KV cache and an AMD GPU: a speculative step or a batch stays dense and leaves the index stale.
+"""
+function lsa_enable!(s::LlamaSession, config::Luminal.LSAConfig)
+    s.device isa Luminal.AMDDevice || error("lsa_enable!: needs an AMD GPU")
+    s.kv_dtype === Float16 || error("lsa_enable!: needs a Float16 KV cache - got $(s.kv_dtype)")
+    layers = [i - 1 for (i, l) in enumerate(s.model.layers) if !NN._is_state_layer(l)]
+    _drop_decode_graphs!(s)
+    Luminal.LSA_SESSIONS[s] = Luminal.LSAState(config, filter(l -> haskey(config.maps, l), layers), s.max_seq)
+    return s
+end
+
+"Return a session to dense attention. The decode graphs built so far are dropped."
+function lsa_disable!(s::LlamaSession)
+    _drop_decode_graphs!(s)
+    delete!(Luminal.LSA_SESSIONS, s)
+    return s
+end
+
+# The graphs that own a decode cache - a chunk graph holds the old one and would fill it - and the cache itself, freed now and not at the
+# next collection, since at 262k positions it is 16 GiB. Forgets the caches registered for the state being replaced.
+function _drop_decode_graphs!(s::LlamaSession)
+    old = get(Luminal.LSA_SESSIONS, s, nothing)
+    old === nothing || Luminal.lsa_forget_caches!(old)
+    # Each compiled graph owns converted copies of the weights and its intermediates - free them now, the weights the session shares stay
+    for g in Iterators.flatten((values(s.decode), values(s.spec)))
+        g isa NamedTuple && hasproperty(g, :exec) && (try Luminal.release!(g.exec) catch end)
+    end
+    empty!(s.decode); empty!(s.spec)
+    GC.gc(true)
+    Luminal.reclaim!(s.device)
+    return nothing
 end
 
 # prefill's K/V (head_dim, slen, kv_heads, B) -> the cache's first n slots of sequence b (an int8 cache quantizes)

@@ -882,7 +882,10 @@ function llama_self_attn_cached(sa::SelfAttention,
     # head-major order the output projection expects.
     ins = [(t.id, 0, t.shape) for t in (q, past_k, past_v, k_new, v_new, step_pos_tensor)]
     # The op also writes the tokens' K/V into the cache slots (write_cache=true).
-    out = Luminal.add_op!(x.graph_ref, Luminal.DecodeAttention(sa.scale, true, sa.window), ins,
+    # (a layer with a Latent Sparse Attention map, in a decode graph built for it - one token a step - reads the keys it selects)
+    lsa = S == 1 && sa.window == 0 ? Luminal.lsa_layer_state(Luminal.LSA_LAYER[]) : nothing
+    attn_op = lsa === nothing ? Luminal.DecodeAttention(sa.scale, true, sa.window) : Luminal.LSADecodeAttention(sa.scale, lsa)
+    out = Luminal.add_op!(x.graph_ref, attn_op, ins,
                           Luminal.ShapeTracker(S == 1 ? [D, sa.n_heads, batch] : [D, sa.n_heads, S, batch]))
     kv_only && return out, k_new, v_new                  # (only the cache write is wanted: the attention node itself, K and V)
     out = Luminal.reshape(out, [D * sa.n_heads, S, batch])
@@ -970,6 +973,7 @@ function build_llama_decode_step!(model,
             snaps = (Luminal.tensor(graph, scale_b(shapes[i][1]); dtype=Float32), Luminal.tensor(graph, scale_b(shapes[i][2]); dtype=Float32))
             push!(snap_tensors, snaps)
         end
+        Luminal.LSA_LAYER[] = i - 1                                    # (which layer's Latent Sparse Attention state, if any, the block takes)
         x, nk, nv = _decode_block(layer, x, step_pos, pos_tensor, self_k_tensors[i], self_v_tensors[i], rope_base;
                                   lens=lens, snaps=snaps, nsnap=nsnap)
         push!(new_k_tensors, nk)
@@ -1071,6 +1075,7 @@ function llama_decode_step!(exec_fn,
     # The step graph's DecodeAttention nodes have already written each sequence's
     # K/V into its cache slot (in place, inside the captured graph).
     pos .+= advance
+    Luminal.lsa_after_step!(cache)           # (Latent Sparse Attention: the buckets of a block this step closed)
     return logits
 end
 
