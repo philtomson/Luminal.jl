@@ -431,7 +431,8 @@ batch of 4 clips decodes in about the time of 2.
   - a prefix cache (`PrefixCache`: system prompt, turn and recurrent-state
     checkpoints) so a follow-up turn only prefills its new tokens;
   - the OpenAI-compatible server above, with a reasoning-token budget.
-  - Latent Sparse Attention for the decode step of Qwen3.8-27B (experimental, see above): about 2x per token at 262k context.
+  - Latent Sparse Attention for the decode step of Qwen3.8-27B (experimental, see above; from
+    [Prefrontal-AI/latent-sparse-attention](https://github.com/Prefrontal-AI/latent-sparse-attention)): about 2x per token at 262k context.
 - **Loading straight into reduced precision** (`LlamaSession(...; weight_storage=Luminal.Int4)`,
   or `load_weights_to_dict(...; quantize=...)`): each matmul weight is converted
   as it is read, so a model never sits in memory in Float32 (Qwen3.6-27B: ~15 GB
@@ -556,3 +557,11 @@ src/
 
 Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 or the MIT license (http://opensource.org/licenses/MIT), at your option.
+
+## Acknowledgements
+
+- [Latent Sparse Attention](https://github.com/Prefrontal-AI/latent-sparse-attention) (Prefrontal-AI, Apache-2.0; paper:
+  [arXiv 2610.42147](https://arxiv.org/abs/2610.42147)). `src/LatentSparse.jl` is a Julia port of that repository's reference
+  implementation (`src/lsa/core`: `reference.py`, `ward.py`, `index_space.py`, `attention.py`), the GPU kernels and the decode-loop
+  wiring are written against it, the learned maps are its `d-lsa-weights-v1` release, and its torch oracle produced the fixtures the
+  port was checked against.

@@ -1,11 +1,12 @@
 # Latent Sparse Attention (D-LSA, flat design), CPU reference in plain Julia.
 #
-# A port of the plain-torch oracle in latent-sparse-attention `src/lsa/core` (`reference.py`, `ward.py`) - pool, Ward, bucket,
-# score, pick, expand. It is the oracle the GPU kernels will be tested against, so it favours being obviously the same
-# algorithm over speed. Positions in tables and id lists are 0-based, as the oracle's and the fixtures' are, and -1 pads;
-# Julia arrays are indexed from 1 inside.
+# A port of the plain-torch reference of https://github.com/Prefrontal-AI/latent-sparse-attention (Apache-2.0; paper arXiv 2610.42147) -
+# `src/lsa/core`: `reference.py` (build_buckets, read), `ward.py` (the Ward merge) and `index_space.py` (the index vectors) - pool, Ward,
+# bucket, score, pick, expand. It is the oracle the GPU kernels (LatentSparseSelect.jl, DecodeAttnGather.jl) and the decode wiring
+# (LSADecode.jl) are tested against, so it favours being obviously the same algorithm over speed. Positions in tables and id lists are
+# 0-based, as the oracle's and the fixtures' are, and -1 pads; Julia arrays are indexed from 1 inside.
 #
-# Standalone on purpose: it depends on nothing in Luminal, so it loads in a second and is not yet `include`d by Luminal.jl.
+# Depends on nothing in Luminal, so it also loads on its own (the tests include it that way); Luminal.jl includes it as `Luminal.LatentSparse`.
 
 module LatentSparse
 
