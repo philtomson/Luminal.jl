@@ -145,6 +145,69 @@ LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl \
 
 For a one-shot generation from a GGUF, `examples/qwen35_gguf.jl <file.gguf> "prompt"`.
 
+### Latent Sparse Attention (experimental)
+
+Decode attention for Qwen3.8-27B can read a selected subset of the cache instead of all of it: Latent Sparse Attention
+([paper](https://arxiv.org/abs/2610.42147), [code](https://github.com/Prefrontal-AI/latent-sparse-attention)), the flat distilled design (D-LSA).
+Each full-attention layer clusters its keys into buckets in a learned 64-dim index space; a decode token scores the bucket
+centroids, picks the best 1024, and attends over their keys plus the last 512 and the first 4 - at most 4612 keys whatever the context.
+The attention kernel itself is unchanged. This is **decode only**: prefill stays dense.
+
+```julia
+using Luminal, Luminal.NN
+using Luminal: LSAConfig, lsa_load_maps
+using Luminal.Decoding: lsa_enable!, lsa_disable!
+
+f = read_gguf(path); cfg = qwen35_config(f)
+session = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), LlamaTokenizer(f), path; max_seq = 131072,
+                       weights = load_qwen35_gguf(path, cfg; quantize = _ -> Luminal.Int4),
+                       decode_weights = Luminal.Int4, kv_dtype = Float16)       # LSA needs a Float16 KV cache
+maps = lsa_load_maps("qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.safetensors")
+lsa_enable!(session, LSAConfig(maps = maps, top_k = 4096, top_p = 1024))        # before the first decode
+generate_ids(session, [prompt_ids]; max_new_tokens = 200)                       # prefill dense, decode sparse
+lsa_disable!(session)                                                           # back to dense
+```
+
+The maps (about 6 MB, one query and one key projection per full-attention layer) are the `d-lsa-weights-v1` release of the
+latent-sparse-attention repository, as `.pt` files; `examples/lsa_pt_to_safetensors.py` converts one without torch. `top_k` and
+`top_p` set the budget (`top_p` at most 1024). `lsa_enable!` drops the session's compiled graphs and rebuilds them on the next decode.
+
+What it measures on a Strix Halo (gfx1151), Qwen3.8-27B with Int4 decode weights and a Float16 KV cache, one token a step,
+`top_k` 4096 (`benchmarks/lsa_decode_token.jl`, a random cache filled to each length):
+
+| context | dense | LSA | speedup |
+|---|---|---|---|
+| 4,096 | 76.3 ms/token | 77.3 | 0.99x |
+| 16,384 | 80.6 | 77.6 | 1.04x |
+| 65,536 | 97.2 | 77.7 | 1.25x |
+| 131,072 | 117.8 | 78.1 | 1.51x |
+| 262,000 | 156.9 | 78.6 | 2.00x |
+
+The 27B reads about 76 ms of weights every token and only 16 of its 64 layers are full attention, so the gain is the attention
+layers' share: roughly 80 ms a token at 262k dense against about 2 ms sparse. LSA costs about 1 ms a token at short context and breaks
+even near 8k to 16k. Per layer, the sparse read (selection and attention) takes 0.11 ms at 16k keys and 0.16 ms at 262k, against
+0.38 and 5.2 ms for the dense kernel.
+
+Quality (`benchmarks/lsa_decode_quality.jl`, real text through the chunked prefill, the dense model's own tokens fed to both so the
+contexts match): within the budget the output equals dense (the 4-layer wiring check matches 199 tokens with logits within 6e-6).
+On a 16,000-token prompt the KL from dense is 0.0043 at `top_k` 4096 and 0.0116 at 2048, and on a 64,000-token prompt (7.2% and 4.0%
+of the context read) 0.0030 and 0.0046 with the argmax agreeing on 47 of 48 tokens. A passphrase buried in the text and asked for at
+the end (three facts at 20%, 50% and 80% depth at 64k) is retrieved correctly at both budgets. These are single prompts on documentation
+and source text, not a benchmark suite, and nothing past 64k tokens has been scored.
+
+Limits:
+- One sequence, one token a step, a Float16 KV cache and an AMD GPU. A speculative (MTP or DFlash2) step, a batch, an int8 cache and the
+  prefix cache are not supported with LSA on; those graphs stay dense and would leave the index stale.
+- Prefill is dense, and a block's buckets are built on the CPU (about 0.3 ms a 512-key block, per layer) after the prefill and as decode
+  closes each block. The index state is 1.1 GB at 262144 positions.
+- The dense split-K kernel takes at most 262144 keys, so the comparison above stops there; the sparse read has no such limit but
+  nothing beyond 262144 has been run.
+
+How it is built: `src/LatentSparse.jl` is a plain-Julia port of the reference (the test oracle); `src/LatentSparseSelect.jl` has the
+selection kernels (index query, bucket scores, a radix-select top-p and the expansion to key ids); `src/DecodeAttnGather.jl` is the
+split-K decode kernel reading the selected slots in place; `src/LSADecode.jl` is the decode-step op and the host upkeep. Tests:
+`test_latent_sparse`, `test_lsa_select`, `test_decode_gather`, `test_lsa_decode`. Benchmarks: `benchmarks/lsa_*.jl`.
+
 ## Installation
 
 ```bash
@@ -368,6 +431,7 @@ batch of 4 clips decodes in about the time of 2.
   - a prefix cache (`PrefixCache`: system prompt, turn and recurrent-state
     checkpoints) so a follow-up turn only prefills its new tokens;
   - the OpenAI-compatible server above, with a reasoning-token budget.
+  - Latent Sparse Attention for the decode step of Qwen3.8-27B (experimental, see above): about 2x per token at 262k context.
 - **Loading straight into reduced precision** (`LlamaSession(...; weight_storage=Luminal.Int4)`,
   or `load_weights_to_dict(...; quantize=...)`): each matmul weight is converted
   as it is read, so a model never sits in memory in Float32 (Qwen3.6-27B: ~15 GB
@@ -436,6 +500,7 @@ CPU backend.
 
 ### Not yet implemented
 - Multi-GPU or distributed execution
+- Latent Sparse Attention in prefill, with speculative decoding, batches or an int8 KV cache, and past 262144 positions
 - Tensor-core or matrix-core kernels, and generated (rather than hand-written) kernels
 - Other upstream models (for example YOLO)
 
