@@ -198,7 +198,9 @@ and source text, not a benchmark suite, and nothing past 64k tokens has been sco
 Limits:
 - One sequence, one token a step, a Float16 KV cache and an AMD GPU. A speculative (MTP or DFlash2) step, a batch, an int8 cache and the
   prefix cache are not supported with LSA on; those graphs stay dense and would leave the index stale.
-- Prefill is dense, and a block's buckets are built on the CPU (about 0.3 ms a 512-key block, per layer) after the prefill and as decode
+- Prefill is dense on purpose. Sparse prefill was measured and not built: on a 16k prompt it raised the mean KL from dense to 0.035 (0.004 with
+  dense prefill) and the argmax agreed on 45 of 48 tokens (48 of 48), and a kernel for it would gain an estimated 1.1x at 64k and 1.8x at 262k.
+- A block's buckets are built on the CPU (about 0.3 ms a 512-key block, per layer) after the prefill and as decode
   closes each block. The index state is 1.1 GB at 262144 positions.
 - The dense split-K kernel takes at most 262144 keys, so the comparison above stops there; the sparse read has no such limit but
   nothing beyond 262144 has been run.
