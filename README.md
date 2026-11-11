@@ -172,6 +172,25 @@ The maps (about 6 MB, one query and one key projection per full-attention layer)
 latent-sparse-attention repository, as `.pt` files; `examples/lsa_pt_to_safetensors.py` converts one without torch. `top_k` and
 `top_p` set the budget (`top_p` at most 1024). `lsa_enable!` drops the session's compiled graphs and rebuilds them on the next decode.
 
+To serve it to a harness such as opencode, add the maps to the server of the section above (get them once):
+
+```bash
+gh release download d-lsa-weights-v1 -R Prefrontal-AI/latent-sparse-attention \
+    -p 'qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt' -p SHA256SUMS      # check the sum, then convert:
+python3 -I examples/lsa_pt_to_safetensors.py qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt maps.safetensors
+
+LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl \
+    /path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf --lsa=maps.safetensors --max-seq=131072 --port=8080 --name=qwen3.8-27b-lsa
+```
+
+- Everything in the section above applies (`-t auto,1`, the `--name` as the opencode model id, the same `baseURL`); the log's `serving` line
+  says `Latent Sparse Attention`.
+- `--lsa-top-k` (default 4096) and `--lsa-top-p` (default 1024) set the budget.
+- LSA decodes one token a step, so speculative decoding (MTP, `--dflash`) is off, and `--kv-int8` is refused. Expect the plain decode speed
+  (about 77 ms/token in the benchmark, not the MTP rate) and a gain only on long contexts: none below 16k, 1.5x at 131k.
+- The prefix cache still works: the index is rebuilt from the cache after every prefill (a fraction of a second per 30k tokens).
+- Allocate the context you need: `--max-seq` sets the KV cache (8 GiB at 131072), and the index state adds about 1.1 GB per 262144 positions.
+
 What it measures on a Strix Halo (gfx1151), Qwen3.8-27B with Int4 decode weights and a Float16 KV cache, one token a step,
 `top_k` 4096 (`benchmarks/lsa_decode_token.jl`, a random cache filled to each length):
 

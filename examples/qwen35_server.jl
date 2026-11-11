@@ -2,7 +2,7 @@
 #
 # Usage:
 #   LUMINAL_GGUF_NATIVE=1 julia -t auto,1 --project=. examples/qwen35_server.jl <model.gguf> [--mtp=<gguf with the MTP head>] [--port=8080]
-#       [--host=127.0.0.1] [--max-seq=16384] [--int8] [--kv-int8] [--no-spec] [--dflash=<DFlash2 draft gguf>] [--name=<model id>] [--min-avail=20] [--reasoning-budget=N]
+#       [--host=127.0.0.1] [--max-seq=16384] [--int8] [--kv-int8] [--no-spec] [--lsa=<D-LSA maps.safetensors> [--lsa-top-k=4096] [--lsa-top-p=1024]] [--dflash=<DFlash2 draft gguf>] [--name=<model id>] [--min-avail=20] [--reasoning-budget=N]
 # Then point the harness at http://localhost:8080/v1 (model id: --name, default the file's name).
 #
 # Endpoints: GET /v1/models, GET /health, POST /v1/chat/completions ("stream": true gives server-sent events). Request fields used: messages
@@ -652,7 +652,10 @@ function main()
     isempty(args) && error("usage: qwen35_server.jl <model.gguf> [--mtp=<gguf>] [--port=8080] [--host=127.0.0.1] [--max-seq=16384] [--int8] [--kv-int8] [--no-spec] [--dflash=<gguf>] [--name=id] [--reasoning-budget=N]")
     base = args[1]; mtp = flag("mtp", base)
     port = parse(Int, flag("port", "8080")); host = flag("host", "127.0.0.1")
-    use_spec = !("--no-spec" in ARGS)
+    lsa_maps = flag("lsa", "")                           # Latent Sparse Attention for the decode step: the D-LSA maps (safetensors, see README); one token a step, so no speculation
+    use_lsa = !isempty(lsa_maps)
+    use_lsa && "--kv-int8" in ARGS && error("--lsa needs the Float16 KV cache (drop --kv-int8)")
+    use_spec = !("--no-spec" in ARGS) && !use_lsa
     dflash_path = flag("dflash", "")                     # the DFlash2 block drafter instead of the MTP head
     use_dflash = use_spec && !isempty(dflash_path)
     REASONING_BUDGET[] = parse(Int, flag("reasoning-budget", "0"))
@@ -670,6 +673,7 @@ function main()
         use_spec && !use_dflash && merge!(W, load_qwen35_mtp(mtp, cfg; quantize = _ -> T, block = cfg.n_layers))
         s = LlamaSession(Qwen35(Luminal.Graph(), nothing; cfg...), tok, base; max_seq = parse(Int, flag("max-seq", "16384")), weights = W, decode_weights = T,
                          kv_dtype = KV)
+        use_lsa && Luminal.Decoding.lsa_enable!(s, Luminal.LSAConfig(maps = Luminal.lsa_load_maps(lsa_maps), top_k = parse(Int, flag("lsa-top-k", "4096")), top_p = parse(Int, flag("lsa-top-p", "1024"))))
         d = use_dflash ? DFlash2(s, dflash_path, base) : use_spec ? MTPDrafter(s) : nothing
         logline("loaded; warming up (compiles the graphs, about a minute)")
         gen_spec(prompt; kw...) = d isa DFlash2 ? generate_ids_dflash(s, d, prompt; kw...) : generate_ids_speculative(s, d, prompt; ndraft = 0, kw...)
@@ -711,7 +715,7 @@ function main()
     end
     max_seq = take!(ready); max_seq isa Exception && error("loading failed: " * sprint(showerror, max_seq))
     server = HTTP.serve!(http -> route(http, name), host, port; stream = true)
-    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec$(use_dflash ? ", DFlash2 block drafter" : use_spec ? ", MTP head" : ""), context $max_seq, $(KV === Int8 ? "int8" : "Float16") KV cache)")
+    logline("serving $name on http://$host:$port/v1 (speculative decoding: $use_spec$(use_lsa ? ", Latent Sparse Attention" : "")$(use_dflash ? ", DFlash2 block drafter" : use_spec ? ", MTP head" : ""), context $max_seq, $(KV === Int8 ? "int8" : "Float16") KV cache)")
     wait(worker)
 end
 
